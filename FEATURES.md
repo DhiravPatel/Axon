@@ -143,6 +143,53 @@ A snapshot of everything Axon ships today, grouped by the stages that introduced
 - Completion: keywords, in-scope identifiers, member access.
 - Editor integration ready (VS Code, Neovim, any LSP-aware client).
 
+## Stage 19 — `for await`, `select`, `plan with` Enhancements
+
+Three core language constructs from §14 and §26 wired through parser, type checker, and runtime.
+
+### §14 `for await` — async-stream iteration
+- New `is_await: bool` field on `ExprKind::For`; parser recognizes `for await pat in expr { body }`.
+- Eval routes async-flagged iteration to a Chan-draining loop when the iterator is a `Chan` value; lists, sets, maps, tuples, and strings still iterate as usual.
+- `break` and `continue` work correctly mid-stream.
+- The `await` keyword is semantic markup today (the synchronous interpreter drains eagerly) — the surface is identical to what the async scheduler will use when it lands.
+
+### §14 `select` — multi-channel arms
+- Replaced the raw-text `SelectArm` placeholder with a typed AST: `SelectArmKind::{Recv, Timeout, Else}`.
+- New parser for `select { name = recv(chan) => body, _ = timeout(dur) => body, else => body }`. No new tokens — uses existing call syntax instead of `<-` so it composes with the rest of the grammar.
+- Runtime semantics: walk recv arms in declaration order, pick the first whose channel is non-empty. If none is ready, take the first `timeout` (fires immediately in the sync runtime), then the first `else`. With no fallback arm, a runtime error surfaces.
+- Declaration order is the tiebreak when multiple channels are ready — deterministic and easy to reason about.
+
+### §26 `plan with` — `max_steps` + `output: Schema`
+- `max_steps:` slot now actually caps the tool-use loop (overrides the default `MAX_TOOL_USE_ITERATIONS = 8`). Validates that the value is `> 0` *before* the first model call.
+- `output:` slot steers the model toward emitting JSON (appended as a system-prompt nudge) and parses the final response as a `Record` so call sites can pattern-match `r.field`.
+- Type checker now returns `Dyn` for `plan ... { output: ... }` (Stage 12 gradual-escape-hatch propagation) so field access on the returned record type-checks without manual ascription.
+- Bad JSON in the model's final response surfaces a clean `plan` with `output:` expects valid JSON error.
+
+### Type-checker generalizations driven by these features
+- `for` over `Dyn` no longer errors (E0230) — propagates as `Dyn` element type, same as field access on `Dyn`.
+- Method calls on `Dyn` no longer error — return `Dyn` with `Dyn` argument types.
+- These two relaxations are what let stdlib calls (`list_new(...)`, `chan()`, `mem_*`, `rag_*`) feed into the new constructs without per-program annotations.
+
+### CLI demo (real run)
+```
+--- for await over a list (sync stream) ---
+1
+2
+3
+--- for await draining a chan ---
+alpha
+beta
+gamma
+--- select picks the ready channel ---
+hello-from-b
+--- select falls through to else ---
+(no message)
+--- plan with output: schema returns a Record ---
+42                                  # parsed from {"answer":"42","confidence":0.95}
+```
+
+---
+
 ## Stage 17 — Deploy (HTTP server, health checks, env binding, manifest)
 
 **Crate:** [axon-deploy](crates/axon-deploy/). Adds `axon serve` and `axon deploy` CLI subcommands.

@@ -672,7 +672,11 @@ impl Compiler {
                 self.patch_jump_here(skip);
                 self.emit(Op::LoadUnit, expr.span);
             }
-            ExprKind::For { pat, iter, body } => {
+            ExprKind::For { pat, iter, body, .. } => {
+                // VM treats `for await` the same as `for` — async-stream
+                // dispatch lives in the tree-walking eval, where the
+                // Chan-vs-List distinction is observable. The bytecode
+                // path always iterates eagerly.
                 self.compile_for(pat, iter, body, expr.span)
             }
             ExprKind::While { cond, body } => self.compile_while(cond, body, expr.span),

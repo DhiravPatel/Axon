@@ -666,6 +666,9 @@ pub enum ExprKind {
         pat: Pattern,
         iter: Expr,
         body: Block,
+        /// `true` for `for await pat in stream { ... }`. The runtime
+        /// dispatches to the async-stream-aware iterator when set.
+        is_await: bool,
     },
     While {
         cond: Expr,
@@ -781,9 +784,22 @@ pub struct MatchArm {
 
 #[derive(Clone, Debug)]
 pub struct SelectArm {
-    /// Raw text of the arm — `select` sub-grammar deferred to a later stage.
-    pub raw: String,
+    pub kind: SelectArmKind,
+    pub body: Block,
     pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum SelectArmKind {
+    /// `name = <-channel_expr => body` — receive from a channel.
+    /// `binding` may be `_` for a discard.
+    Recv { binding: Ident, channel: Expr },
+    /// `_ = timeout(duration_expr) => body` — fires when no channel arm is
+    /// ready.
+    Timeout { duration: Expr },
+    /// `else => body` — fires when no channel arm is ready and no
+    /// `timeout(...)` arm is present. At most one allowed per `select`.
+    Else,
 }
 
 #[derive(Clone, Debug)]

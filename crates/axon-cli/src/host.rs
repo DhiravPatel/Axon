@@ -30,6 +30,8 @@ pub fn install(interp: &Interpreter) {
     install_ffi(interp);
     install_env(interp);
     install_deploy(interp);
+    install_supervisor(interp);
+    install_migrate(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,4 +1972,325 @@ fn deploy_write_manifest(args: &[Value]) -> Result<Value, String> {
     let path = std::path::Path::new(dir.as_str()).join("deploy.json");
     manifest.save(&path).map_err(|e| e.to_string())?;
     Ok(Value::String(Rc::new(path.display().to_string())))
+}
+
+// ---------------------------------------------------------------------------
+// `super_*` bindings  (Stage 18 — §22 supervisor restart strategies)
+//
+// A thread-local registry maps supervisor name → Supervisor. Programs build
+// one with `super_new`, populate children with `super_add_child`, then
+// drive restart decisions with `super_on_failure(now_ns)`. The decision
+// comes back as a record `{ kind, targets, reason }` where `kind` is
+// `"restart"` / `"escalate"` / `"unknown"`.
+// ---------------------------------------------------------------------------
+
+use axon_runtime::supervisor::{Decision, RestartStrategy, Supervisor};
+
+thread_local! {
+    static SUPERVISORS: RefCell<std::collections::HashMap<String, Supervisor>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn install_supervisor(interp: &Interpreter) {
+    interp.register_native("super_new", n("super_new", 4, Some(4), super_new));
+    interp.register_native(
+        "super_add_child",
+        n("super_add_child", 2, Some(2), super_add_child),
+    );
+    interp.register_native(
+        "super_on_failure",
+        n("super_on_failure", 3, Some(3), super_on_failure),
+    );
+    interp.register_native(
+        "super_escalated",
+        n("super_escalated", 1, Some(1), super_escalated),
+    );
+    interp.register_native(
+        "super_reset",
+        n("super_reset", 0, Some(0), super_reset),
+    );
+}
+
+fn super_new(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "super_new")?;
+    let strategy_name = s_arg(args, 1, "super_new")?;
+    let max_restarts = i_arg(args, 2, "super_new")?;
+    let within_ns = i_arg(args, 3, "super_new")?;
+    if max_restarts < 0 {
+        return Err("super_new: max_restarts must be ≥ 0".into());
+    }
+    if within_ns <= 0 {
+        return Err("super_new: within_ns must be > 0".into());
+    }
+    let strategy = RestartStrategy::parse(strategy_name.as_str()).ok_or_else(|| {
+        format!(
+            "super_new: unknown strategy `{strategy_name}` (expected one_for_one / one_for_all / rest_for_one)"
+        )
+    })?;
+    let s = Supervisor::new(
+        name.as_str(),
+        strategy,
+        max_restarts as u32,
+        within_ns,
+    );
+    SUPERVISORS.with(|reg| {
+        reg.borrow_mut().insert(name.as_str().to_string(), s);
+    });
+    Ok(Value::Unit)
+}
+
+fn super_add_child(args: &[Value]) -> Result<Value, String> {
+    let sup_name = s_arg(args, 0, "super_add_child")?;
+    let child = s_arg(args, 1, "super_add_child")?;
+    SUPERVISORS.with(|reg| -> Result<(), String> {
+        let mut r = reg.borrow_mut();
+        let s = r
+            .get_mut(sup_name.as_str())
+            .ok_or_else(|| format!("super_add_child: no supervisor `{sup_name}`"))?;
+        s.add_child(child.as_str().to_string());
+        Ok(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn super_on_failure(args: &[Value]) -> Result<Value, String> {
+    let sup_name = s_arg(args, 0, "super_on_failure")?;
+    let child = s_arg(args, 1, "super_on_failure")?;
+    let now_ns = i_arg(args, 2, "super_on_failure")?;
+    let decision = SUPERVISORS.with(|reg| -> Result<Decision, String> {
+        let mut r = reg.borrow_mut();
+        let s = r
+            .get_mut(sup_name.as_str())
+            .ok_or_else(|| format!("super_on_failure: no supervisor `{sup_name}`"))?;
+        Ok(s.on_failure(child.as_str(), now_ns))
+    })?;
+    let mut rec = Vec::new();
+    match decision {
+        Decision::Restart(targets) => {
+            rec.push((
+                "kind".to_string(),
+                Value::String(Rc::new("restart".to_string())),
+            ));
+            let xs: Vec<Value> = targets
+                .into_iter()
+                .map(|t| Value::String(Rc::new(t)))
+                .collect();
+            rec.push((
+                "targets".to_string(),
+                Value::List(Rc::new(std::cell::RefCell::new(xs))),
+            ));
+            rec.push(("reason".to_string(), Value::String(Rc::new(String::new()))));
+        }
+        Decision::Escalate { reason } => {
+            rec.push((
+                "kind".to_string(),
+                Value::String(Rc::new("escalate".to_string())),
+            ));
+            rec.push((
+                "targets".to_string(),
+                Value::List(Rc::new(std::cell::RefCell::new(vec![]))),
+            ));
+            rec.push(("reason".to_string(), Value::String(Rc::new(reason))));
+        }
+        Decision::Unknown(name) => {
+            rec.push((
+                "kind".to_string(),
+                Value::String(Rc::new("unknown".to_string())),
+            ));
+            rec.push((
+                "targets".to_string(),
+                Value::List(Rc::new(std::cell::RefCell::new(vec![]))),
+            ));
+            rec.push((
+                "reason".to_string(),
+                Value::String(Rc::new(format!("unknown child `{name}`"))),
+            ));
+        }
+    }
+    Ok(Value::Record(Rc::new(std::cell::RefCell::new(rec))))
+}
+
+fn super_escalated(args: &[Value]) -> Result<Value, String> {
+    let sup_name = s_arg(args, 0, "super_escalated")?;
+    let escalated = SUPERVISORS.with(|reg| -> Result<bool, String> {
+        let r = reg.borrow();
+        let s = r
+            .get(sup_name.as_str())
+            .ok_or_else(|| format!("super_escalated: no supervisor `{sup_name}`"))?;
+        Ok(s.is_escalated())
+    })?;
+    Ok(Value::Bool(escalated))
+}
+
+fn super_reset(_args: &[Value]) -> Result<Value, String> {
+    SUPERVISORS.with(|reg| reg.borrow_mut().clear());
+    Ok(Value::Unit)
+}
+
+// ---------------------------------------------------------------------------
+// `schema_migrate_*` bindings  (Stage 18 — §17.1 schema migrations)
+//
+// A thread-local registry per schema name holds:
+//   * the Migrator (current version + planned step versions)
+//   * the user-supplied transform Values, keyed by source version.
+//
+// Programs build a migrator with `schema_migrator_new(name, current_version)`,
+// register each step with `schema_add_migration(name, from_version, handler)`,
+// then run upgrades with `schema_migrate(name, value, from_version)`. The
+// handler is invoked once per step in order; if any step errors the chain
+// short-circuits with a typed `{ ok: false, error: ... }` record.
+// ---------------------------------------------------------------------------
+
+use axon_runtime::migrate::{MigrationError, Migrator};
+
+struct MigrationSlot {
+    migrator: Migrator,
+    /// Indexed by `from_version`. Same closure shape Axon programs hand in:
+    /// `fn(input) -> output`.
+    handlers: std::collections::HashMap<u32, Value>,
+}
+
+thread_local! {
+    static MIGRATORS: RefCell<std::collections::HashMap<String, MigrationSlot>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn install_migrate(interp: &Interpreter) {
+    interp.register_native(
+        "schema_migrator_new",
+        n("schema_migrator_new", 2, Some(2), schema_migrator_new),
+    );
+    interp.register_native(
+        "schema_add_migration",
+        n("schema_add_migration", 3, Some(3), schema_add_migration),
+    );
+    interp.register_native_ext(
+        "schema_migrate",
+        ext("schema_migrate", 3, Some(3), schema_migrate_ext),
+    );
+    interp.register_native(
+        "schema_migrate_reset",
+        n("schema_migrate_reset", 0, Some(0), schema_migrate_reset),
+    );
+}
+
+fn schema_migrator_new(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "schema_migrator_new")?;
+    let current = i_arg(args, 1, "schema_migrator_new")?;
+    if current < 0 {
+        return Err("schema_migrator_new: current_version must be ≥ 0".into());
+    }
+    let migrator = Migrator::new(name.as_str(), current as u32);
+    MIGRATORS.with(|reg| {
+        reg.borrow_mut().insert(
+            name.as_str().to_string(),
+            MigrationSlot {
+                migrator,
+                handlers: std::collections::HashMap::new(),
+            },
+        );
+    });
+    Ok(Value::Unit)
+}
+
+fn schema_add_migration(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "schema_add_migration")?;
+    let from_version = i_arg(args, 1, "schema_add_migration")?;
+    if from_version < 0 {
+        return Err("schema_add_migration: from_version must be ≥ 0".into());
+    }
+    let handler = args[2].clone();
+    if !matches!(
+        handler,
+        Value::Fn(_) | Value::Native(_) | Value::NativeExt(_) | Value::Tool(_)
+    ) {
+        return Err(format!(
+            "schema_add_migration: handler must be callable, got `{}`",
+            handler.type_name()
+        ));
+    }
+    MIGRATORS.with(|reg| -> Result<(), String> {
+        let mut r = reg.borrow_mut();
+        let slot = r
+            .get_mut(name.as_str())
+            .ok_or_else(|| format!("schema_add_migration: no migrator `{name}`"))?;
+        slot.migrator
+            .add_step(from_version as u32)
+            .map_err(|e| format!("schema_add_migration: {e}"))?;
+        slot.handlers.insert(from_version as u32, handler);
+        Ok(())
+    })?;
+    Ok(Value::Unit)
+}
+
+/// `schema_migrate(name, value, from_version)` → record
+/// `{ ok: Bool, value: <migrated>, error: String }`.
+fn schema_migrate_ext(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let name = s_arg(args, 0, "schema_migrate")?;
+    let input = args[1].clone();
+    let from_version = i_arg(args, 2, "schema_migrate")?;
+    if from_version < 0 {
+        return Err("schema_migrate: from_version must be ≥ 0".into());
+    }
+
+    // Plan first (borrows the registry briefly), then drop the borrow so
+    // the handler can re-borrow if it wants to.
+    let (plan_result, handlers): (Result<Vec<u32>, MigrationError>, _) = MIGRATORS.with(|reg| {
+        let r = reg.borrow();
+        let slot = match r.get(name.as_str()) {
+            Some(s) => s,
+            None => return (Err(MigrationError::Missing { from_version: 0 }), Vec::new()),
+        };
+        let plan = slot.migrator.plan(from_version as u32);
+        let mut handlers_in_order: Vec<(u32, Value)> = Vec::new();
+        if let Ok(p) = &plan {
+            for v in p {
+                if let Some(h) = slot.handlers.get(v) {
+                    handlers_in_order.push((*v, h.clone()));
+                }
+            }
+        }
+        (plan, handlers_in_order)
+    });
+
+    let mut current = input;
+    let mut error: Option<String> = None;
+    match plan_result {
+        Ok(_) => {
+            for (v, h) in &handlers {
+                match interp.call_value(h, &[current.clone()], span) {
+                    Ok(next) => current = next,
+                    Err(sig) => {
+                        error = Some(format!(
+                            "migration step from v{v} failed: {}",
+                            eval_signal_msg(&sig)
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => error = Some(format!("{e}")),
+    }
+
+    let mut rec = Vec::new();
+    if let Some(msg) = error {
+        rec.push(("ok".to_string(), Value::Bool(false)));
+        rec.push(("value".to_string(), Value::Nil));
+        rec.push(("error".to_string(), Value::String(Rc::new(msg))));
+    } else {
+        rec.push(("ok".to_string(), Value::Bool(true)));
+        rec.push(("value".to_string(), current));
+        rec.push(("error".to_string(), Value::String(Rc::new(String::new()))));
+    }
+    Ok(Value::Record(Rc::new(std::cell::RefCell::new(rec))))
+}
+
+fn schema_migrate_reset(_args: &[Value]) -> Result<Value, String> {
+    MIGRATORS.with(|reg| reg.borrow_mut().clear());
+    Ok(Value::Unit)
 }

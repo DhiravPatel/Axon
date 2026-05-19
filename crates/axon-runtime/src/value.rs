@@ -149,6 +149,9 @@ pub struct Closure {
     pub env: Env,
     pub span: Span,
     pub declared_effects: Option<Vec<String>>,
+    /// Behavioural attributes parsed from `@retry`, `@memoize`, `@deadline`,
+    /// `@idempotent`. Default empty; see [`crate::attrs::CallPolicy`].
+    pub policy: crate::attrs::CallPolicy,
 }
 
 pub enum ClosureBody {
@@ -582,6 +585,30 @@ impl Closure {
             env,
             span,
             declared_effects,
+            policy: crate::attrs::CallPolicy::default(),
+        }
+    }
+
+    /// Sibling constructor that also takes a parsed [`CallPolicy`]; used by
+    /// `load_program` when it turns an `FnDecl` (with `@retry`, `@deadline`,
+    /// ...) into a closure value.
+    pub fn with_policy(
+        name: Option<String>,
+        params: Vec<Param>,
+        body: ClosureBody,
+        env: Env,
+        span: Span,
+        declared_effects: Option<Vec<String>>,
+        policy: crate::attrs::CallPolicy,
+    ) -> Self {
+        Self {
+            name,
+            params,
+            body,
+            env,
+            span,
+            declared_effects,
+            policy,
         }
     }
 

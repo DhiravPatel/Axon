@@ -15,13 +15,16 @@
 //!     either a `Value` or a `RuntimeError`.
 
 mod actor;
+pub mod attrs;
 mod budget;
 mod builtin;
 mod caps;
 mod env;
 mod error;
 mod eval;
+pub mod migrate;
 mod record;
+pub mod supervisor;
 mod tool;
 mod trace;
 mod value;

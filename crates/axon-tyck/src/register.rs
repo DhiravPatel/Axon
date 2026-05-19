@@ -88,6 +88,12 @@ impl<'a> Checker<'a> {
             "env_get", "env_get_or", "env_load_dotenv",
             // ---- Stage 17 deploy: HTTP server + manifest ----
             "serve_run", "deploy_write_manifest",
+            // ---- Stage 18 supervisor restart strategies ----
+            "super_new", "super_add_child", "super_on_failure", "super_escalated",
+            "super_reset",
+            // ---- Stage 18 schema migrations ----
+            "schema_migrator_new", "schema_add_migration", "schema_migrate",
+            "schema_migrate_reset",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),

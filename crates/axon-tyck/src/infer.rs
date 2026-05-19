@@ -499,11 +499,19 @@ impl<'a> Checker<'a> {
                 let _ = self.check_block(then_branch, &Ty::Unit, scope, params, used);
                 Ty::Unit
             }
-            ExprKind::For { pat, iter, body } => {
+            ExprKind::For { pat, iter, body, .. } => {
                 let iter_ty = self.infer(iter, scope, params, used);
                 let elem_ty = match iter_ty {
                     Ty::List(t) | Ty::Set(t) | Ty::Stream(t) => *t,
                     Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+                    // `Dyn` is the gradual escape hatch: any value at
+                    // runtime might be iterable (List / Chan / Stream).
+                    // Stage 12 relaxed field access on Dyn for the same
+                    // reason; we do the same for iteration so values
+                    // returned from native built-ins (list_new, chan,
+                    // mem_*, rag_*) can drive `for` / `for await` without
+                    // manual ascriptions.
+                    Ty::Dyn | Ty::Error => Ty::Dyn,
                     other => {
                         self.report(
                             Diagnostic::error(
@@ -554,12 +562,26 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Plan { target, slots } => {
                 let _ = self.infer(target, scope, params, used);
+                let mut has_output_slot = false;
                 for s in slots {
                     self.infer(&s.value, scope, params, used);
+                    if let Some(label) = &s.label {
+                        if label.name == "output" {
+                            has_output_slot = true;
+                        }
+                    }
                 }
                 self.use_effect(used, "LLM");
                 self.use_effect(used, "Net");
-                Ty::String
+                // With `output: Schema`, the runtime parses the final
+                // response as JSON and surfaces a structured Record.
+                // Surface that as `Dyn` so field access works through the
+                // gradual escape hatch (Stage 12 propagation).
+                if has_output_slot {
+                    Ty::Dyn
+                } else {
+                    Ty::String
+                }
             }
             ExprKind::Stream { item_type, body } => {
                 let item_ty = item_type
@@ -950,6 +972,14 @@ impl<'a> Checker<'a> {
                 } else {
                     return Ty::Error;
                 }
+            }
+            (Ty::Dyn, _) | (Ty::Error, _) => {
+                // Same `Dyn` relaxation as field access (Stage 12) and `for`
+                // iteration (Stage 19): we don't know the receiver's type
+                // at compile time, so the call returns Dyn. Argument types
+                // are unknown — accept any positional args.
+                let arity = args.len();
+                (Ty::Dyn, EffectRow::pure(), vec![Ty::Dyn; arity])
             }
             (other, name) => {
                 self.report(errors::no_such_method(span, name, other));
