@@ -79,6 +79,14 @@ fn main() -> ExitCode {
             let remaining: Vec<String> = args.collect();
             cmd_fmt(&remaining)
         }
+        "serve" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_serve(&remaining)
+        }
+        "deploy" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_deploy(&remaining)
+        }
         "version" | "--version" | "-V" => {
             println!("axon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -119,6 +127,14 @@ fn print_help() {
                           formatted output to stdout. `--write` overwrites\n\
                           the input in place; `--check` exits non-zero if\n\
                           any file would be reformatted (useful in CI).\n\
+           serve  <file> --listen ADDR --handler NAME\n\
+                          Start an HTTP/1.1 server. POST /invoke dispatches\n\
+                          to the named handler with the request body; GET\n\
+                          /healthz and /readyz return JSON health status.\n\
+           deploy <file> -o DIR [--name N] [--port P] [--handler H]\n\
+                          Package a project for deployment: write a\n\
+                          `.axskill` archive plus a `deploy.json` manifest\n\
+                          into DIR. Pair with `axon serve` on the target.\n\
            build  [-o out.wasm] <file>\n\
                           Lower the integer subset of Axon to a WebAssembly\n\
                           module. The output runs in any standard WASM runtime\n\
@@ -879,4 +895,234 @@ fn print_item_summary(item: &axon_ast::Item) {
         Item::Eval(e) => println!("  eval {}", e.name),
         Item::Config(c) => println!("  config {}", c.name.name),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 17 — `axon serve` and `axon deploy`
+// ---------------------------------------------------------------------------
+
+fn cmd_serve(args: &[String]) -> ExitCode {
+    let mut file: Option<&str> = None;
+    let mut listen = "127.0.0.1:8080".to_string();
+    let mut handler = "main".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--listen" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon serve: --listen requires ADDR");
+                    return ExitCode::from(2);
+                }
+                listen = args[i].clone();
+                i += 1;
+            }
+            "--handler" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon serve: --handler requires NAME");
+                    return ExitCode::from(2);
+                }
+                handler = args[i].clone();
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon serve: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if file.is_some() {
+                    eprintln!("axon serve: only one source file is supported");
+                    return ExitCode::from(2);
+                }
+                file = Some(a);
+                i += 1;
+            }
+        }
+    }
+    let file = match file {
+        Some(f) => f,
+        None => {
+            eprintln!("usage: axon serve <file> [--listen ADDR] [--handler NAME]");
+            return ExitCode::from(2);
+        }
+    };
+
+    let text = match std::fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon serve: cannot read `{file}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let source = axon_diag::SourceFile::new(file, &text);
+    let (program, diags) = axon_parser::parse(&source);
+    if !diags.is_empty() {
+        for d in &diags {
+            eprintln!("{}", axon_diag::render(d, &source, true));
+        }
+        return ExitCode::from(1);
+    }
+
+    let mut interp = axon_runtime::Interpreter::new();
+    host::install(&interp);
+    interp.load_program(&program);
+
+    // Look up the named handler in globals.
+    let callee = match interp.globals.lookup(&handler) {
+        Some(v) => v,
+        None => {
+            eprintln!("axon serve: handler `{handler}` not found in program");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Programmatically call serve_run(listen, callee). The simpler path
+    // would be to expose a Rust-side `serve` directly, but routing
+    // through the same NativeExt the language uses means there's exactly
+    // one server code path.
+    let serve_native = match interp.globals.lookup("serve_run") {
+        Some(v) => v,
+        None => {
+            eprintln!("axon serve: serve_run binding missing (internal error)");
+            return ExitCode::from(1);
+        }
+    };
+    let result = interp.call_value(
+        &serve_native,
+        &[
+            axon_runtime::Value::String(std::rc::Rc::new(listen)),
+            callee,
+        ],
+        axon_diag::Span::DUMMY,
+    );
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("axon serve: {e:?}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_deploy(args: &[String]) -> ExitCode {
+    let mut src_dir: Option<&str> = None;
+    let mut out_dir: Option<&str> = None;
+    let mut name: Option<String> = None;
+    let mut handler = "main".to_string();
+    let mut port: u16 = 8080;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-o" | "--out" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon deploy: -o requires DIR");
+                    return ExitCode::from(2);
+                }
+                out_dir = Some(args[i].as_str());
+                i += 1;
+            }
+            "--name" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon deploy: --name requires NAME");
+                    return ExitCode::from(2);
+                }
+                name = Some(args[i].clone());
+                i += 1;
+            }
+            "--handler" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon deploy: --handler requires NAME");
+                    return ExitCode::from(2);
+                }
+                handler = args[i].clone();
+                i += 1;
+            }
+            "--port" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon deploy: --port requires N");
+                    return ExitCode::from(2);
+                }
+                port = match args[i].parse() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("axon deploy: --port must be 0..=65535");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 1;
+            }
+            other if other.starts_with("--") || other.starts_with('-') => {
+                eprintln!("axon deploy: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if src_dir.is_some() {
+                    eprintln!("axon deploy: only one project dir is supported");
+                    return ExitCode::from(2);
+                }
+                src_dir = Some(a);
+                i += 1;
+            }
+        }
+    }
+    let (src, out) = match (src_dir, out_dir) {
+        (Some(s), Some(o)) => (s, o),
+        _ => {
+            eprintln!("usage: axon deploy <project_dir> -o <out_dir> [--name N] [--port P] [--handler H]");
+            return ExitCode::from(2);
+        }
+    };
+    let src_path = std::path::Path::new(src);
+    let out_path = std::path::Path::new(out);
+    if let Err(e) = std::fs::create_dir_all(out_path) {
+        eprintln!("axon deploy: cannot create `{out}`: {e}");
+        return ExitCode::from(1);
+    }
+    // Pack the skill.
+    let skill = match axon_skill::Skill::pack(src_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("axon deploy: skill pack: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let skill_name = name.unwrap_or_else(|| skill.manifest.name.clone());
+    let skill_path = out_path.join(format!("{}.axskill", skill_name));
+    let skill_bytes = match skill.to_json() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("axon deploy: serialize skill: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = std::fs::write(&skill_path, skill_bytes) {
+        eprintln!("axon deploy: write {}: {e}", skill_path.display());
+        return ExitCode::from(1);
+    }
+    // Write the manifest.
+    let manifest = axon_deploy::DeployManifest {
+        version: axon_deploy::manifest::MANIFEST_VERSION,
+        name: skill_name.clone(),
+        entrypoint_handler: handler,
+        port,
+        env: Default::default(),
+        health_checks: vec!["liveness".into()],
+        dotenv: None,
+        vault: None,
+    };
+    let manifest_path = out_path.join("deploy.json");
+    if let Err(e) = manifest.save(&manifest_path) {
+        eprintln!("axon deploy: write manifest: {e}");
+        return ExitCode::from(1);
+    }
+    println!("wrote {}", skill_path.display());
+    println!("wrote {}", manifest_path.display());
+    ExitCode::SUCCESS
 }

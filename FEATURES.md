@@ -143,6 +143,204 @@ A snapshot of everything Axon ships today, grouped by the stages that introduced
 - Completion: keywords, in-scope identifiers, member access.
 - Editor integration ready (VS Code, Neovim, any LSP-aware client).
 
+## Stage 17 — Deploy (HTTP server, health checks, env binding, manifest)
+
+**Crate:** [axon-deploy](crates/axon-deploy/). Adds `axon serve` and `axon deploy` CLI subcommands.
+
+### `axon-deploy` (§41) — production deploy primitives
+- **Minimal HTTP/1.1 server** in pure Rust (`std::net::TcpListener`, thread-per-connection, no `tokio`/`hyper`).
+  - Routes `POST /invoke` to a user handler.
+  - Routes `GET /healthz` (liveness: 200 if anything is up) and `GET /readyz` (readiness: 503 if any check fails).
+  - 15s read/write timeouts, 4 MiB body cap, 32 KiB header cap — malformed/oversize requests are rejected before they reach a handler.
+  - `Connection: close` per response; one request per socket. Keeps the server loop ~200 LoC.
+- `HealthCheck` trait + built-in `Liveness` + `AlwaysHealthy(name)`. Custom checks plug in via `Server::with_check(Box::new(...))`.
+- **Dotenv loader** that preserves existing process env by default (deployment-baked secrets win over repo defaults). `overwrite: true` for the rare cases that need it.
+- `DeployManifest` (`deploy.json`): `name`, `entrypoint_handler`, `port`, `env: BTreeMap<String, String>`, `health_checks: Vec<String>`, optional `dotenv` + `vault` refs, version-checked on load.
+
+### CLI bindings
+- `env_get(name)`, `env_get_or(name, default)`, `env_load_dotenv(path, overwrite)`.
+- `serve_run(listen_addr, handler)` — **NativeExt**; binds the server, then routes each request through the Axon handler in the interpreter thread. Cross-thread handoff via `mpsc` so the single-threaded interpreter stays sound even though the HTTP loop is multi-threaded.
+- `deploy_write_manifest(dir, name, entrypoint, port)`.
+
+### New `axon` subcommands
+- **`axon serve <file> [--listen ADDR] [--handler NAME]`** — start the HTTP server.
+- **`axon deploy <project_dir> -o <out_dir> [--name N] [--port P] [--handler H]`** — package: writes `<name>.axskill` (Stage 14 format) + `deploy.json`.
+
+### CLI demo (real run, with `nc` hitting the live server)
+```
+$ axon deploy src_project -o dist --port 9191 --handler greet
+wrote dist/greet-svc.axskill
+wrote dist/deploy.json
+
+$ axon serve server.ax --listen 127.0.0.1:9192 --handler greet
+axon serve: listening on 127.0.0.1:9192
+
+$ printf 'POST /invoke HTTP/1.1\r\n...\r\n\r\naxon!' | nc 127.0.0.1 9192
+HTTP/1.1 200 OK
+Content-Length: 13
+Hello, axon!!
+
+$ printf 'GET /healthz HTTP/1.1\r\n...\r\n\r\n' | nc 127.0.0.1 9192
+HTTP/1.1 200 OK
+{"checks":[{"detail":"","name":"liveness","ok":true}],"ok":true}
+```
+
+---
+
+## Stage 16 — Trajectory Eval, Cost Optimization, FFI
+
+**Crates:** [axon-eval](crates/axon-eval/), [axon-cost](crates/axon-cost/), [axon-ffi](crates/axon-ffi/)
+
+### `axon-eval` (§55) — scenarios, metrics, suite runner
+- `Scenario { name, input, expected, tags }`; `RunResult { output, latency_ms, data, error }`.
+- Five built-in metrics: `ExactMatch`, `Contains`, `RegexLike` (anchored wildcard), `JsonPath` (`/foo/bar=value`), `LatencyP95` (per-suite budget over actual latencies).
+- `Metric` trait is object-safe so suites hold heterogeneous `Box<dyn Metric>`.
+- `Suite::run` takes `FnMut` so the host can capture `&mut Interpreter` and dispatch through user-supplied handlers.
+- `SuiteReport::to_junit_xml()` emits CI-friendly XML with per-testcase failure messages.
+
+### `axon-cost` (§56) — ledger, profiles, reports
+- `CostEntry`: per-call `(provider, model, input_tokens, output_tokens, cached_input_tokens, latency_ms, timestamp_ns, tag)`.
+- `ProviderProfile`: prices in cents-per-million-tokens (so integer math doesn't round cheap models to zero), plus optional per-call fixed cost and cached-input discount.
+- `Ledger::save`/`load` for cross-process persistence with versioned JSON.
+- `Report::build` aggregates: total calls / cents, per-provider summary, **p50 + p95 latency**, top-N most-expensive calls.
+
+### `axon-ffi` (§35) — subprocess FFI with JSON line protocol
+- `call_once(spec, request)` — spawn, write one JSON line on stdin, read one JSON line from stdout, return response. Bounded by `timeout_ms` with a sentinel thread that `SIGKILL`s overstays via libc.
+- `Connection` for persistent line-protocol children (amortizes spawn cost).
+- All FFI is subprocess-based — no `libloading`, no `unsafe`, no native deps beyond `libc` on Unix.
+
+### CLI bindings
+- `eval_suite_new`, `eval_add_scenario`, `eval_add_metric` (`exact_match`/`contains`/`regex_like`/`json_path`), `eval_set_latency_budget`, `eval_run` (NativeExt — invokes the user handler), `eval_report_junit`.
+- `cost_record`, `cost_profile_add`, `cost_report`, `cost_save`, `cost_load`, `cost_reset`.
+- `ffi_call(program, args_list, request_json, timeout_ms)` → `{ ok, response_json, error }`.
+
+### CLI demo (real run)
+```
+--- eval ---
+3                                  # total scenarios
+2                                  # passed (1 expected-mismatch failed)
+--- cost ---
+3                                  # total calls
+2700                               # total cents ($27.00 across 3 calls)
+600                                # p50 latency_ms
+900                                # p95 latency_ms
+anthropic                          # top-spend provider
+anthropic                          # most expensive single call's provider
+--- ffi ---
+true
+{"hello":"axon"}                   # JSON round-tripped through /bin/cat
+```
+The JUnit XML report from `eval_report_junit` includes:
+```xml
+<testsuite name="polite-suite" tests="3" failures="1">
+  <testcase name="wrong" time="0">
+    <failure message="exact_match: expected `Goodbye, axon!`, got `Hello, axon!`"/>
+  </testcase>
+</testsuite>
+```
+
+---
+
+## Stage 15 — Guardrails, Secrets, Sandbox
+
+**Crates:** [axon-guard](crates/axon-guard/), [axon-secret](crates/axon-secret/), [axon-sandbox](crates/axon-sandbox/)
+
+### `axon-guard` (§30) — guardrails for inputs and outputs
+- `ContentFilter` with detectors for **Email**, **US phone**, **US SSN**, **credit cards** (with Luhn check + word boundaries), **API keys** (`sk-ant-`/`sk-`/`ghp_`/`github_pat_`), **AWS access keys** (`AKIA…`/`ASIA…`), **private-key headers** (RSA / OpenSSH / EC / DSA / PKCS8).
+- `Finding` carries a `redacted` preview so logs never show the raw match.
+- `injection_score(text)` — heuristic 0..=1 with weighted flags for `IgnorePrevious` / `RoleOverride` / `EmbeddedSystemTag` / `PromptLeak` / `JailbreakLingo` / `SuspiciousBase64Blob`.
+- `Policy` — `allow`/`deny` rule list with `Contains` and anchored `Wildcard` matchers, default action, first-match-wins evaluation. JSON-serializable for `axon.toml` integration.
+
+### `axon-secret` (§40) — redaction-aware secrets
+- `Secret<T>` — wraps a value so `Debug`, `Display`, and `Serialize` all emit `<redacted>`. The only way to read the inner value is `expose_for_use()`, whose name flags audit-trail usage.
+- `Vault` — JSON file with `{ version, secrets: BTreeMap }`. Save uses atomic `tmp → rename`; on Unix the file is created with **mode `0600`** via `OpenOptions::mode`.
+- `Vault::load` **rejects insecure permissions** (`mode & 0o077 != 0` → `InsecurePermissions { path, mode }`) with an actionable error message ("Run `chmod 600 …`").
+
+### `axon-sandbox` (§42) — resource-limited subprocesses
+- `Limits { cpu_seconds, memory_mb, max_open_files, wall_seconds }` with conservative defaults (10s CPU / 256 MB / 64 FDs / 15s wall).
+- `run_sandboxed` applies `setrlimit` via Unix `pre_exec` so the limits take effect **before the child's `execve`**.
+- Wall-clock timeout is enforced by the parent via polling + `kill`.
+- `SandboxResult` distinguishes `wall_timeout` (parent killed it) from `limit_breached` (kernel signaled, e.g. `SIGXCPU`).
+- Windows path is documented as v0 limit — `Limits` are accepted but only wall timeout fires.
+
+### CLI bindings
+- `guard_scan_pii(text)`, `guard_scan_secrets(text)`, `guard_injection_score(text)`, `guard_policy_evaluate(json_path, text)`.
+- `secret_open(path)`, `secret_get(name)` (returns `<redacted>` by default), `secret_set(name, value)`, `secret_remove(name)`, `secret_names()`, `secret_redact(s)`.
+- `sandbox_run(program, args_list, cpu_seconds, memory_mb, wall_seconds)` → `{ exit_code, stdout, stderr, wall_ms, wall_timeout, limit_breached }`.
+
+### CLI demo (real run)
+```
+--- guardrails ---
+3
+Email
+PhoneUs
+SsnUs
+2                                  # 2 injection flags
+allow                              # policy: "approved: ship it"
+deny                               # policy: "key=AKIA..." (deny-aws-key)
+--- secrets ---
+2                                  # 2 secrets stored
+<redacted>                         # secret_get never shows clear value
+--- sandbox ---
+sandboxed                          # stdout from /bin/sh
+0                                  # exit_code
+true                               # wall_timeout fired on `sleep 5` with 1s limit
+```
+The vault file is `-rw-------` on disk — `ls -l` confirms mode `0600`.
+
+---
+
+## Stage 14 — Durable Triggers, Skill Packaging, A2A Discovery
+
+**Crates:** [axon-trigger](crates/axon-trigger/), [axon-skill](crates/axon-skill/), [axon-a2a](crates/axon-a2a/)
+
+### `axon-trigger` (§52) — schedules + in-process scheduler
+- `Schedule::Every { period_ns }` / `Schedule::At { when_ns }` / `Schedule::Cron(CronExpr)`.
+- `CronExpr::parse` — 5-field POSIX subset (`min hour dom mon dow`) with `*`, lists, ranges, `*/N` steps, and the OR-semantics for restricted dom+dow.
+- `Schedule::due_at(last, now)` — coalescing catch-up: a process offline for hours fires once on resume, not once per missed window. Returns the period-grid deadline so persisted state stays aligned.
+- `Scheduler::tick(now_ns)` is pure bookkeeping — returns IDs in deterministic id-sorted order so the host can dispatch.
+- `save_to_memory(store)` / `load_from_memory(store)` — durable state on top of any `axon_memory::Store`. Restart resumes exactly where the last save left off.
+- `RetryPolicy` with bounded `max_attempts` + `backoff_ns`; trigger auto-disables after exhaustion.
+
+### `axon-skill` (§53) — `.axskill` package format
+- One file, one JSON document: `{ manifest, files }`. Pure-Rust, deterministic on disk, `cat | jq`-friendly.
+- `Manifest`: name, version, entrypoint, capabilities, dependencies, authors, description.
+- `Skill::pack(dir)` walks a directory tree (UTF-8 only) and slurps every file relative to the root.
+- Every archive carries a **content hash** (FNV-1a over canonical key/body concat). `Skill::verify()` rejects tampered files, unknown format versions, missing entrypoints.
+- `Skill::unpack_to(dest)` only writes after verification passes.
+
+### `axon-a2a` (§54) — agent cards & discovery
+- `AgentCard` schema matching `/.well-known/agent-card.json`: `agent_id`, `name`, `version`, `endpoint`, `capabilities` (with input/output schema URLs), `auth` (`None`/`ApiKey`/`Bearer`/`OAuth2`), `pricing`, `rate_limits`, free-form metadata.
+- `AgentCard::verify()` — required fields non-empty, endpoint is `http(s)://`, capability names unique, schema URLs well-formed.
+- `load_card_from_path(path)` for local/test discovery; `fetch_card(base_url)` for HTTPS via `ureq` with a 10-second total timeout.
+
+### CLI bindings
+- `trigger_every`, `trigger_at`, `trigger_cron`, `trigger_remove`, `trigger_len`, `trigger_save`, `trigger_load`, and `trigger_tick(now_ns)` (NativeExt — looks up the handler by name in the global env and invokes it).
+- `skill_pack(src_dir, dest)`, `skill_install(pkg, dest_dir)`, `skill_inspect(pkg)`.
+- `a2a_card_load(path)`, `a2a_card_fetch(url)`, `a2a_card_has_capability(path, name)`.
+
+### CLI demo (real run)
+```
+--- triggers ---
+2                                      # 2 triggers registered
+[trigger] heartbeat                    # first tick: heartbeat fires
+1
+[trigger] running nightly report       # second tick: nightly_at fires
+1
+--- skill packaging ---
+hello-skill
+1.0.0
+h_ce8bc9a61355bb08                     # content hash
+--- a2a discovery ---
+Acme Research Agent
+https://research.acme.com/agent
+2                                      # 2 capabilities
+Research
+true                                   # has_capability("Summarize")
+```
+
+---
+
 ## Stage 13 — Orchestration & Reasoning
 
 **Crate:** [axon-flow](crates/axon-flow/), plus a runtime extension (`NativeExtFn` / `Value::NativeExt`).

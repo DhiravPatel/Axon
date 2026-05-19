@@ -1,0 +1,10 @@
+[package]
+name = "axon-secret"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon secrets — Secret<T> redaction-aware type + filesystem-permission-protected vault."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

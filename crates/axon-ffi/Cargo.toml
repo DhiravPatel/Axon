@@ -1,0 +1,13 @@
+[package]
+name = "axon-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon foreign function interface — subprocess FFI with JSON line protocol."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

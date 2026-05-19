@@ -19,6 +19,16 @@ members = [
     "crates/axon-rag",
     "crates/axon-media",
     "crates/axon-flow",
+    "crates/axon-trigger",
+    "crates/axon-skill",
+    "crates/axon-a2a",
+    "crates/axon-guard",
+    "crates/axon-secret",
+    "crates/axon-sandbox",
+    "crates/axon-eval",
+    "crates/axon-cost",
+    "crates/axon-ffi",
+    "crates/axon-deploy",
     "crates/axon-cli",
 ]
 resolver = "2"
@@ -51,6 +61,16 @@ axon-memory  = { path = "crates/axon-memory" }
 axon-rag     = { path = "crates/axon-rag" }
 axon-media   = { path = "crates/axon-media" }
 axon-flow    = { path = "crates/axon-flow" }
+axon-trigger = { path = "crates/axon-trigger" }
+axon-skill   = { path = "crates/axon-skill" }
+axon-a2a     = { path = "crates/axon-a2a" }
+axon-guard   = { path = "crates/axon-guard" }
+axon-secret  = { path = "crates/axon-secret" }
+axon-sandbox = { path = "crates/axon-sandbox" }
+axon-eval    = { path = "crates/axon-eval" }
+axon-cost    = { path = "crates/axon-cost" }
+axon-ffi     = { path = "crates/axon-ffi" }
+axon-deploy  = { path = "crates/axon-deploy" }
 
 ureq         = { version = "2", default-features = false, features = ["tls", "json"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

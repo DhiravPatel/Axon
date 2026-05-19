@@ -1,0 +1,10 @@
+[package]
+name = "axon-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon guardrails — policy DSL, PII/secret content filters, prompt-injection heuristics."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

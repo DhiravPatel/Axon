@@ -1,0 +1,15 @@
+[package]
+name = "axon-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon sandbox — resource limits and subprocess sandboxing via Unix rlimit."
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

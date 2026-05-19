@@ -61,6 +61,33 @@ impl<'a> Checker<'a> {
             "media_image_load", "media_audio_load", "media_document_load", "media_sniff",
             // ---- Stage 13 flow: orchestration + reasoning combinators ----
             "flow_seq", "flow_parallel", "flow_refine",
+            // ---- Stage 14 triggers: durable scheduling ----
+            "trigger_every", "trigger_at", "trigger_cron", "trigger_remove", "trigger_len",
+            "trigger_tick", "trigger_save", "trigger_load",
+            // ---- Stage 14 skills: .axskill packaging ----
+            "skill_pack", "skill_install", "skill_inspect",
+            // ---- Stage 14 a2a: agent-to-agent discovery ----
+            "a2a_card_load", "a2a_card_fetch", "a2a_card_save", "a2a_card_has_capability",
+            // ---- Stage 15 guardrails: PII/injection/policy ----
+            "guard_scan_pii", "guard_scan_secrets", "guard_injection_score",
+            "guard_policy_evaluate",
+            // ---- Stage 15 secrets: redaction-aware vault ----
+            "secret_open", "secret_get", "secret_set", "secret_remove", "secret_names",
+            "secret_redact",
+            // ---- Stage 15 sandbox: resource-limited subprocesses ----
+            "sandbox_run",
+            // ---- Stage 16 eval: trajectory eval suite runner ----
+            "eval_suite_new", "eval_add_scenario", "eval_add_metric",
+            "eval_set_latency_budget", "eval_run", "eval_report_junit",
+            // ---- Stage 16 cost: cost ledger ----
+            "cost_record", "cost_profile_add", "cost_report",
+            "cost_save", "cost_load", "cost_reset",
+            // ---- Stage 16 ffi: subprocess FFI ----
+            "ffi_call",
+            // ---- Stage 17 env: environment binding ----
+            "env_get", "env_get_or", "env_load_dotenv",
+            // ---- Stage 17 deploy: HTTP server + manifest ----
+            "serve_run", "deploy_write_manifest",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),
