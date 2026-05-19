@@ -102,6 +102,47 @@ impl Vault {
             .ok_or_else(|| VaultError::NotFound(name.to_string()))
     }
 
+    // ---- OAuth-shaped accessors -------------------------------------
+
+    /// Store an OAuth token. The token's JSON shape is written under
+    /// the key `oauth:{name}` so it lives alongside plain secrets in the
+    /// same vault file without a schema change.
+    pub fn set_oauth(&mut self, name: &str, token: &crate::oauth::OauthToken) -> Result<(), VaultError> {
+        let json = serde_json::to_string(token).map_err(|e| VaultError::Encode(e.to_string()))?;
+        self.secrets.insert(format!("oauth:{name}"), json);
+        Ok(())
+    }
+
+    /// Load an OAuth token previously stored with [`set_oauth`].
+    pub fn get_oauth(&self, name: &str) -> Result<crate::oauth::OauthToken, VaultError> {
+        let key = format!("oauth:{name}");
+        let raw = self
+            .secrets
+            .get(&key)
+            .ok_or_else(|| VaultError::NotFound(key.clone()))?;
+        serde_json::from_str(raw).map_err(|e| VaultError::Parse(e.to_string()))
+    }
+
+    /// Load + refresh if expired (or within `slack_secs` of expiry).
+    /// Persists the rotated token back to `path` so the next process
+    /// boot picks up the new access token. Returns the live token.
+    pub fn load_oauth_with_refresh(
+        &mut self,
+        name: &str,
+        slack_secs: i64,
+        path: impl AsRef<Path>,
+    ) -> Result<crate::oauth::OauthToken, VaultError> {
+        let mut token = self.get_oauth(name)?;
+        if token.needs_refresh(slack_secs) {
+            token
+                .refresh()
+                .map_err(|e| VaultError::Encode(format!("oauth refresh: {e}")))?;
+            self.set_oauth(name, &token)?;
+            self.save(path)?;
+        }
+        Ok(token)
+    }
+
     /// Write the vault to `path`. On Unix the file is created with `0600`;
     /// on other platforms we rely on default permissions and document the
     /// gap (Windows ACLs come with §42 sandbox).

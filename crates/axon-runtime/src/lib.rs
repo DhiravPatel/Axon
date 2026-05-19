@@ -23,6 +23,7 @@ mod env;
 mod error;
 mod eval;
 pub mod migrate;
+pub mod otlp;
 mod record;
 pub mod supervisor;
 mod tool;

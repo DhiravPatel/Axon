@@ -115,6 +115,12 @@ impl Recording {
 pub struct Replay {
     events: Vec<RecordedEvent>,
     cursor: usize,
+    /// `true` → `--patch` mode: a program issuing **more** events than
+    /// the recording captured (because the source has been edited) is
+    /// allowed; the next event surfaces as `MissingFromRecording` so the
+    /// caller can choose to make a live call or synthesize a stub.
+    /// Default `false` → strict; extra events are a hard error.
+    lenient: bool,
 }
 
 impl Replay {
@@ -122,7 +128,22 @@ impl Replay {
         Self {
             events: rec.events,
             cursor: 0,
+            lenient: false,
         }
+    }
+
+    /// Construct in `--patch` mode: extra events past the recording end
+    /// are reported via [`ReplayMiss::Exhausted`] rather than failing.
+    pub fn new_lenient(rec: Recording) -> Self {
+        Self {
+            events: rec.events,
+            cursor: 0,
+            lenient: true,
+        }
+    }
+
+    pub fn is_lenient(&self) -> bool {
+        self.lenient
     }
 
     /// Pop the next event off the front of the recording. Returns
@@ -130,10 +151,13 @@ impl Replay {
     /// program is doing something different from what was recorded.
     pub fn next_event(&mut self) -> Result<RecordedEvent, String> {
         if self.cursor >= self.events.len() {
-            return Err(
+            return Err(if self.lenient {
+                "replay exhausted (patch mode): no recorded event remaining for this call"
+                    .into()
+            } else {
                 "replay exhausted: the program issued more non-deterministic events than were recorded"
-                    .into(),
-            );
+                    .into()
+            });
         }
         let ev = self.events[self.cursor].clone();
         self.cursor += 1;
@@ -142,6 +166,16 @@ impl Replay {
 
     pub fn is_done(&self) -> bool {
         self.cursor >= self.events.len()
+    }
+
+    /// How many events have been consumed so far. Useful for reporting
+    /// at end-of-run ("consumed 4 of 7 recorded events").
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn total(&self) -> usize {
+        self.events.len()
     }
 }
 

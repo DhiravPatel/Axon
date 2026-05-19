@@ -143,6 +143,17 @@ impl Interpreter {
         self.tracer.borrow_mut().take()
     }
 
+    /// Snapshot the current trace spans without disturbing the tracer.
+    /// Used by `trace_export_otlp` to flush mid-run, and by `axon repl`
+    /// to surface effect summaries between expressions.
+    pub fn with_trace_spans<R>(
+        &self,
+        f: impl FnOnce(&[crate::trace::TraceSpan]) -> R,
+    ) -> Option<R> {
+        let g = self.tracer.borrow();
+        g.as_ref().map(|t| f(t.spans()))
+    }
+
     /// Begin a recording — every subsequent non-deterministic observation
     /// (model response, in v0) is appended.
     pub fn enable_recording(&self) {
@@ -158,6 +169,22 @@ impl Interpreter {
     /// without contacting any provider.
     pub fn enable_replay(&self, rec: crate::record::Recording) {
         *self.replay.borrow_mut() = Some(crate::record::Replay::new(rec));
+    }
+
+    /// Begin a replay in `--patch` mode (lenient). A program that diverges
+    /// from the original — for example, by adding extra model calls past
+    /// the end of the recording — gets a clean error instead of an
+    /// assertion-style halt. Used by `axon replay --patch`.
+    pub fn enable_replay_lenient(&self, rec: crate::record::Recording) {
+        *self.replay.borrow_mut() = Some(crate::record::Replay::new_lenient(rec));
+    }
+
+    /// Borrow the replay cursor info for end-of-run reporting.
+    pub fn replay_progress(&self) -> Option<(usize, usize, bool)> {
+        self.replay
+            .borrow()
+            .as_ref()
+            .map(|r| (r.cursor(), r.total(), r.is_lenient()))
     }
 
     /// Register top-level item bindings derived from a `Program`. Functions

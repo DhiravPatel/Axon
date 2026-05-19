@@ -9,3 +9,12 @@ description = "Axon deploy tooling: HTTP server, health checks, env binding, dep
 serde      = { workspace = true }
 serde_json = { workspace = true }
 axon-skill = { workspace = true }
+
+# TLS — pure-Rust, no OpenSSL. `ring`-free flag keeps the crypto provider
+# explicit; we register one via `rustls::crypto::ring::default_provider()`
+# at first use.
+rustls         = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

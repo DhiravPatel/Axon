@@ -32,6 +32,7 @@ pub fn install(interp: &Interpreter) {
     install_deploy(interp);
     install_supervisor(interp);
     install_migrate(interp);
+    install_otlp(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1870,6 +1871,10 @@ fn install_deploy(interp: &Interpreter) {
         "serve_run",
         ext("serve_run", 2, Some(2), serve_run_ext),
     );
+    interp.register_native_ext(
+        "serve_run_tls",
+        ext("serve_run_tls", 4, Some(4), serve_run_tls_ext),
+    );
     interp.register_native(
         "deploy_write_manifest",
         n("deploy_write_manifest", 4, Some(4), deploy_write_manifest),
@@ -1897,7 +1902,8 @@ fn serve_run_ext(
         ));
     }
     let server = Server::bind(addr.as_str()).map_err(|e| format!("serve_run: bind {addr}: {e}"))?;
-    eprintln!("axon serve: listening on {}", server.local_addr);
+    let _ = server.install_signal_handler();
+    eprintln!("axon serve: listening on {} (Ctrl-C to shutdown)", server.local_addr);
 
     // Channel of (Request, return-channel) so the request thread can
     // hand off to the interpreter thread synchronously.
@@ -1919,6 +1925,77 @@ fn serve_run_ext(
 
     // Drain the channel on the main thread so the user's handler runs in
     // the interpreter's thread (the only thread that owns `interp`).
+    while let Ok((req, resp_tx)) = rx.recv() {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let body_str = String::from_utf8_lossy(&req.body).to_string();
+        let response = match interp.call_value(
+            &handler,
+            &[Value::String(Rc::new(body_str))],
+            span,
+        ) {
+            Ok(v) => {
+                let text = match v {
+                    Value::String(s) => s.as_str().to_string(),
+                    other => format!("{other}"),
+                };
+                Response::text(200, text)
+            }
+            Err(e) => Response::text(500, format!("handler error: {}", eval_signal_msg(&e))),
+        };
+        let _ = resp_tx.send(response);
+    }
+    let _ = dispatch_thread.join();
+    Ok(Value::Unit)
+}
+
+/// `serve_run_tls(listen_addr, handler, cert_pem_path, key_pem_path)` —
+/// like `serve_run` but performs a rustls handshake on every accepted
+/// connection. Cert and key are loaded once at bind time from PEM files;
+/// production deployments typically point them at an ACME-managed pair
+/// and redeploy on rotation.
+fn serve_run_tls_ext(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let addr = s_arg(args, 0, "serve_run_tls")?;
+    let handler = args[1].clone();
+    let cert = s_arg(args, 2, "serve_run_tls")?;
+    let key = s_arg(args, 3, "serve_run_tls")?;
+    if !matches!(
+        handler,
+        Value::Fn(_) | Value::Native(_) | Value::NativeExt(_) | Value::Tool(_)
+    ) {
+        return Err(format!(
+            "serve_run_tls: handler must be callable (got `{}`)",
+            handler.type_name()
+        ));
+    }
+    let server = Server::bind(addr.as_str())
+        .map_err(|e| format!("serve_run_tls: bind {addr}: {e}"))?
+        .with_tls_pem(cert.as_str(), key.as_str())
+        .map_err(|e| format!("serve_run_tls: load TLS pem: {e}"))?;
+    let _ = server.install_signal_handler();
+    eprintln!(
+        "axon serve [tls]: listening on https://{} (Ctrl-C to shutdown)",
+        server.local_addr
+    );
+    let (tx, rx) = std::sync::mpsc::channel::<(Request, std::sync::mpsc::Sender<Response>)>();
+    let stop = server.stop.clone();
+    let dispatch_thread = std::thread::spawn(move || -> std::io::Result<()> {
+        server.run(move |req: &Request| -> Response {
+            let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Response>();
+            if tx.send((req.clone(), resp_tx)).is_err() {
+                return Response::text(503, "interpreter gone");
+            }
+            match resp_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(r) => r,
+                Err(_) => Response::text(504, "handler timeout"),
+            }
+        })
+    });
     while let Ok((req, resp_tx)) = rx.recv() {
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -2292,5 +2369,43 @@ fn schema_migrate_ext(
 
 fn schema_migrate_reset(_args: &[Value]) -> Result<Value, String> {
     MIGRATORS.with(|reg| reg.borrow_mut().clear());
+    Ok(Value::Unit)
+}
+
+// ---------------------------------------------------------------------------
+// `trace_*` bindings  (Stage 20 — §31 OpenTelemetry / OTLP)
+//
+// Programs that enabled tracing (via the CLI's `--trace` flag, or by
+// calling `axon_runtime::Interpreter::enable_tracing` directly from
+// embedded use) can flush the current span list to an OTLP/HTTP-JSON
+// document. That JSON is byte-compatible with what a real OTLP exporter
+// POSTs to `/v1/traces` — pipe it to `otel-cli`, Tempo, Honeycomb, etc.
+// ---------------------------------------------------------------------------
+
+fn install_otlp(interp: &Interpreter) {
+    interp.register_native_ext(
+        "trace_export_otlp",
+        ext("trace_export_otlp", 2, Some(2), trace_export_otlp_ext),
+    );
+}
+
+/// `trace_export_otlp(path, service_name)` snapshots the live trace spans
+/// (requires tracing was enabled — `axon run --trace ...`) and writes an
+/// OTLP/HTTP-JSON document to `path`.
+fn trace_export_otlp_ext(
+    interp: &mut Interpreter,
+    args: &[Value],
+    _span: axon_diag::Span,
+) -> Result<Value, String> {
+    let path = s_arg(args, 0, "trace_export_otlp")?;
+    let service = s_arg(args, 1, "trace_export_otlp")?;
+    let spans = interp
+        .with_trace_spans(|s| s.to_vec())
+        .ok_or_else(|| {
+            "trace_export_otlp: tracing is not enabled — re-run with `axon run --trace ...`"
+                .to_string()
+        })?;
+    axon_runtime::otlp::write_to_path(&spans, service.as_str(), path.as_str())
+        .map_err(|e| format!("trace_export_otlp: {e}"))?;
     Ok(Value::Unit)
 }

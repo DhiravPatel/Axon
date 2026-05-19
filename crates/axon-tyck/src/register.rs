@@ -94,6 +94,10 @@ impl<'a> Checker<'a> {
             // ---- Stage 18 schema migrations ----
             "schema_migrator_new", "schema_add_migration", "schema_migrate",
             "schema_migrate_reset",
+            // ---- Stage 20 OTLP exporter ----
+            "trace_export_otlp",
+            // ---- Stage 21 TLS deploy server ----
+            "serve_run_tls",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),

@@ -87,6 +87,22 @@ fn main() -> ExitCode {
             let remaining: Vec<String> = args.collect();
             cmd_deploy(&remaining)
         }
+        "replay" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_replay(&remaining)
+        }
+        "trace" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_trace(&remaining)
+        }
+        "repl" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_repl(&remaining)
+        }
+        "login" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_login(&remaining)
+        }
         "version" | "--version" | "-V" => {
             println!("axon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -128,9 +144,17 @@ fn print_help() {
                           the input in place; `--check` exits non-zero if\n\
                           any file would be reformatted (useful in CI).\n\
            serve  <file> --listen ADDR --handler NAME\n\
+                          [--tls-cert PATH --tls-key PATH]\n\
                           Start an HTTP/1.1 server. POST /invoke dispatches\n\
                           to the named handler with the request body; GET\n\
                           /healthz and /readyz return JSON health status.\n\
+                          With --tls-* flags, terminate TLS via rustls.\n\
+                          SIGINT/SIGTERM triggers graceful shutdown with\n\
+                          in-flight handler drain.\n\
+           login  <provider> [--vault PATH] [--key VALUE]\n\
+                          Save an API key to the local vault (mode 0600 on\n\
+                          Unix). Reads --key, then $PROVIDER_API_KEY env,\n\
+                          then prompts on stdin.\n\
            deploy <file> -o DIR [--name N] [--port P] [--handler H]\n\
                           Package a project for deployment: write a\n\
                           `.axskill` archive plus a `deploy.json` manifest\n\
@@ -905,6 +929,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut file: Option<&str> = None;
     let mut listen = "127.0.0.1:8080".to_string();
     let mut handler = "main".to_string();
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -927,6 +953,24 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 handler = args[i].clone();
                 i += 1;
             }
+            "--tls-cert" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon serve: --tls-cert requires PATH");
+                    return ExitCode::from(2);
+                }
+                tls_cert = Some(args[i].clone());
+                i += 1;
+            }
+            "--tls-key" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon serve: --tls-key requires PATH");
+                    return ExitCode::from(2);
+                }
+                tls_key = Some(args[i].clone());
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("axon serve: unknown flag `{other}`");
                 return ExitCode::from(2);
@@ -940,6 +984,11 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 i += 1;
             }
         }
+    }
+    // TLS flags must be paired.
+    if tls_cert.is_some() ^ tls_key.is_some() {
+        eprintln!("axon serve: --tls-cert and --tls-key must be used together");
+        return ExitCode::from(2);
     }
     let file = match file {
         Some(f) => f,
@@ -978,25 +1027,35 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
-    // Programmatically call serve_run(listen, callee). The simpler path
-    // would be to expose a Rust-side `serve` directly, but routing
-    // through the same NativeExt the language uses means there's exactly
-    // one server code path.
-    let serve_native = match interp.globals.lookup("serve_run") {
+    // Route through the same NativeExt the language exposes so there's
+    // exactly one server code path. Plain HTTP uses `serve_run`; TLS
+    // uses `serve_run_tls` with cert+key paths.
+    let (binding_name, call_args) = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => (
+            "serve_run_tls",
+            vec![
+                axon_runtime::Value::String(std::rc::Rc::new(listen)),
+                callee,
+                axon_runtime::Value::String(std::rc::Rc::new(cert)),
+                axon_runtime::Value::String(std::rc::Rc::new(key)),
+            ],
+        ),
+        _ => (
+            "serve_run",
+            vec![
+                axon_runtime::Value::String(std::rc::Rc::new(listen)),
+                callee,
+            ],
+        ),
+    };
+    let serve_native = match interp.globals.lookup(binding_name) {
         Some(v) => v,
         None => {
-            eprintln!("axon serve: serve_run binding missing (internal error)");
+            eprintln!("axon serve: `{binding_name}` binding missing (internal error)");
             return ExitCode::from(1);
         }
     };
-    let result = interp.call_value(
-        &serve_native,
-        &[
-            axon_runtime::Value::String(std::rc::Rc::new(listen)),
-            callee,
-        ],
-        axon_diag::Span::DUMMY,
-    );
+    let result = interp.call_value(&serve_native, &call_args, axon_diag::Span::DUMMY);
     match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1124,5 +1183,402 @@ fn cmd_deploy(args: &[String]) -> ExitCode {
     }
     println!("wrote {}", skill_path.display());
     println!("wrote {}", manifest_path.display());
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Stage 20 — `axon replay`, `axon trace`, `axon repl`
+// ---------------------------------------------------------------------------
+
+/// `axon replay <recording.json> <source.ax> [--patch]`
+///
+/// Re-run an Axon program against a captured non-determinism tape. Each
+/// model/clock/randomness observation comes from the recording instead of
+/// hitting a live provider — zero network, byte-identical results.
+///
+/// `--patch` enables lenient mode: a program that's been edited since the
+/// recording may issue extra calls (they surface as a clean error rather
+/// than halting with the strict "replay exhausted" assertion).
+fn cmd_replay(args: &[String]) -> ExitCode {
+    let mut recording_path: Option<&str> = None;
+    let mut source_path: Option<&str> = None;
+    let mut patch = false;
+    for arg in args {
+        match arg.as_str() {
+            "--patch" => patch = true,
+            other if other.starts_with("--") => {
+                eprintln!("axon replay: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if recording_path.is_none() {
+                    recording_path = Some(other);
+                } else if source_path.is_none() {
+                    source_path = Some(other);
+                } else {
+                    eprintln!("axon replay: unexpected extra argument `{other}`");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+    let (rec, src) = match (recording_path, source_path) {
+        (Some(r), Some(s)) => (r, s),
+        _ => {
+            eprintln!("usage: axon replay <recording.json> <source.ax> [--patch]");
+            return ExitCode::from(2);
+        }
+    };
+    let raw_rec = match std::fs::read_to_string(rec) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon replay: cannot read recording `{rec}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw_rec) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("axon replay: `{rec}` is not valid JSON: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let recording = match axon_runtime::Recording::from_json(&parsed) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("axon replay: `{rec}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let text = match std::fs::read_to_string(src) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon replay: cannot read source `{src}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let source = SourceFile::new(src, &text);
+    let (program, diags) = axon_parser::parse(&source);
+    if !diags.is_empty() {
+        for d in &diags {
+            eprintln!("{}", axon_diag::render(d, &source, true));
+        }
+        return ExitCode::from(1);
+    }
+
+    let interp = axon_runtime::Interpreter::new();
+    host::install(&interp);
+    if patch {
+        interp.enable_replay_lenient(recording);
+    } else {
+        interp.enable_replay(recording);
+    }
+    let mut interp = interp;
+    interp.load_program(&program);
+    let exit = match interp.run_main() {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            eprint!("{}", err.render(&source, use_color));
+            ExitCode::from(1)
+        }
+    };
+    if let Some((cursor, total, lenient)) = interp.replay_progress() {
+        let mode = if lenient { "patch" } else { "strict" };
+        eprintln!("axon replay [{mode}]: consumed {cursor} of {total} recorded event(s)");
+    }
+    exit
+}
+
+/// `axon trace <file>` — pretty-print a JSONL trace file as a span tree
+/// with durations, span kinds, and any attached error.
+fn cmd_trace(args: &[String]) -> ExitCode {
+    let path = match args.first() {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: axon trace <file.jsonl>");
+            return ExitCode::from(2);
+        }
+    };
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("axon trace: cannot read `{path}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut spans: Vec<serde_json::Value> = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str(trimmed) {
+            Ok(v) => spans.push(v),
+            Err(e) => {
+                eprintln!("axon trace: line {} not valid JSON: {e}", i + 1);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if spans.is_empty() {
+        println!("(no spans)");
+        return ExitCode::SUCCESS;
+    }
+    // Group children by parent_id for tree printing.
+    use std::collections::HashMap;
+    let mut by_parent: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, s) in spans.iter().enumerate() {
+        let parent = s.get("parent_id").and_then(|v| v.as_i64()).unwrap_or(-1);
+        by_parent.entry(parent).or_default().push(i);
+    }
+    fn print_subtree(
+        spans: &[serde_json::Value],
+        by_parent: &HashMap<i64, Vec<usize>>,
+        parent: i64,
+        depth: usize,
+    ) {
+        if let Some(children) = by_parent.get(&parent) {
+            for &idx in children {
+                let s = &spans[idx];
+                let id = s.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                let start = s.get("start_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let end = s.get("end_ms").and_then(|v| v.as_i64());
+                let dur = end.map(|e| e - start).unwrap_or(0);
+                let err = s.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                let indent = "  ".repeat(depth);
+                let err_tag = if err.is_empty() {
+                    String::new()
+                } else {
+                    format!(" \x1b[31m[error: {err}]\x1b[0m")
+                };
+                println!(
+                    "{indent}\x1b[36m{name}\x1b[0m \x1b[90m({kind})\x1b[0m  {dur}ms{err_tag}"
+                );
+                let _ = id;
+                print_subtree(spans, by_parent, id, depth + 1);
+            }
+        }
+    }
+    let total_ms: i64 = spans
+        .iter()
+        .filter_map(|s| {
+            let start = s.get("start_ms").and_then(|v| v.as_i64())?;
+            let end = s.get("end_ms").and_then(|v| v.as_i64())?;
+            Some(end - start)
+        })
+        .max()
+        .unwrap_or(0);
+    println!("trace: {} span(s), max span duration {total_ms}ms", spans.len());
+    print_subtree(&spans, &by_parent, -1, 0);
+    ExitCode::SUCCESS
+}
+
+/// `axon repl` — interactive read-eval-print loop. Each line is parsed as
+/// a top-level expression-or-statement, evaluated against a persistent
+/// interpreter, and the result + effect summary is printed. `.help`,
+/// `.quit`, `.effects` are built-in dot-commands.
+fn cmd_repl(_args: &[String]) -> ExitCode {
+    use std::io::{BufRead, Write};
+    let interp = axon_runtime::Interpreter::new();
+    host::install(&interp);
+    interp.enable_tracing();
+    let mut interp = interp;
+
+    println!("Axon {} REPL — type `.help` for commands, `.quit` to exit.", env!("CARGO_PKG_VERSION"));
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut line_no: u32 = 1;
+    let mut buf = String::new();
+    loop {
+        print!("axon[{line_no}]> ");
+        let _ = std::io::stdout().flush();
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => {
+                println!();
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("axon repl: read error: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        let line = buf.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        match line.as_str() {
+            ".quit" | ".exit" => break,
+            ".help" => {
+                println!(
+                    "  .help         show this message\n  \
+                     .quit / .exit terminate the REPL\n  \
+                     .effects      show the current active capability set\n  \
+                     <expr>        evaluate; the result is printed if non-Unit"
+                );
+                continue;
+            }
+            ".effects" => {
+                println!("active capabilities: {}", interp.active_caps());
+                continue;
+            }
+            _ => {}
+        }
+        // Wrap each input in a synthetic main so the parser/tyck can
+        // type-check it as a function body. Declare the full standard
+        // effect row so `print_int`, `time_now`, `http_fetch`, etc.
+        // work the way they would in a normal `fn main()`. Multi-
+        // statement input separated by `;` (or newlines in a `{}` block).
+        let wrapped = format!(
+            "fn __repl_{line_no}() uses {{ Console, Fs.Read, Fs.Write, Time, Random, Net, LLM, Memory, Spawn }} {{\n{line}\n}}"
+        );
+        let src = SourceFile::new("<repl>", &wrapped);
+        let (program, diags) = axon_parser::parse(&src);
+        if !diags.is_empty() {
+            for d in &diags {
+                eprintln!("{}", axon_diag::render(d, &src, true));
+            }
+            line_no += 1;
+            continue;
+        }
+        interp.load_program(&program);
+        let fn_name = format!("__repl_{line_no}");
+        // Look up the synthesized fn and invoke it.
+        let callee = match interp.globals.lookup(&fn_name) {
+            Some(v) => v,
+            None => {
+                eprintln!("axon repl: synthesized handler not found (internal error)");
+                line_no += 1;
+                continue;
+            }
+        };
+        match interp.call_value(&callee, &[], axon_diag::Span::DUMMY) {
+            Ok(v) => match v {
+                axon_runtime::Value::Unit => {}
+                other => println!("=> {other}"),
+            },
+            Err(axon_runtime::EvalSignal::Error(err)) => {
+                let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr());
+                eprint!("{}", err.render(&src, use_color));
+            }
+            Err(other) => {
+                eprintln!("axon repl: unexpected control flow: {other:?}");
+            }
+        }
+        line_no += 1;
+    }
+    ExitCode::SUCCESS
+}
+
+/// `axon login <provider> [--vault PATH] [--key VALUE]`
+///
+/// Prompts for an API key (or reads it from `--key` for scripts/CI), then
+/// stores it in the vault under `<PROVIDER>_API_KEY`. The vault file is
+/// mode-0600 on Unix; if it already exists it must have those permissions
+/// or the load fails cleanly per Stage 15's contract.
+fn cmd_login(args: &[String]) -> ExitCode {
+    let mut provider: Option<&str> = None;
+    let mut vault_path: Option<String> = None;
+    let mut key_arg: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--vault" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon login: --vault requires PATH");
+                    return ExitCode::from(2);
+                }
+                vault_path = Some(args[i].clone());
+                i += 1;
+            }
+            "--key" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon login: --key requires VALUE");
+                    return ExitCode::from(2);
+                }
+                key_arg = Some(args[i].clone());
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon login: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if provider.is_some() {
+                    eprintln!("axon login: only one provider per invocation");
+                    return ExitCode::from(2);
+                }
+                provider = Some(other);
+                i += 1;
+            }
+        }
+    }
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: axon login <provider> [--vault PATH] [--key VALUE]");
+            eprintln!("  provider examples: anthropic, openai, google");
+            return ExitCode::from(2);
+        }
+    };
+    let vault_path = vault_path.unwrap_or_else(|| {
+        std::env::var("AXON_VAULT").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            format!("{home}/.axon/vault.json")
+        })
+    });
+
+    // Resolve the API-key value in order: --key, then `<PROVIDER>_API_KEY`
+    // env, then a prompt on stdin.
+    let api_key = if let Some(k) = key_arg {
+        k
+    } else {
+        let env_var = format!("{}_API_KEY", provider.to_uppercase());
+        match std::env::var(&env_var) {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                use std::io::{BufRead, Write};
+                eprint!("api key for `{provider}`: ");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                if std::io::stdin().lock().read_line(&mut line).is_err() {
+                    eprintln!("axon login: failed to read key from stdin");
+                    return ExitCode::from(1);
+                }
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    eprintln!("axon login: empty key — aborting");
+                    return ExitCode::from(1);
+                }
+                trimmed
+            }
+        }
+    };
+
+    let mut vault = if std::path::Path::new(&vault_path).exists() {
+        match axon_secret::Vault::load(&vault_path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("axon login: cannot load vault `{vault_path}`: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        axon_secret::Vault::new()
+    };
+    let secret_name = format!("{}_API_KEY", provider.to_uppercase());
+    vault.set(&secret_name, api_key);
+    if let Err(e) = vault.save(&vault_path) {
+        eprintln!("axon login: cannot write vault: {e}");
+        return ExitCode::from(1);
+    }
+    println!("saved `{secret_name}` to {vault_path} (mode 0600 on Unix)");
     ExitCode::SUCCESS
 }

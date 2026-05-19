@@ -143,6 +143,120 @@ A snapshot of everything Axon ships today, grouped by the stages that introduced
 - Completion: keywords, in-scope identifiers, member access.
 - Editor integration ready (VS Code, Neovim, any LSP-aware client).
 
+## Stage 21 — OAuth Vault, TLS Serve, Graceful Shutdown, `axon login`
+
+Production security layer: refreshable OAuth tokens, rustls-terminated HTTPS, SIGINT-driven drain shutdown, and a CLI credential capture flow.
+
+### §40.2 OAuth-aware vault
+- New `axon-secret::oauth::OauthToken` — `access_token` + optional `refresh_token` + `expires_at_secs` + `token_url` + `client_id`. All fields serialize for vault storage; the value layer keeps `Secret<T>` redaction.
+- `is_expired_at(now)`, `needs_refresh(slack_secs)` — pure predicates for tests.
+- `OauthToken::refresh()` — POSTs `grant_type=refresh_token` to the stored `token_url` via `ureq`, parses the JSON response, rotates `access_token` (and `refresh_token` if the server rotated it), and recomputes `expires_at_secs` from `expires_in` (defaults to 1 hour per OAuth2 spec).
+- `Vault::set_oauth(name, &token)` / `Vault::get_oauth(name)` — OAuth tokens live under `oauth:{name}` in the same vault JSON, so plain API keys and OAuth tokens coexist without a schema change.
+- `Vault::load_oauth_with_refresh(name, slack_secs, path)` — loads, refreshes if needed, persists rotated token back to disk before returning. The standard "always-fresh, no re-login" pattern.
+- Typed `TokenRefreshError`: `NoRefreshToken` / `NoTokenUrl` / `Http(...)` / `HttpStatus { status, body }` / `Io` / `Parse`.
+
+### §41 TLS via rustls
+- `Server::with_tls_pem(cert_pem_path, key_pem_path)` — loads a PEM-encoded cert chain + private key (rustls-pemfile parses RSA, ECDSA, EdDSA, and PKCS8 keys). Pure Rust, no OpenSSL.
+- Single crypto provider registered via `rustls::crypto::ring::default_provider().install_default()` (called lazily on first use).
+- `handle_connection_plain` / `handle_connection_tls` share the same `read_request_from<S: Read>` / `write_response_to<S: Write>` helpers, so adding TLS didn't fork the protocol logic.
+- v0 limit: TLS reads PEM from disk at bind time; cert rotation requires a redeploy. ACME / file-watching rotation is a Stage 22+ enhancement.
+
+### §41 Graceful shutdown
+- `Server.in_flight: AtomicUsize` — incremented when a connection thread starts, decremented when it returns. After `stop` flips, `run()` waits up to `shutdown_grace` (default 10s) for `in_flight == 0` before returning.
+- `Server::install_signal_handler()` — Unix-only: installs a `SIGINT`/`SIGTERM` handler that flips `stop`. Process-wide; latest install wins (last `axon serve` invocation in the same process). Non-Unix is a no-op — callers can still flip `server.stop` programmatically.
+- `serve_run` / `serve_run_tls` both call `install_signal_handler()` before entering the run loop, so `Ctrl-C` and `kill -TERM` drain in-flight requests automatically.
+
+### §36 `axon login`
+- `axon login <provider> [--vault PATH] [--key VALUE]` — stores an API key in the vault under `<PROVIDER>_API_KEY`.
+- Key source precedence: `--key` arg → `<PROVIDER>_API_KEY` env var → interactive stdin prompt.
+- Vault path resolution: `--vault` flag → `AXON_VAULT` env → `~/.axon/vault.json`.
+- Vault file is mode `0600` on Unix (verified by `axon-secret::Vault::save`).
+- Multiple `axon login` calls on the same vault append cleanly — keys for different providers coexist.
+
+### `axon serve` extended
+- New flags: `--tls-cert PATH` / `--tls-key PATH` (must be paired). When present, routes through `serve_run_tls` instead of `serve_run`.
+- Banner now mentions Ctrl-C: `axon serve [tls]: listening on https://… (Ctrl-C to shutdown)`.
+
+### CLI demo (real run)
+```
+$ axon login anthropic --vault /tmp/v.json --key sk-ant-demo
+saved `ANTHROPIC_API_KEY` to /tmp/v.json (mode 0600 on Unix)
+$ ls -l /tmp/v.json
+-rw-------  1 user user  72 May 19 21:35 /tmp/v.json
+
+$ axon serve svc.ax --listen 127.0.0.1:18432 \
+                    --tls-cert /tmp/cert.pem --tls-key /tmp/key.pem &
+axon serve [tls]: listening on https://127.0.0.1:18432 (Ctrl-C to shutdown)
+
+$ curl -sk -X POST https://127.0.0.1:18432/invoke -d "hello-axon"
+got: hello-axon
+
+$ kill -TERM %1
+(server drains in-flight requests, exits cleanly)
+```
+
+---
+
+## Stage 20 — OTLP Exporter + `axon replay/--patch` + `axon trace` + `axon repl`
+
+Closes three observability/tooling gaps: OpenTelemetry-compatible trace export, deterministic replay-with-edits, and an interactive REPL.
+
+### §31 OTLP/HTTP-JSON exporter
+- New `axon-runtime::otlp` module: converts internal `TraceSpan` records into OpenTelemetry Protocol JSON (`ExportTraceServiceRequest` shape) — byte-compatible with what real OTLP exporters POST to `/v1/traces`.
+- Span-kind mapped to `SPAN_KIND_INTERNAL` (1); error spans get `STATUS_CODE_ERROR` (2) with the message; OK spans get `STATUS_CODE_OK` (1).
+- Resource bag includes `service.name`, `telemetry.sdk.name`, `telemetry.sdk.language`, and `telemetry.sdk.version`.
+- Stable 32-hex-char `traceId` keyed off the recording's smallest span id so record/replay pairs produce identical IDs.
+- Nanosecond timestamps (OTLP requires nanos; we multiply our `start_ms`/`end_ms` by 1_000_000).
+- Host binding `trace_export_otlp(path, service_name)` — NativeExt that pulls live spans via `Interpreter::with_trace_spans`.
+- Refuses cleanly when tracing wasn't enabled: `trace_export_otlp: tracing is not enabled — re-run with axon run --trace …`.
+
+### §32 `axon replay <rec> <src>` with `--patch`
+- New CLI subcommand. Strict mode (default) replays an Axon program against a recording byte-identically and reports `consumed N of M recorded event(s)` on stderr.
+- `--patch` mode flips `Replay::lenient`: a program edited *after* the recording was made (extra model calls, etc.) gets a cleaner `replay exhausted (patch mode)` error message and the cursor report shows `[patch]` vs `[strict]`.
+- New `Interpreter::enable_replay_lenient` + `replay_progress() -> Option<(cursor, total, lenient)>` for end-of-run summaries.
+
+### §36 `axon trace <file.jsonl>`
+- Reads a JSONL trace file (the format `--trace PATH` already writes) and pretty-prints a colored span tree with durations, kinds, and any attached error.
+- Empty file → `(no spans)`; malformed JSON → typed error with the offending line number.
+- No external deps — uses `serde_json::Value`.
+
+### §36 `axon repl`
+- Interactive read-eval-print loop with banner, prompt-numbered input, and three dot-commands: `.help`, `.quit`/`.exit`, `.effects`.
+- Each line is wrapped in a synthesized `fn __repl_N() uses { ...standard row... } { ... }` so built-ins like `print_int`, `time_now`, `http_fetch` work without `uses` clauses in REPL input.
+- Persistent interpreter — bindings from `let x = ...` survive across prompts (within the synthesized fn's scope).
+- Tracing is auto-enabled so the REPL can show effect summaries on demand.
+
+### CLI demo (real run)
+```
+$ axon run --trace internal.jsonl --record rec.json svc.ax
+the answer is 42
+
+$ axon trace internal.jsonl
+trace: 1 span(s), max span duration 0ms
+ask (ask)  0ms
+
+$ head -5 traces.otlp.json
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [ ... "service.name": "demo-svc" ... ]
+
+$ axon replay rec.json svc.ax
+axon replay [strict]: consumed 1 of 1 recorded event(s)
+
+$ axon replay rec.json svc-edited.ax --patch
+... replay exhausted (patch mode): no recorded event remaining for this call
+axon replay [patch]: consumed 1 of 1 recorded event(s)
+
+$ printf 'print_int(40 + 2)\n.effects\n.quit\n' | axon repl
+Axon 0.1.0 REPL — type `.help` for commands, `.quit` to exit.
+axon[1]> 42
+axon[2]> active capabilities: {Audit, Channel, Console, ...}
+```
+
+---
+
 ## Stage 19 — `for await`, `select`, `plan with` Enhancements
 
 Three core language constructs from §14 and §26 wired through parser, type checker, and runtime.
