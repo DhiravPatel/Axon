@@ -1034,6 +1034,37 @@ fn install_a2a(interp: &Interpreter) {
         "a2a_card_has_capability",
         n("a2a_card_has_capability", 2, Some(2), a2a_card_has_capability),
     );
+
+    // Stage 22 — Ed25519 signed identity.
+    interp.register_native(
+        "a2a_keypair_generate",
+        n("a2a_keypair_generate", 0, Some(0), a2a_keypair_generate),
+    );
+    interp.register_native(
+        "a2a_keypair_from_seed",
+        n("a2a_keypair_from_seed", 1, Some(1), a2a_keypair_from_seed),
+    );
+    interp.register_native(
+        "a2a_sign_card",
+        n("a2a_sign_card", 3, Some(3), a2a_sign_card),
+    );
+    interp.register_native(
+        "a2a_verify_signed_card",
+        n("a2a_verify_signed_card", 2, Some(2), a2a_verify_signed_card),
+    );
+    interp.register_native(
+        "a2a_trust_store_new",
+        n("a2a_trust_store_new", 2, Some(2), a2a_trust_store_new),
+    );
+    // Stage 23 — delegated identity.
+    interp.register_native(
+        "a2a_sign_delegation",
+        n("a2a_sign_delegation", 7, Some(7), a2a_sign_delegation),
+    );
+    interp.register_native(
+        "a2a_verify_delegation",
+        n("a2a_verify_delegation", 4, Some(4), a2a_verify_delegation),
+    );
 }
 
 fn a2a_card_load(args: &[Value]) -> Result<Value, String> {
@@ -1091,6 +1122,265 @@ fn card_to_record(card: &AgentCard) -> Value {
         Value::List(Rc::new(std::cell::RefCell::new(cap_names))),
     ));
     Value::Record(Rc::new(std::cell::RefCell::new(rec)))
+}
+
+// ---- Stage 22 Ed25519 identity bindings -----------------------------------
+//
+// Trust stores live in a thread-local registry keyed by name so programs
+// can build one with `a2a_trust_store_new("partners", [hex...])` and
+// reuse it across calls.
+
+thread_local! {
+    static TRUST_STORES: RefCell<std::collections::HashMap<String, axon_a2a::TrustStore>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Return a record `{ pubkey_hex, seed_hex }`. The seed is the private
+/// key material — the caller should store it in the vault (Stage 15) and
+/// never log it.
+fn a2a_keypair_generate(_args: &[Value]) -> Result<Value, String> {
+    let kp = axon_a2a::KeyPair::generate();
+    Ok(keypair_to_record(&kp))
+}
+
+fn a2a_keypair_from_seed(args: &[Value]) -> Result<Value, String> {
+    let seed_hex = s_arg(args, 0, "a2a_keypair_from_seed")?;
+    let bytes = hex_decode_or_err(seed_hex.as_str(), "seed_hex")?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "a2a_keypair_from_seed: seed must be 32 bytes (64 hex chars), got {}",
+            bytes.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    let kp = axon_a2a::KeyPair::from_seed_bytes(&seed);
+    Ok(keypair_to_record(&kp))
+}
+
+fn keypair_to_record(kp: &axon_a2a::KeyPair) -> Value {
+    let mut rec = Vec::new();
+    rec.push((
+        "pubkey_hex".to_string(),
+        Value::String(Rc::new(kp.pubkey_hex())),
+    ));
+    rec.push((
+        "seed_hex".to_string(),
+        Value::String(Rc::new(kp.seed_hex())),
+    ));
+    Value::Record(Rc::new(std::cell::RefCell::new(rec)))
+}
+
+/// `a2a_sign_card(card_json_path, seed_hex, dest_json_path)` — read an
+/// unsigned `AgentCard` from disk, sign it with the keypair derived from
+/// `seed_hex`, and write the resulting `SignedAgentCard` envelope to
+/// `dest_json_path`. Returns the signer's pubkey hex.
+fn a2a_sign_card(args: &[Value]) -> Result<Value, String> {
+    let card_path = s_arg(args, 0, "a2a_sign_card")?;
+    let seed_hex = s_arg(args, 1, "a2a_sign_card")?;
+    let dest_path = s_arg(args, 2, "a2a_sign_card")?;
+    let card = axon_a2a::load_card_from_path(card_path.as_str())
+        .map_err(|e| format!("a2a_sign_card: {e}"))?;
+    let seed_bytes = hex_decode_or_err(seed_hex.as_str(), "seed_hex")?;
+    if seed_bytes.len() != 32 {
+        return Err(format!(
+            "a2a_sign_card: seed must be 32 bytes, got {}",
+            seed_bytes.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+    let kp = axon_a2a::KeyPair::from_seed_bytes(&seed);
+    let signed = kp.sign_card(&card).map_err(|e| format!("a2a_sign_card: {e}"))?;
+    let bytes = signed
+        .to_json()
+        .map_err(|e| format!("a2a_sign_card: {e}"))?;
+    std::fs::write(dest_path.as_str(), bytes)
+        .map_err(|e| format!("a2a_sign_card: write {dest_path}: {e}"))?;
+    Ok(Value::String(Rc::new(kp.pubkey_hex())))
+}
+
+/// `a2a_verify_signed_card(signed_json_path, trust_store_name)` →
+/// the verified card as a Record, OR an error if the signature is
+/// invalid / the signer isn't trusted.
+fn a2a_verify_signed_card(args: &[Value]) -> Result<Value, String> {
+    let path = s_arg(args, 0, "a2a_verify_signed_card")?;
+    let store_name = s_arg(args, 1, "a2a_verify_signed_card")?;
+    let trust = TRUST_STORES
+        .with(|reg| reg.borrow().get(store_name.as_str()).cloned())
+        .ok_or_else(|| {
+            format!(
+                "a2a_verify_signed_card: no trust store `{store_name}` — \
+                 call a2a_trust_store_new first"
+            )
+        })?;
+    let card = axon_a2a::SignedAgentCard::load_and_verify(path.as_str(), &trust)
+        .map_err(|e| format!("a2a_verify_signed_card: {e}"))?;
+    Ok(card_to_record(&card))
+}
+
+/// `a2a_trust_store_new(name, allowed_pubkey_hex_list)` — register a
+/// trust store under `name`. The list is a `List<String>` of 64-char
+/// hex pubkeys. Existing stores under the same name are replaced.
+fn a2a_trust_store_new(args: &[Value]) -> Result<Value, String> {
+    // arg 0 = name (the second positional)
+    // The native signature was `(allowed_pubkey_hex_list, name)` — keep
+    // it ergonomic by accepting `(name, list)` here.
+    let name = s_arg(args, 0, "a2a_trust_store_new")?;
+    let list = match &args[1] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "a2a_trust_store_new: arg 1 must be a List<String>, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut store = axon_a2a::TrustStore::new();
+    for v in list {
+        let hex = match v {
+            Value::String(s) => s.as_str().to_string(),
+            other => {
+                return Err(format!(
+                    "a2a_trust_store_new: list must contain Strings, got `{}`",
+                    other.type_name()
+                ));
+            }
+        };
+        store
+            .add_hex(&hex)
+            .map_err(|e| format!("a2a_trust_store_new: {e}"))?;
+    }
+    TRUST_STORES.with(|reg| {
+        reg.borrow_mut().insert(name.as_str().to_string(), store);
+    });
+    Ok(Value::Unit)
+}
+
+fn hex_decode_or_err(s: &str, label: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err(format!("{label}: odd-length hex string ({})", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i]).map_err(|e| format!("{label}: {e}"))?;
+        let lo = hex_nibble(bytes[i + 1]).map_err(|e| format!("{label}: {e}"))?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("bad hex digit `{}`", b as char)),
+    }
+}
+
+/// `a2a_sign_delegation(seed_hex, principal, audience, scopes_list,
+/// expires_at_secs, nonce, dest_json_path)` — produces a signed
+/// `Delegation` envelope on disk. Returns the signer's pubkey hex.
+fn a2a_sign_delegation(args: &[Value]) -> Result<Value, String> {
+    let seed_hex = s_arg(args, 0, "a2a_sign_delegation")?;
+    let principal = s_arg(args, 1, "a2a_sign_delegation")?;
+    let audience = s_arg(args, 2, "a2a_sign_delegation")?;
+    let scopes_list = match &args[3] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "a2a_sign_delegation: scopes must be List<String>, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let expires_at_secs = i_arg(args, 4, "a2a_sign_delegation")?;
+    let nonce = s_arg(args, 5, "a2a_sign_delegation")?;
+    let dest_path = s_arg(args, 6, "a2a_sign_delegation")?;
+
+    let scopes: Result<Vec<String>, String> = scopes_list
+        .iter()
+        .map(|v| match v {
+            Value::String(s) => Ok(s.as_str().to_string()),
+            other => Err(format!(
+                "a2a_sign_delegation: scope must be String, got `{}`",
+                other.type_name()
+            )),
+        })
+        .collect();
+    let scopes = scopes?;
+
+    let seed_bytes = hex_decode_or_err(seed_hex.as_str(), "seed_hex")?;
+    if seed_bytes.len() != 32 {
+        return Err(format!(
+            "a2a_sign_delegation: seed must be 32 bytes, got {}",
+            seed_bytes.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+    let kp = axon_a2a::KeyPair::from_seed_bytes(&seed);
+    let d = axon_a2a::Delegation {
+        principal: principal.as_str().to_string(),
+        audience: audience.as_str().to_string(),
+        scopes,
+        expires_at_secs,
+        nonce: nonce.as_str().to_string(),
+    };
+    let signed = kp
+        .sign_delegation(&d)
+        .map_err(|e| format!("a2a_sign_delegation: {e}"))?;
+    let bytes = signed.to_json().map_err(|e| format!("a2a_sign_delegation: {e}"))?;
+    std::fs::write(dest_path.as_str(), bytes)
+        .map_err(|e| format!("a2a_sign_delegation: write {dest_path}: {e}"))?;
+    Ok(Value::String(Rc::new(kp.pubkey_hex())))
+}
+
+/// `a2a_verify_delegation(signed_path, trust_store_name, expected_audience,
+/// now_secs)` → record `{ principal, scopes, expires_at_secs, nonce }`
+/// on success, or runtime error if signature/audience/expiry check fails.
+fn a2a_verify_delegation(args: &[Value]) -> Result<Value, String> {
+    let path = s_arg(args, 0, "a2a_verify_delegation")?;
+    let store_name = s_arg(args, 1, "a2a_verify_delegation")?;
+    let audience = s_arg(args, 2, "a2a_verify_delegation")?;
+    let now_secs = i_arg(args, 3, "a2a_verify_delegation")?;
+    let trust = TRUST_STORES
+        .with(|reg| reg.borrow().get(store_name.as_str()).cloned())
+        .ok_or_else(|| {
+            format!(
+                "a2a_verify_delegation: no trust store `{store_name}` — \
+                 call a2a_trust_store_new first"
+            )
+        })?;
+    let d = axon_a2a::SignedDelegation::load_and_verify(
+        path.as_str(),
+        &trust,
+        audience.as_str(),
+        now_secs,
+    )
+    .map_err(|e| format!("a2a_verify_delegation: {e}"))?;
+    let mut rec = Vec::new();
+    rec.push(("principal".to_string(), Value::String(Rc::new(d.principal))));
+    rec.push(("audience".to_string(), Value::String(Rc::new(d.audience))));
+    let scopes: Vec<Value> = d
+        .scopes
+        .into_iter()
+        .map(|s| Value::String(Rc::new(s)))
+        .collect();
+    rec.push((
+        "scopes".to_string(),
+        Value::List(Rc::new(std::cell::RefCell::new(scopes))),
+    ));
+    rec.push((
+        "expires_at_secs".to_string(),
+        Value::Int(d.expires_at_secs),
+    ));
+    rec.push(("nonce".to_string(), Value::String(Rc::new(d.nonce))));
+    Ok(Value::Record(Rc::new(std::cell::RefCell::new(rec))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,6 +1621,78 @@ fn install_sandbox(interp: &Interpreter) {
         "sandbox_run",
         n("sandbox_run", 5, Some(5), sandbox_run),
     );
+    interp.register_native(
+        "sandbox_run_with_profile",
+        n("sandbox_run_with_profile", 6, Some(6), sandbox_run_with_profile),
+    );
+}
+
+/// `sandbox_run_with_profile(program, args_list, cpu_seconds, memory_mb,
+/// wall_seconds, profile_name)` — same shape as `sandbox_run` but also
+/// applies a kernel-level sandbox (`strict` / `networked` / `build_tool`).
+fn sandbox_run_with_profile(args: &[Value]) -> Result<Value, String> {
+    let program = s_arg(args, 0, "sandbox_run_with_profile")?;
+    let arg_list = match &args[1] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "sandbox_run_with_profile: arg 1 must be List<String>, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let cpu = i_arg(args, 2, "sandbox_run_with_profile")?.max(0) as u64;
+    let mem = i_arg(args, 3, "sandbox_run_with_profile")?.max(0) as u64;
+    let wall = i_arg(args, 4, "sandbox_run_with_profile")?.max(0) as u64;
+    let profile_name = s_arg(args, 5, "sandbox_run_with_profile")?;
+    let profile = match profile_name.as_str() {
+        "strict" => axon_sandbox::PlatformProfile::strict(),
+        "networked" => axon_sandbox::PlatformProfile::networked(),
+        "build_tool" => axon_sandbox::PlatformProfile::build_tool(),
+        other => {
+            return Err(format!(
+                "sandbox_run_with_profile: unknown profile `{other}` \
+                 (expected strict / networked / build_tool)"
+            ));
+        }
+    };
+    let mut cmd = std::process::Command::new(program.as_str());
+    for a in &arg_list {
+        match a {
+            Value::String(s) => {
+                cmd.arg(s.as_str());
+            }
+            other => {
+                return Err(format!(
+                    "sandbox_run_with_profile: argv element is not String (got `{}`)",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    let sb = axon_sandbox::PlatformSandbox::new(profile);
+    sb.apply(&mut cmd).map_err(|e| e.to_string())?;
+    let limits = axon_sandbox::Limits {
+        cpu_seconds: cpu,
+        memory_mb: mem,
+        max_open_files: 0,
+        wall_seconds: wall,
+    };
+    let r = axon_sandbox::run_sandboxed(&mut cmd, &limits).map_err(|e| e.to_string())?;
+    let mut rec = Vec::new();
+    rec.push((
+        "exit_code".to_string(),
+        match r.exit_code {
+            Some(c) => Value::Int(c as i64),
+            None => Value::Int(-1),
+        },
+    ));
+    rec.push(("stdout".to_string(), Value::String(Rc::new(r.stdout))));
+    rec.push(("stderr".to_string(), Value::String(Rc::new(r.stderr))));
+    rec.push(("wall_ms".to_string(), Value::Int(r.wall_ms as i64)));
+    rec.push(("wall_timeout".to_string(), Value::Bool(r.wall_timeout)));
+    rec.push(("limit_breached".to_string(), Value::Bool(r.limit_breached)));
+    Ok(Value::Record(Rc::new(std::cell::RefCell::new(rec))))
 }
 
 /// `sandbox_run(program, args_list, cpu_seconds, memory_mb, wall_seconds)`
@@ -1740,6 +2102,116 @@ fn install_ffi(interp: &Interpreter) {
         "ffi_call",
         n("ffi_call", 4, Some(4), ffi_call),
     );
+    // Stage 23 — dynamic-library FFI.
+    interp.register_native(
+        "ffi_dlib_call",
+        n("ffi_dlib_call", 4, Some(4), ffi_dlib_call),
+    );
+}
+
+/// `ffi_dlib_call(lib_path, symbol, args_list, ret_is_str)` →
+/// `{ ok: Bool, value: Int | Float | String, error: String }`.
+///
+/// `args_list` is a list of records `{ ty: "i64"|"f64"|"str", v: <val> }`.
+/// Supported shapes: all-i64 arity 0..=4 → i64; all-f64 arity 0..=2 → f64;
+/// single str → str; void → str. See `axon_ffi::dlib` for details.
+fn ffi_dlib_call(args: &[Value]) -> Result<Value, String> {
+    let path = s_arg(args, 0, "ffi_dlib_call")?;
+    let symbol = s_arg(args, 1, "ffi_dlib_call")?;
+    let args_list = match &args[2] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "ffi_dlib_call: arg 2 must be a List of records, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let ret_is_str = match &args[3] {
+        Value::Bool(b) => *b,
+        other => {
+            return Err(format!(
+                "ffi_dlib_call: arg 3 (ret_is_str) must be Bool, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut dlib_args: Vec<axon_ffi::DlibValue> = Vec::with_capacity(args_list.len());
+    for (i, item) in args_list.iter().enumerate() {
+        let rec = match item {
+            Value::Record(r) => r.borrow().clone(),
+            other => {
+                return Err(format!(
+                    "ffi_dlib_call: arg list element {i} must be a record, got `{}`",
+                    other.type_name()
+                ));
+            }
+        };
+        let ty = rec
+            .iter()
+            .find(|(k, _)| k == "ty")
+            .map(|(_, v)| v)
+            .ok_or_else(|| {
+                format!("ffi_dlib_call: arg #{i} record missing `ty`")
+            })?;
+        let v = rec
+            .iter()
+            .find(|(k, _)| k == "v")
+            .map(|(_, v)| v)
+            .ok_or_else(|| {
+                format!("ffi_dlib_call: arg #{i} record missing `v`")
+            })?;
+        let ty_s = match ty {
+            Value::String(s) => s.as_str().to_string(),
+            other => {
+                return Err(format!(
+                    "ffi_dlib_call: arg #{i} `ty` must be String, got `{}`",
+                    other.type_name()
+                ));
+            }
+        };
+        let dv = match (ty_s.as_str(), v) {
+            ("i64", Value::Int(i)) => axon_ffi::DlibValue::I64(*i),
+            ("f64", Value::Float(f)) => axon_ffi::DlibValue::F64(*f),
+            ("f64", Value::Int(i)) => axon_ffi::DlibValue::F64(*i as f64),
+            ("str", Value::String(s)) => axon_ffi::DlibValue::Str(s.as_str().to_string()),
+            (other_ty, value) => {
+                return Err(format!(
+                    "ffi_dlib_call: arg #{i}: ty=`{other_ty}` doesn't match value `{}`",
+                    value.type_name()
+                ));
+            }
+        };
+        dlib_args.push(dv);
+    }
+
+    let lib = match axon_ffi::DynamicLibrary::open(path.as_str()) {
+        Ok(l) => l,
+        Err(e) => return Ok(dlib_result(false, None, &e.to_string())),
+    };
+    match lib.call(symbol.as_str(), &dlib_args, ret_is_str) {
+        Ok(v) => Ok(dlib_result(true, Some(dlib_value_to_axon(&v)), "")),
+        Err(e) => Ok(dlib_result(false, None, &e.to_string())),
+    }
+}
+
+fn dlib_value_to_axon(v: &axon_ffi::DlibValue) -> Value {
+    match v {
+        axon_ffi::DlibValue::I64(i) => Value::Int(*i),
+        axon_ffi::DlibValue::F64(f) => Value::Float(*f),
+        axon_ffi::DlibValue::Str(s) => Value::String(Rc::new(s.clone())),
+    }
+}
+
+fn dlib_result(ok: bool, value: Option<Value>, error: &str) -> Value {
+    let mut rec = Vec::new();
+    rec.push(("ok".to_string(), Value::Bool(ok)));
+    rec.push((
+        "value".to_string(),
+        value.unwrap_or(Value::Nil),
+    ));
+    rec.push(("error".to_string(), Value::String(Rc::new(error.to_string()))));
+    Value::Record(Rc::new(std::cell::RefCell::new(rec)))
 }
 
 /// `ffi_call(program, args_list, request_json_string, timeout_ms)`

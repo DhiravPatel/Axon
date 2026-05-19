@@ -9,3 +9,9 @@ description = "Axon agent-to-agent interop: agent-card.json, discovery, signed i
 serde      = { workspace = true }
 serde_json = { workspace = true }
 ureq       = { workspace = true }
+
+# Pure-Rust Ed25519 from RustCrypto. `rand_core` is needed for the
+# generator; we expose `KeyPair::generate` and `KeyPair::from_seed` so
+# tests/deterministic use cases never touch the OS RNG.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand_core     = { version = "0.6", features = ["getrandom"] }

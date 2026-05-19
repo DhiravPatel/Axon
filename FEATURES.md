@@ -1,6 +1,62 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**253 tests passing** across 27 crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**579 tests passing** across 30+ crates).
+
+---
+
+## Stage 23 — Dynamic-library FFI (§35) + Delegated Identity (§54.2) + `axon pkg` (§36)
+
+Three production-quality additions land together in Stage 23: in-process FFI for pre-built native libraries, the `on_behalf_of` delegation primitive that lets one principal authorize another, and a CLI subcommand for managing project dependencies.
+
+### §35 Dynamic-library FFI via `libloading`
+- New `axon-ffi::dlib` module: `DynamicLibrary` (RAII wrapper around `libloading::Library`), `DlibValue { I64 | F64 | Str }`, typed `DlibError`.
+- `DynamicLibrary::open(path)` — load any `.so` / `.dylib` / `.dll` from disk; symbols looked up lazily via `Library::get`.
+- `DynamicLibrary::call(symbol, args, ret_is_str)` — dispatches based on the arg shape against a small, deliberately narrow set of supported C signatures: i64 arity 0..=4 → i64, f64 arity 0..=2 → f64, single `*const c_char` → `*const c_char`, void → `*const c_char`. Anything outside that closed set is rejected statically with `DlibError::UnsupportedSignature` rather than risking undefined behavior.
+- Host binding `ffi_dlib_call(lib_path, symbol, args_list, ret_is_str)` returns `{ ok, value, error }`. Args are tagged records `{ ty: "i64"|"f64"|"str", v: <val> }` so the host can pick the right C signature without relying on Axon's dynamic-typing inference.
+- Real test: opens `libSystem.dylib` (macOS) / `libm.so.6` (Linux), calls `cos(0.0)`, asserts `1.0` round-trips through the boundary.
+
+### §54.2 Delegated identity (`on_behalf_of`)
+- New `axon-a2a::identity::Delegation` — `{ principal, audience, scopes, expires_at_secs, nonce }`. Serializes to canonical JSON; the JSON is what's actually signed.
+- `SignedDelegation { delegation_json, signature_hex, signer_pubkey_hex }` — same shape as `SignedAgentCard` from Stage 22, reusing the Ed25519 primitives.
+- `KeyPair::sign_delegation(&Delegation)` produces a `SignedDelegation`; `SignedDelegation::verify(&TrustStore, expected_audience, now_secs)` is **fail-closed** in this order:
+  1. hex parse (signature & pubkey both syntactically valid);
+  2. trust-store membership check (untrusted-but-mathematically-valid signatures rejected);
+  3. signature verification (ed25519-dalek);
+  4. audience match (`expected_audience` must equal `delegation.audience`);
+  5. expiry check (`now_secs <= delegation.expires_at_secs`).
+- The trust check runs *before* the signature math so an attacker probing with a known-untrusted key learns nothing about signature internals — defense-in-depth against timing oracles.
+- Host bindings: `a2a_sign_delegation(seed_hex, principal, audience, scopes_list, expires_at_secs, nonce, dest_json_path)` returns the signer's pubkey hex; `a2a_verify_delegation(signed_path, trust_store_name, expected_audience, now_secs)` returns the parsed delegation record on success and errors on any failed gate.
+- Reuses the Stage 22 `TRUST_STORES` thread-local registry — store-name semantics are identical between signed cards and signed delegations.
+
+### §36 `axon pkg` subcommand
+- New `axon pkg <list|add|remove|audit>` for read/edit of the `[deps.<name>]` tables in `axon.toml`.
+- `pkg list` prints each dep with its path; `pkg add NAME --path P` writes (or overwrites) the entry, validating the dep name is alphanumeric/underscore/dash only; `pkg remove NAME` deletes the entry (errors if missing); `pkg audit` walks every declared dep and reports `ok`, `WARN` (dir present but no `axon.toml` or `src/`), or `FAIL` (path doesn't exist).
+- Round-trips through `toml::Value` so unknown manifest sections survive edits unchanged. `--manifest PATH` overrides the default of `./axon.toml` so the command works from any directory.
+- Network/git deps land in a later stage; today the surface is local-path only — same constraint as `axon-project` itself.
+
+### Test coverage
+- `crates/axon-ffi/src/dlib.rs` — 5 unit tests including a real `cos(0.0)` invocation through `libloading`.
+- `crates/axon-a2a/src/identity.rs` — 5 new delegation tests on top of Stage 22's signed-card tests (round trip, audience mismatch, expiry, untrusted signer, tampered JSON).
+- `crates/axon-cli/tests/host_dlib_and_delegation.rs` — 6 end-to-end tests through the `axon` binary.
+- `crates/axon-cli/tests/axon_pkg.rs` — 8 tests covering list / add / remove / audit on real on-disk manifests.
+
+### CLI demo (real run)
+```
+$ axon run examples/stage23_dlib_and_delegation.ax
+ffi_dlib_call(cos, 0.0) ok =
+true
+cos(0.0) =
+1
+signed delegation written to
+/tmp/axon-stage23-deleg.json
+verified delegation:
+  principal =
+user:alice
+  audience  =
+research-agent-1
+  nonce     =
+demo-nonce-001
+```
 
 ---
 
@@ -142,6 +198,48 @@ A snapshot of everything Axon ships today, grouped by the stages that introduced
 - Go-to-definition for local and cross-module symbols.
 - Completion: keywords, in-scope identifiers, member access.
 - Editor integration ready (VS Code, Neovim, any LSP-aware client).
+
+## Stage 22 — Platform Sandboxes (Linux seccomp + macOS sandbox-exec) + Ed25519 A2A Identity
+
+Real OS-level isolation for tool subprocesses, plus verifiable cross-org agent identity via Ed25519.
+
+### §42 Platform sandboxes
+- New `axon-sandbox::platform` module with `PlatformProfile` (declarative intent: `read_only_fs`, `allow_network`, `allow_subprocess`, `extra_syscalls`) and `PlatformSandbox` (mutates a `std::process::Command` before spawn).
+- Three presets: `strict()` (default — read-only FS, no net, no fork), `networked()`, `build_tool()`.
+- **Linux**: seccomp-bpf filter via `seccompiler` (pure Rust, same library Firecracker uses). `PR_SET_NO_NEW_PRIVS + seccomp(2)` installed inside `pre_exec`, so the filter is in force from instruction 1 of the user's process. Whitelist covers POSIX core syscalls; `KillProcess` (SIGKILL) on anything outside the allowlist.
+- **macOS**: `sandbox-exec(1)` wrapping. The command is rewritten as `sandbox-exec -p <inline-sbpl> <original-program> <args...>`. sbpl profile is `(deny default)` + opt-ins for the operations the profile enables.
+- **Windows**: documented v0 limit — `Limits` + wall-timeout still apply, Job Object integration deferred.
+- Host binding `sandbox_run_with_profile(program, args, cpu, mem_mb, wall_s, profile_name)` returns the same result record as `sandbox_run` from Stage 15; the kernel sandbox layer is additive.
+
+### §54 Ed25519 signed agent identity
+- New `axon-a2a::identity` module: `KeyPair` (ed25519-dalek), `SignedAgentCard { card_json, signature_hex, signer_pubkey_hex }`, `TrustStore`, `IdentityError`.
+- `KeyPair::generate()` uses OS RNG; `KeyPair::from_seed_bytes` is deterministic for reproducible tests and seed-vault recovery.
+- `KeyPair::sign_card(&AgentCard)` produces a `SignedAgentCard` with the canonical card JSON, 64-byte hex signature, and 32-byte hex verifying key.
+- `SignedAgentCard::verify(&TrustStore)` is **fail-closed**: signature math must verify *and* the signer's pubkey must be in the trust store. Untrusted-but-mathematically-valid signatures are rejected with `IdentityError::Untrusted(hex)`.
+- `KeyPair::Debug` redacts the private seed; the only way to extract it is through `seed_hex()` / `seed_bytes()` (named so audit trails flag the call).
+- Host bindings: `a2a_keypair_generate`, `a2a_keypair_from_seed`, `a2a_sign_card(card_json_path, seed_hex, signed_dest_path)`, `a2a_verify_signed_card(signed_path, trust_store_name)`, `a2a_trust_store_new(name, list_of_pubkey_hex)`.
+
+### CLI demo (real run)
+```
+$ axon run demo.ax
+--- platform sandbox: strict profile ---
+hello-from-sandbox                          # echo ran under macOS sandbox-exec
+0
+--- Ed25519 keypair ---
+a79b45a4162df95e                            # first 16 hex chars of pubkey
+64                                          # 64-char seed
+--- sign + verify ---
+research-acme                               # verified card.agent_id
+Acme Research Agent
+--- signed card on disk ---
+{
+  "card_json": "{...canonical AgentCard JSON...}",
+  "signature_hex": "68edfe57...a04",        # 64-byte Ed25519 sig
+  "signer_pubkey_hex": "a79b45a4...500"     # 32-byte verifying key
+}
+```
+
+---
 
 ## Stage 21 — OAuth Vault, TLS Serve, Graceful Shutdown, `axon login`
 

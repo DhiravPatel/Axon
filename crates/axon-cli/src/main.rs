@@ -103,6 +103,10 @@ fn main() -> ExitCode {
             let remaining: Vec<String> = args.collect();
             cmd_login(&remaining)
         }
+        "pkg" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_pkg(&remaining)
+        }
         "version" | "--version" | "-V" => {
             println!("axon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -155,6 +159,9 @@ fn print_help() {
                           Save an API key to the local vault (mode 0600 on\n\
                           Unix). Reads --key, then $PROVIDER_API_KEY env,\n\
                           then prompts on stdin.\n\
+           pkg    <subcmd>  Manage dependencies declared in `axon.toml`.\n\
+                          Subcommands: `list`, `add NAME --path P`,\n\
+                          `remove NAME`, `audit`.\n\
            deploy <file> -o DIR [--name N] [--port P] [--handler H]\n\
                           Package a project for deployment: write a\n\
                           `.axskill` archive plus a `deploy.json` manifest\n\
@@ -1582,3 +1589,304 @@ fn cmd_login(args: &[String]) -> ExitCode {
     println!("saved `{secret_name}` to {vault_path} (mode 0600 on Unix)");
     ExitCode::SUCCESS
 }
+
+// ---------------------------------------------------------------------------
+// Stage 23 — `axon pkg`
+// ---------------------------------------------------------------------------
+
+/// `axon pkg <subcmd>` — read/edit dependency entries in `axon.toml`.
+///
+/// Subcommands:
+///   * `list`               — print each `[deps.<name>] path = "..."` entry.
+///   * `add  <name> --path P` — add or update the dep entry.
+///   * `remove <name>`      — drop the dep entry (no-op if absent).
+///   * `audit`              — sanity-check every dep path exists & looks
+///                            like an Axon project.
+///
+/// All subcommands operate on the `axon.toml` in the current directory by
+/// default; pass `--manifest PATH` to point elsewhere. Edits preserve the
+/// rest of the manifest by round-tripping through `toml::Value`.
+fn cmd_pkg(args: &[String]) -> ExitCode {
+    // Pull out --manifest if present so the inner sub-dispatch sees a
+    // contiguous positional list.
+    let mut manifest_path = std::path::PathBuf::from("axon.toml");
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--manifest" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon pkg: --manifest requires PATH");
+                    return ExitCode::from(2);
+                }
+                manifest_path = std::path::PathBuf::from(&args[i]);
+                i += 1;
+            }
+            other if other.starts_with("--manifest=") => {
+                manifest_path = std::path::PathBuf::from(&other["--manifest=".len()..]);
+                i += 1;
+            }
+            other => {
+                rest.push(other);
+                i += 1;
+            }
+        }
+    }
+    let (sub, sub_args) = match rest.split_first() {
+        Some(s) => s,
+        None => {
+            eprintln!("usage: axon pkg <list|add|remove|audit> [args...]");
+            return ExitCode::from(2);
+        }
+    };
+
+    match *sub {
+        "list" => pkg_list(&manifest_path),
+        "add" => pkg_add(&manifest_path, sub_args),
+        "remove" | "rm" => pkg_remove(&manifest_path, sub_args),
+        "audit" => pkg_audit(&manifest_path),
+        other => {
+            eprintln!("axon pkg: unknown subcommand `{other}`");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Read the manifest as a `toml::Value`. A missing file produces an empty
+/// table so first-time `add` calls Just Work — but `list`/`audit`/`remove`
+/// against a missing manifest should still tell the user something.
+fn pkg_load_manifest(path: &std::path::Path) -> Result<toml::Value, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text)
+            .map_err(|e| format!("axon pkg: `{}` is not valid TOML: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(toml::Value::Table(toml::map::Map::new()))
+        }
+        Err(e) => Err(format!("axon pkg: cannot read `{}`: {e}", path.display())),
+    }
+}
+
+fn pkg_save_manifest(path: &std::path::Path, value: &toml::Value) -> Result<(), String> {
+    let text = toml::to_string_pretty(value)
+        .map_err(|e| format!("axon pkg: cannot serialize manifest: {e}"))?;
+    std::fs::write(path, text)
+        .map_err(|e| format!("axon pkg: cannot write `{}`: {e}", path.display()))
+}
+
+fn pkg_get_deps_table<'a>(manifest: &'a toml::Value) -> Option<&'a toml::value::Table> {
+    manifest.get("deps").and_then(|v| v.as_table())
+}
+
+fn pkg_list(manifest_path: &std::path::Path) -> ExitCode {
+    let manifest = match pkg_load_manifest(manifest_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let deps = match pkg_get_deps_table(&manifest) {
+        Some(t) => t,
+        None => {
+            println!("(no dependencies declared in {})", manifest_path.display());
+            return ExitCode::SUCCESS;
+        }
+    };
+    if deps.is_empty() {
+        println!("(no dependencies declared in {})", manifest_path.display());
+        return ExitCode::SUCCESS;
+    }
+    let mut names: Vec<&String> = deps.keys().collect();
+    names.sort();
+    for name in names {
+        let entry = &deps[name];
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("(no path)");
+        println!("  {name}  path = \"{path}\"");
+    }
+    ExitCode::SUCCESS
+}
+
+fn pkg_add(manifest_path: &std::path::Path, args: &[&str]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: axon pkg add <name> --path <DIR>");
+        return ExitCode::from(2);
+    }
+    let name = args[0];
+    if !is_valid_dep_name(name) {
+        eprintln!(
+            "axon pkg add: invalid dep name `{name}` — use letters, digits, `_` or `-`"
+        );
+        return ExitCode::from(2);
+    }
+    let mut path_value: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i] {
+            "--path" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon pkg add: --path requires DIR");
+                    return ExitCode::from(2);
+                }
+                path_value = Some(args[i].to_string());
+                i += 1;
+            }
+            other if other.starts_with("--path=") => {
+                path_value = Some(other["--path=".len()..].to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("axon pkg add: unexpected argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let path = match path_value {
+        Some(p) => p,
+        None => {
+            eprintln!("axon pkg add: --path is required (network deps land in a later stage)");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut manifest = match pkg_load_manifest(manifest_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let root = match manifest.as_table_mut() {
+        Some(t) => t,
+        None => {
+            eprintln!("axon pkg add: manifest root is not a table");
+            return ExitCode::from(1);
+        }
+    };
+    let deps_entry = root
+        .entry("deps".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let deps = match deps_entry.as_table_mut() {
+        Some(t) => t,
+        None => {
+            eprintln!("axon pkg add: `[deps]` exists but is not a table");
+            return ExitCode::from(1);
+        }
+    };
+    let mut entry = toml::map::Map::new();
+    entry.insert("path".to_string(), toml::Value::String(path.clone()));
+    deps.insert(name.to_string(), toml::Value::Table(entry));
+
+    if let Err(e) = pkg_save_manifest(manifest_path, &manifest) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    println!("added dep `{name}` path = \"{path}\"");
+    ExitCode::SUCCESS
+}
+
+fn pkg_remove(manifest_path: &std::path::Path, args: &[&str]) -> ExitCode {
+    let name = match args.first() {
+        Some(n) => *n,
+        None => {
+            eprintln!("usage: axon pkg remove <name>");
+            return ExitCode::from(2);
+        }
+    };
+    let mut manifest = match pkg_load_manifest(manifest_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let removed = manifest
+        .as_table_mut()
+        .and_then(|t| t.get_mut("deps"))
+        .and_then(|v| v.as_table_mut())
+        .map(|deps| deps.remove(name).is_some())
+        .unwrap_or(false);
+    if !removed {
+        eprintln!("axon pkg remove: no dep named `{name}`");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = pkg_save_manifest(manifest_path, &manifest) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
+    println!("removed dep `{name}`");
+    ExitCode::SUCCESS
+}
+
+fn pkg_audit(manifest_path: &std::path::Path) -> ExitCode {
+    let manifest = match pkg_load_manifest(manifest_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let deps = match pkg_get_deps_table(&manifest) {
+        Some(t) => t,
+        None => {
+            println!("(no dependencies declared in {})", manifest_path.display());
+            return ExitCode::SUCCESS;
+        }
+    };
+    if deps.is_empty() {
+        println!("(no dependencies declared in {})", manifest_path.display());
+        return ExitCode::SUCCESS;
+    }
+    let manifest_dir = manifest_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut bad = 0usize;
+    let mut names: Vec<&String> = deps.keys().collect();
+    names.sort();
+    for name in names {
+        let entry = &deps[name];
+        let path_str = match entry.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => {
+                println!("  FAIL {name}: missing `path` field");
+                bad += 1;
+                continue;
+            }
+        };
+        let dep_path = manifest_dir.join(path_str);
+        if !dep_path.is_dir() {
+            println!("  FAIL {name}: `{}` is not a directory", dep_path.display());
+            bad += 1;
+            continue;
+        }
+        // A well-formed dep has an axon.toml *or* a src/ directory.
+        let has_manifest = dep_path.join("axon.toml").is_file();
+        let has_src = dep_path.join("src").is_dir();
+        if !has_manifest && !has_src {
+            println!(
+                "  WARN {name}: `{}` lacks axon.toml and src/ — not an Axon project?",
+                dep_path.display()
+            );
+            // A warning, not a failure: empty workspaces should still pass
+            // audit so users can scaffold a dep before populating it.
+            continue;
+        }
+        println!("  ok   {name}: {}", dep_path.display());
+    }
+    if bad > 0 {
+        eprintln!("axon pkg audit: {bad} dependency error(s)");
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn is_valid_dep_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+

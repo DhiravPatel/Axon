@@ -98,6 +98,13 @@ impl<'a> Checker<'a> {
             "trace_export_otlp",
             // ---- Stage 21 TLS deploy server ----
             "serve_run_tls",
+            // ---- Stage 22 platform sandboxes + Ed25519 identity ----
+            "sandbox_run_with_profile",
+            "a2a_keypair_generate", "a2a_keypair_from_seed",
+            "a2a_sign_card", "a2a_verify_signed_card", "a2a_trust_store_new",
+            // ---- Stage 23 dynamic-library FFI + delegated identity ----
+            "ffi_dlib_call",
+            "a2a_sign_delegation", "a2a_verify_delegation",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),
