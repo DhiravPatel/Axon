@@ -979,6 +979,13 @@ impl<'a> Checker<'a> {
     }
 
     fn field_ty(&mut self, span: Span, on: &Ty, name: &Ident) -> Ty {
+        // `Dyn` is the runtime "unknown type" — propagate it through field
+        // access so values returned from native built-ins (host extensions,
+        // FFI) can be drilled into without manual type ascriptions.
+        // `Error` likewise stays `Error` to avoid cascading diagnostics.
+        if matches!(on, Ty::Dyn | Ty::Error) {
+            return Ty::Dyn;
+        }
         if let Ty::Tuple(xs) = on {
             // Numeric field access on tuples (`t.0`, `t.1`) — `name` is an
             // identifier, but we accept all-digit names here for tuples.

@@ -1,0 +1,10 @@
+[package]
+name = "axon-rag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon retrieval-augmented-generation primitives: chunking, embedding, vector + lexical indices, hybrid retrieval."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

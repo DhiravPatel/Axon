@@ -1,0 +1,10 @@
+[package]
+name = "axon-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon Memory & state — pluggable persistent stores."
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }

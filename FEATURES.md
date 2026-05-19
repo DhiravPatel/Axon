@@ -143,6 +143,129 @@ A snapshot of everything Axon ships today, grouped by the stages that introduced
 - Completion: keywords, in-scope identifiers, member access.
 - Editor integration ready (VS Code, Neovim, any LSP-aware client).
 
+## Stage 13 — Orchestration & Reasoning
+
+**Crate:** [axon-flow](crates/axon-flow/), plus a runtime extension (`NativeExtFn` / `Value::NativeExt`).
+
+### `axon-flow` — three production combinators
+- `sequential(steps, input)` — pipeline: thread `input` through each `Step` in order; short-circuit on first failure with `sequential[i]` path crumb.
+- `parallel(steps, input)` — fan-out: run every `Step` on the *same* input, collect outputs in order. `Vec<Result<...>>` so caller decides on partial failure. `parallel_strict` short-circuits.
+- `refine(generate, critique, revise, accept, max_rounds)` — planner-critic loop. Keeps best-so-far; returns `(draft, score, RefineOutcome::Accepted | MaxRounds)`. Matches §49.3 `flow.reflect` shape.
+- Generic over `Step<I, O>`; `FnStep` wraps closures; `ScriptedStep` returns pre-recorded outputs (for tests).
+- `FlowError` carries a path breadcrumb (`sequential[2]`, `parallel[branch=4]`, `refine[critique:2]`) so failures localize to a step.
+
+### Runtime extension: `NativeExtFn` / `Value::NativeExt`
+- New native-fn variant that **takes `&mut Interpreter` plus the call-site span**. Enables host bindings to invoke user closures supplied as arguments.
+- `Interpreter::register_native_ext(name, fn)` is the registration point.
+- Arity, capability, and error-trace handling all mirror the existing `NativeFn` path.
+
+### CLI bindings (all `NativeExt` so user fns can be supplied as steps)
+- `flow_seq(list_of_callables, input)` → final value
+- `flow_parallel(list_of_callables, input)` → `List<output>`
+- `flow_refine(generate, critique, revise, max_rounds, accept_score)` → `{ draft, score, rounds, outcome }`
+
+### CLI demo (real run)
+```
+--- pipeline ---
+issue #42                              # classify → summarize → polish
+--- fan-out ---
+research n                             # style_concise
+RESEARCH NOTES                         # style_loud
+[summary] research notes               # style_label
+--- refine ---
+accepted                               # outcome
+draft+++                               # draft after 3 revisions
+3                                      # rounds used
+```
+
+---
+
+## Stage 12 — RAG & Multimodal
+
+**Crates:** [axon-rag](crates/axon-rag/), [axon-media](crates/axon-media/)
+
+### `axon-rag` — production retrieval primitives
+- `RecursiveChunker` — paragraph → sentence → word → char fallback with configurable overlap.
+- `HashEmbedder` — deterministic feature-hashing (FNV-1a) + L2 normalization. Zero network, byte-identical across runs, ideal for tests/replay; same trait surface as future remote embedders.
+- `Index` — in-memory vector + lexical store with stable JSON serialization; rehydrates BM25 sidecar on load; idempotent inserts keyed by content-hashed `passage_id`.
+- `Bm25` — Okapi BM25+ (k1=1.5, b=0.75) over the same tokenization the embedder uses.
+- `Retriever` — hybrid scorer (`α·cosine + (1-α)·BM25_normalized`); top-k with deterministic tie-break.
+- CLI bindings: `rag_index_new`, `rag_ingest`, `rag_chunk`, `rag_retrieve`, `rag_save`, `rag_load`, `rag_index_len`.
+
+### `axon-media` — typed multimodal primitives
+- `Image::from_bytes` — real header parsers for **PNG IHDR**, **JPEG SOFn**, **GIF LSD**; returns width, height, MIME, byte length without decoding pixels.
+- `Audio::from_bytes` — RIFF/WAVE parser; walks `fmt ` and `data` sub-chunks to recover sample rate, channels, bit depth, and duration_ms; rejects non-PCM formats with a typed error.
+- `Document::from_bytes` — UTF-8 text with optional form-feed (`\x0C`) page boundaries (the `pdftotext` convention).
+- `sniff()` — content-first MIME detection (PNG/JPEG/GIF/WAV/PDF/text/unknown).
+- Every parser rejects malformed input with a typed `MediaError` — no panics, no decoder exploits.
+- CLI bindings: `media_image_load`, `media_audio_load`, `media_document_load`, `media_sniff`.
+
+### Host + tyck wiring
+- Type checker now treats `Dyn.field` as `Dyn` so structured Records returned by native bindings can be drilled into without type ascriptions — propagation through `Dyn` and `Error`, not a blanket relaxation.
+- All `rag_*` and `media_*` names added to the type checker's PURE built-in list.
+
+### CLI demo (real run)
+```axon
+fn main() uses { Console } {
+    let img = media_image_load("chart.png")
+    print(img.mime)            // "image/png"
+    print_int(img.width)        // 800
+    print_int(img.height)       // 600
+
+    rag_index_new(512)
+    rag_ingest("doc1", "Ferret are small carnivorous mammals ...")
+    rag_ingest("doc2", "The stock market closed lower today ...")
+    let hits = rag_retrieve("how to train a ferret pet", 2)
+    // top hit: "Domestic ferret can be trained to use a litter box..."
+    rag_save("kb.json")
+    // ... next process can rag_load("kb.json") and pick up where we left off
+}
+```
+
+---
+
+## Stage 11 — Standard Library & Memory
+
+**Crates:** [axon-std](crates/axon-std/), [axon-memory](crates/axon-memory/)
+
+### `axon-std` — 87 functions across 8 modules
+- `std.string` (16): `str_upper`, `str_lower`, `str_trim*`, `str_split`, `str_join`, `str_contains`, `str_starts_with`/`ends_with`, `str_replace`, `str_repeat`, `str_len`, `str_chars`, `str_index_of`, `str_substring`.
+- `std.list` (16): `list_new`/`len`/`push`/`pop`/`get`/`set`, `first`/`last`/`contains`, `reverse`/`sort`, `take`/`drop`/`concat`, `index_of`, `remove_at`.
+- `std.map` (10): insertion-ordered KV — `map_new`/`len`/`get`/`get_or`/`set`/`remove`/`contains`/`keys`/`values`/`merge`.
+- `std.set` (9): dedup-preserving — `set_new`/`add`/`remove`/`contains`/`union`/`intersection`/`difference`/`to_list`/`len`.
+- `std.option` (6) + `std.result` (7): first-order helpers; `Result` uses tagged `Instance` so pattern matching works uniformly.
+- `std.math` (14): `pow`, `sqrt`, `floor`/`ceil`/`round`, `sin`/`cos`/`tan`, `log`/`log2`, `exp`, `pi`/`e`, `gcd`.
+- `std.time` (9): `dur_seconds`/`millis` and reverse, `date_year/month/day`, `date_make` (validates day-of-month), `date_is_leap`.
+
+### `axon-memory` — pluggable persistent stores
+- `EphemeralStore` — in-process `BTreeMap`.
+- `FileStore` — JSON-backed with **atomic writes** (write `.tmp`, fsync, rename) so a partial process kill never leaves the file half-written.
+- Single `Store` trait — downstream code holds `Arc<dyn Store>` and never cares which backend.
+- Sorted-key snapshots → deterministic on-disk output.
+- Schema versioning with explicit rejection of unknown versions.
+- `forget_tagged()` and `forget_older_than()` for retention/GDPR-style passes.
+
+### Host wiring
+- `Interpreter::register_native()` is a new public method so downstream crates plug into the runtime without modification.
+- `axon-cli` exposes 8 `mem_*` built-ins (open file, open ephemeral, set, get, remove, keys, len, contains) backed by `axon-memory`, with automatic `Value`↔`serde_json::Value` conversion.
+- Type checker's built-in list extended so all stdlib + `mem_*` names type-check.
+
+### CLI demo (real, end-to-end)
+```axon
+fn main() uses { Console } {
+    mem_open_file("/tmp/wordcount.json")
+    let words = str_split(str_lower(sentence), " ")
+    let counts = map_new()
+    // ... (frequency map via list_get/map_set) ...
+    mem_set("top_word", best_word)   // persists across processes
+    mem_set("top_count", best_count)
+    print_int(best_count)
+}
+```
+The JSON file survives the process exit and is read back in the next run.
+
+---
+
 ## Stage 10 — Doc Site Generator & Formatter
 
 **Crates:** [axon-doc](crates/axon-doc/), [axon-fmt](crates/axon-fmt/)

@@ -23,4 +23,9 @@ axon-wasm = { workspace = true }
 axon-lsp = { workspace = true }
 axon-doc = { workspace = true }
 axon-fmt = { workspace = true }
+axon-std = { workspace = true }
+axon-memory = { workspace = true }
+axon-rag = { workspace = true }
+axon-media = { workspace = true }
+axon-flow = { workspace = true }
 serde_json = { workspace = true }

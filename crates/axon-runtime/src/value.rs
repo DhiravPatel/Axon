@@ -126,6 +126,12 @@ pub enum Value {
     /// constructs this directly.
     #[allow(dead_code)]
     Error(Rc<String>),
+
+    /// Extended native function that may re-enter the interpreter to invoke
+    /// user closures or other native functions. Introduced in Stage 13 for
+    /// orchestration primitives (`flow_seq`, `flow_parallel`, `flow_refine`)
+    /// that need to call back into Axon code with each step's value.
+    NativeExt(Rc<NativeExtFn>),
 }
 
 /// A user-defined function plus the captured environment that closed over
@@ -170,6 +176,27 @@ pub struct NativeFn {
 
 pub type NativeCall = fn(&[Value]) -> Result<Value, String>;
 
+/// Extended native call type. Receives a mutable interpreter handle so the
+/// body can invoke user closures via [`crate::Interpreter::call_value`].
+///
+/// Errors are returned as `String` to mirror [`NativeCall`]; the runtime
+/// wraps them into a proper [`crate::error::EvalSignal`] at the call site.
+pub type NativeExtCall =
+    fn(&mut crate::Interpreter, &[Value], axon_diag::Span) -> Result<Value, String>;
+
+/// Signature + behavior of a native function that may invoke user code.
+///
+/// Same shape as [`NativeFn`] but with the extended `call` signature. The
+/// runtime registers both kinds in the global environment as `Value::Native`
+/// vs `Value::NativeExt` and dispatches accordingly.
+pub struct NativeExtFn {
+    pub name: &'static str,
+    pub min_arity: usize,
+    pub max_arity: Option<usize>,
+    pub required_caps: &'static [&'static str],
+    pub call: NativeExtCall,
+}
+
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -198,6 +225,7 @@ impl Value {
             Value::Tainted(_) => "Tainted",
             Value::Fn(_) => "Fn",
             Value::Native(_) => "Native",
+            Value::NativeExt(_) => "Native",
             Value::Spawned(_) => "Agent",
             Value::Chan(_) => "Chan",
             Value::Model(_) => "Model",
@@ -331,6 +359,7 @@ impl PartialEq for Value {
             (Tainted(a), Tainted(b)) => a == b,
             (Fn(a), Fn(b)) => Rc::ptr_eq(a, b),
             (Native(a), Native(b)) => Rc::ptr_eq(a, b),
+            (NativeExt(a), NativeExt(b)) => Rc::ptr_eq(a, b),
             (Spawned(a), Spawned(b)) => Rc::ptr_eq(a, b) || a.id == b.id,
             (Chan(a), Chan(b)) => Rc::ptr_eq(a, b),
             (Model(a), Model(b)) => Rc::ptr_eq(a, b),
@@ -519,6 +548,7 @@ impl fmt::Display for Value {
                 None => f.write_str("<lambda>"),
             },
             Value::Native(n) => write!(f, "<native {}>", n.name),
+            Value::NativeExt(n) => write!(f, "<native {}>", n.name),
             Value::Spawned(a) => write!(f, "<{} #{}>", a.type_name, a.id),
             Value::Chan(q) => write!(f, "<chan len={}>", q.borrow().len()),
             Value::Model(m) => write!(f, "<model {}>", m.name()),

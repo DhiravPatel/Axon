@@ -35,7 +35,7 @@ pub use eval::Interpreter;
 pub use record::{Recording, RecordedEvent, Replay};
 pub use tool::{ToolBody, ToolDef};
 pub use trace::{AttributeValue, SpanKind, TraceSpan, Tracer};
-pub use value::{Closure, ClosureBody, NativeFn, Value};
+pub use value::{Closure, ClosureBody, NativeExtCall, NativeExtFn, NativeFn, Value};
 
 use axon_ast::Program;
 use axon_diag::SourceFile;

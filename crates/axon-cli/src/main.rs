@@ -15,6 +15,8 @@ use std::process::ExitCode;
 
 use axon_diag::SourceFile;
 
+mod host;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let cmd = match args.next() {
@@ -497,6 +499,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
 
     for t in &tests {
         let mut interp = axon_runtime::Interpreter::with_caps(caps.clone());
+        host::install(&interp);
         interp.load_program(&project.merged);
         let closure = axon_runtime::Closure::new(
             Some(format!("test:{}", t.name)),
@@ -731,6 +734,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             axon_runtime::CapSet::standard_default()
         };
         let mut interp = axon_runtime::Interpreter::with_caps(caps);
+        host::install(&interp);
         if trace_path.is_some() {
             interp.enable_tracing();
         }

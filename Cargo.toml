@@ -14,6 +14,11 @@ members = [
     "crates/axon-lsp",
     "crates/axon-doc",
     "crates/axon-fmt",
+    "crates/axon-std",
+    "crates/axon-memory",
+    "crates/axon-rag",
+    "crates/axon-media",
+    "crates/axon-flow",
     "crates/axon-cli",
 ]
 resolver = "2"
@@ -41,6 +46,11 @@ axon-wasm    = { path = "crates/axon-wasm" }
 axon-lsp     = { path = "crates/axon-lsp" }
 axon-doc     = { path = "crates/axon-doc" }
 axon-fmt     = { path = "crates/axon-fmt" }
+axon-std     = { path = "crates/axon-std" }
+axon-memory  = { path = "crates/axon-memory" }
+axon-rag     = { path = "crates/axon-rag" }
+axon-media   = { path = "crates/axon-media" }
+axon-flow    = { path = "crates/axon-flow" }
 
 ureq         = { version = "2", default-features = false, features = ["tls", "json"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
