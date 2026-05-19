@@ -1,0 +1,36 @@
+//! examples/pure.ax — pure-Rust subset demo.
+//!
+//! Run with:
+//!   cargo run -q -p axon-cli -- run examples/pure.ax
+
+fn fact(n: Int) -> Int {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+
+fn fib(n: Int) -> Int {
+    match n {
+        0 => 0,
+        1 => 1,
+        _ => fib(n - 1) + fib(n - 2)
+    }
+}
+
+fn main() uses { Console } {
+    print("fact(10) =", fact(10))
+    print("fib(15)  =", fib(15))
+
+    // Closures + higher-order list methods.
+    let xs = [1, 2, 3, 4, 5]
+    let doubled = xs.map(|n| n * 2)
+    let evens = xs.filter(|n| n % 2 == 0)
+    print("doubled =", doubled)
+    print("evens   =", evens)
+
+    // Loops, mutation, string interpolation.
+    var sum = 0
+    for n in xs {
+        sum += n
+    }
+    print("sum     =", sum)
+    print("hello, {sum} cookies!")
+}

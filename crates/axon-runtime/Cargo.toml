@@ -1,0 +1,19 @@
+[package]
+name = "axon-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tree-walking interpreter for the Axon programming language"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-ast = { workspace = true }
+axon-models = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+axon-parser = { workspace = true }
+axon-tyck = { workspace = true }
+axon-models = { workspace = true }
+axon-ast = { workspace = true }
+serde_json = { workspace = true }

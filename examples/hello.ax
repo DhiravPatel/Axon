@@ -1,0 +1,23 @@
+//! examples/hello.ax — a working agent end-to-end.
+//!
+//! Stage 5.5 turned `spawn` into a real runtime construct, so this example
+//! actually executes. Run with:
+//!
+//!   cargo run -q -p axon-cli -- run examples/hello.ax
+
+agent Greeter(name: String) {
+    state count: Int = 0
+
+    on greet(who: String) -> String uses { Console } {
+        self.count = self.count + 1
+        print("[{self.name} greeting #{self.count}]")
+        "hello, {who}!"
+    }
+}
+
+fn main() uses { Spawn, Console } {
+    let g = spawn Greeter(name = "axon")
+    print(g.greet("world"))
+    print(g.greet("again"))
+    print(g.greet("once more"))
+}

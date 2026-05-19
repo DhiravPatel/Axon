@@ -1,0 +1,9 @@
+[package]
+name = "axon-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical type representation and effect rows for the Axon compiler"
+
+[dependencies]
+axon-diag = { workspace = true }

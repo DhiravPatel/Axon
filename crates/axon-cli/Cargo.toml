@@ -1,0 +1,26 @@
+[package]
+name = "axon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The `axon` command-line interface"
+
+[[bin]]
+name = "axon"
+path = "src/main.rs"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-lexer = { workspace = true }
+axon-ast = { workspace = true }
+axon-parser = { workspace = true }
+axon-types = { workspace = true }
+axon-tyck = { workspace = true }
+axon-runtime = { workspace = true }
+axon-vm = { workspace = true }
+axon-project = { workspace = true }
+axon-wasm = { workspace = true }
+axon-lsp = { workspace = true }
+axon-doc = { workspace = true }
+axon-fmt = { workspace = true }
+serde_json = { workspace = true }

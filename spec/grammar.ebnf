@@ -1,0 +1,130 @@
+(* ===========================================================================
+   Axon — formal grammar (EBNF)
+
+   This file mirrors §43 of the Axon language reference. It is the *normative*
+   source for the parser: when the reference and this file disagree, this
+   file wins, and the divergence should be filed as a reference erratum.
+
+   Conventions:
+     - Newline handling and the bracket-tolerance rule are specified in the
+       prose of §9.2 and are not represented in this grammar.
+     - `ident` is any token recognized by the lexer as an identifier OR (in
+       binding positions) any keyword used as a name; see §9.3 and the
+       commentary in `crates/axon-parser/src/parser.rs::parse_ident`.
+     - Terminals in quotes refer to source-level lexemes; non-terminals are
+       lowercase snake_case.
+   =========================================================================== *)
+
+program        = { use_decl } { item } ;
+
+item           = use_decl | type_decl | schema_decl | trait_decl | impl_block
+               | fn_decl | model_decl | tool_decl | memory_decl | prompt_decl
+               | agent_decl | actor_decl | supervisor_decl | graph_decl
+               | network_decl | orchestrate_decl | policy_decl | mempolicy_decl
+               | config_decl | const_decl | effect_decl | test_decl | eval_decl ;
+
+use_decl       = "use" path [ "." "{" ident { "," ident } "}" ] [ "as" ident ] ;
+
+fn_decl        = [ "pub" ] { attribute } [ "async" ] "fn" ident generics
+                 "(" params ")" [ "->" type ] [ "uses" effect_row ] block ;
+params         = [ param { "," param } ] ;
+param          = ident ":" type [ "=" expr ] | ident ":" "..." type ;
+generics       = [ "<" gen_param { "," gen_param } ">" ] ;
+gen_param      = ident [ ":" bound { "+" bound } ] | "+" ident | "-" ident
+               | effect_var ;
+effect_var     = ident ;                              (* lowercase row variable *)
+
+effect_row     = "{" [ effect { "," effect } ] "}" ;
+effect         = ident [ "." ident ] | effect_var ;
+
+attribute      = "@" ident [ "(" arg_list ")" ]
+               | "#[" ident [ "(" arg_list ")" ] "]" ;
+
+type           = atom_type { type_suffix } | type "|" type ;
+atom_type      = path generics | "[" type "]" | "{" type ":" type "}"
+               | "{" type "}" | "(" [ type { "," type } ] ")"
+               | "&" [ "mut" ] type | "Tainted" "<" type ">"
+               | "(" params ")" "->" type [ "uses" effect_row ] ;
+type_suffix    = "?" | "uses" effect_row | "@" ident [ "(" arg_list ")" ] ;
+
+type_decl      = [ "pub" ] "type" ident generics
+                 ( "{" field { "," field } "}"
+                 | "=" variant { "|" variant }
+                 | "alias" type | "=" type [ "@" ident ] ) ;
+field          = [ doc ] ident ":" type { refinement } [ "=" expr ] ;
+variant        = ident [ "(" [ field_or_type { "," field_or_type } ] ")" ] ;
+
+schema_decl    = [ "pub" ] "schema" ident [ "@version" "(" int ")" ]
+                 "{" { schema_field } { migration } "}" ;
+schema_field   = [ doc ] ident ":" type { refinement } [ "=" expr ] ;
+refinement     = "@" ident [ "(" arg_list ")" ] ;
+migration      = "migrate" "from" "v" int block ;
+
+agent_decl     = "agent" ident "(" params ")" "{" { agent_member } "}" ;
+agent_member   = [ "@durable" ] "state" ident ":" type [ "=" expr ]
+               | "model" ":" expr | "memory" ":" expr
+               | "policy" ":" ident | "mempolicy" ":" ident
+               | "context" ":" expr | "budget" ":" expr
+               | "on" ident "(" params ")" [ "->" type ]
+                     [ "uses" effect_row ] block
+               | "on" ( "start" | "stop" | "error" ) "(" params ")"
+                     [ "->" type ] block
+               | fn_decl ;
+actor_decl     = "actor" ident "(" params ")" "{" { agent_member } "}" ;
+
+supervisor_decl= "supervisor" ident "{" { sup_setting | child_decl
+                                          | on_handler } "}" ;
+child_decl     = "child" ident "=" call [ "@restart" "(" ident ")" ] ;
+
+graph_decl     = "graph" ident "(" params ")" "->" type
+                 "{" { "node" ident ":" expr } { "edge" edge }
+                 done_clause "}" ;
+network_decl   = "network" ident "{" "agents" "{" field { "," field } "}"
+                 "topology" "{" { edge } "}" { agent_member } "}" ;
+orchestrate_decl = "orchestrate" ident "(" params ")" "->" type block ;
+policy_decl    = "policy" ident "{" { policy_rule } "}" ;
+mempolicy_decl = "mempolicy" ident "{" { mempolicy_rule } "}" ;
+
+model_decl     = "model" ident "=" call [ "{" { setting } "}" ] ;
+tool_decl      = [ doc ] "tool" ident "(" params ")" "->" type
+                 [ "uses" effect_row ] { attribute }
+                 ( block | "extern" string string ) ;
+memory_decl    = "memory" ident "=" call ;
+prompt_decl    = "prompt" ident "(" params ")" "->" type "{" { prompt_slot } "}" ;
+
+expr           = literal | path | call | block | if_expr | match_expr
+               | when_expr | for_expr | while_expr | select_expr
+               | ask_expr | gen_expr | plan_expr | stream_expr
+               | with_expr | lambda | binary | unary | pipeline
+               | "spawn" call | expr "await" | expr "?" | expr "!" ;
+ask_expr       = "ask" expr "{" { prompt_slot } "}" ;
+gen_expr       = ( "generate" | "gen" ) "<" type ">"
+                 "(" expr "," expr [ "," arg_list ] ")" ;
+plan_expr      = "plan" "with" expr "{" { prompt_slot } "}" ;
+stream_expr    = "stream" [ "<" type ">" ] block ;
+with_expr      = "with" ( "budget" "(" arg_list ")"
+                        | "recording" "(" expr ")"
+                        | "scope" "as" ident
+                        | "span" "(" arg_list ")" )
+                 block [ "on_exceeded" lambda ] ;
+prompt_slot    = ( "system" | "system+" | "user" | "memory" | "tools"
+                 | "examples" | "output" | "max_steps" | "budget"
+                 | "stop" | "context" ) ":" expr
+               | string ;                              (* bare string = system *)
+pipeline       = expr "|>" expr ;
+lambda         = "|" [ ident { "," ident } ] "|" expr
+               | "fn" "(" params ")" block ;
+block          = "{" { stmt } [ expr ] "}" ;
+stmt           = let_stmt | var_stmt | expr | "return" [ expr ]
+               | "defer" expr | "break" [ ident ] | "continue" [ ident ]
+               | "yield" expr ;
+let_stmt       = "let" pattern [ ":" type ] "=" expr ;
+var_stmt       = "var" ident [ ":" type ] "=" expr ;
+match_expr     = "match" expr "{" { pattern [ "if" expr ] "=>" expr } "}" ;
+pattern        = literal | ident | "_" | path [ "(" pat_list ")" ]
+               | "{" field_pat { "," field_pat } "}" | "[" pat_list "]"
+               | "(" pat_list ")" | ident "@" pattern | pattern "|" pattern ;
+
+literal        = int | float | decimal | money | duration | date
+               | datetime | time | bool | char | string | raw_string
+               | bytes | prompt_lit | hash_lit | addr_lit | "nil" | "()" ;

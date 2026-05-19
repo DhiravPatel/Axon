@@ -1,0 +1,32 @@
+//! examples/fib.ax — pure-Int subset compilable to WebAssembly.
+//!
+//! Build:
+//!   cargo run -q -p axon-cli -- build examples/fib.ax -o /tmp/fib.wasm
+//!
+//! Run in any WASM runtime that provides `host.print_int`. With wasmtime:
+//!   wasmtime --invoke main /tmp/fib.wasm
+
+fn fib(n: Int) -> Int {
+    if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn fact(n: Int) -> Int {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+
+fn sum_to(n: Int) -> Int {
+    var i = 1
+    var sum = 0
+    while i <= n {
+        sum = sum + i
+        i = i + 1
+    }
+    sum
+}
+
+fn main() -> Int uses { Console } {
+    print_int(fib(15))
+    print_int(fact(10))
+    print_int(sum_to(100))
+    fib(20)
+}

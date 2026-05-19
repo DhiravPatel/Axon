@@ -1,0 +1,26 @@
+//! Tests for the helpers in `math.ax`. Run with `axon test examples/calculator`.
+
+test "add returns the sum" {
+    assert_eq(add(2, 3), 5)
+    assert_eq(add(-1, 1), 0)
+}
+
+test "sub returns the difference" {
+    assert_eq(sub(10, 3), 7)
+}
+
+test "fact handles base and recursive cases" {
+    assert_eq(fact(0), 1)
+    assert_eq(fact(1), 1)
+    assert_eq(fact(5), 120)
+}
+
+test "is_even agrees with arithmetic" {
+    assert(is_even(0))
+    assert(is_even(4))
+    assert(!is_even(3))
+}
+
+test "intentional failure to show the runner reports them" {
+    assert_eq(add(1, 1), 3, "1 + 1 should be 2, not 3")
+}

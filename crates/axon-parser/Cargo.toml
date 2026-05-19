@@ -1,0 +1,11 @@
+[package]
+name = "axon-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parser for the Axon language"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-lexer = { workspace = true }
+axon-ast = { workspace = true }

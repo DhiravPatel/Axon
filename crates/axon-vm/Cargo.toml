@@ -1,0 +1,13 @@
+[package]
+name = "axon-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AxVM bytecode compiler and stack-based interpreter for Axon"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-ast = { workspace = true }
+
+[dev-dependencies]
+axon-parser = { workspace = true }

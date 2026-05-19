@@ -1,0 +1,14 @@
+[package]
+name = "axon-tyck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Type checker for the Axon programming language"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-ast = { workspace = true }
+axon-types = { workspace = true }
+
+[dev-dependencies]
+axon-parser = { workspace = true }

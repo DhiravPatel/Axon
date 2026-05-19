@@ -1,0 +1,40 @@
+//! examples/researcher.ax — Stage 6.5 end-to-end demo.
+//!
+//! Demonstrates: agents, message handlers, effect rows, model declarations,
+//! memory recall, **tools the model invokes mid-response**, capability
+//! attenuation per tool, `spawn`.
+//!
+//! Run with the deterministic mock model (no API key needed):
+//!   cargo run -q -p axon-cli -- run examples/researcher.ax
+//!
+//! Swap `mock_model("fixed", ...)` for `anthropic("claude-opus-4-7")` and
+//! set `ANTHROPIC_API_KEY` to talk to the real model. The tool below is
+//! callable by the model whether the provider is mock or real.
+
+model brain = mock_model("fixed", "Per the search tool, the 2025 amendments tightened transparency requirements.")
+memory kb = local_memory()
+
+tool search(q: String) -> String uses { Net } {
+    "[stub-search] no live web index in this stage; received query: {q}"
+}
+
+agent Researcher(m: Model, mem: Memory) {
+    on inquiry(question: String) -> String uses { LLM, Net, Memory } {
+        let ctx = self.mem.recall(question)
+        ask self.m {
+            system: "Cite every claim. Use the search tool when you don't know."
+            memory: ctx
+            user:   question
+            tools:  [search]
+        }
+    }
+}
+
+fn main() uses { Spawn, LLM, Net, Memory, Console } {
+    kb.store("the EU AI Act was originally adopted in 2024")
+    kb.store("amendments in 2025 tightened transparency requirements")
+
+    let r = spawn Researcher(m = brain, mem = kb)
+    let answer = r.inquiry("What changed in the EU AI Act in 2025?")
+    print(answer)
+}

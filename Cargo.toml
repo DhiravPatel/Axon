@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "crates/axon-diag",
+    "crates/axon-lexer",
+    "crates/axon-ast",
+    "crates/axon-parser",
+    "crates/axon-types",
+    "crates/axon-tyck",
+    "crates/axon-runtime",
+    "crates/axon-vm",
+    "crates/axon-models",
+    "crates/axon-project",
+    "crates/axon-wasm",
+    "crates/axon-lsp",
+    "crates/axon-doc",
+    "crates/axon-fmt",
+    "crates/axon-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/axon-lang/axon"
+description = "Axon: the programming language for autonomous AI agents"
+
+[workspace.dependencies]
+axon-diag   = { path = "crates/axon-diag" }
+axon-lexer  = { path = "crates/axon-lexer" }
+axon-ast    = { path = "crates/axon-ast" }
+axon-parser = { path = "crates/axon-parser" }
+axon-types  = { path = "crates/axon-types" }
+axon-tyck   = { path = "crates/axon-tyck" }
+axon-runtime = { path = "crates/axon-runtime" }
+axon-vm      = { path = "crates/axon-vm" }
+axon-models  = { path = "crates/axon-models" }
+axon-project = { path = "crates/axon-project" }
+axon-wasm    = { path = "crates/axon-wasm" }
+axon-lsp     = { path = "crates/axon-lsp" }
+axon-doc     = { path = "crates/axon-doc" }
+axon-fmt     = { path = "crates/axon-fmt" }
+
+ureq         = { version = "2", default-features = false, features = ["tls", "json"] }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+lsp-server   = "0.7"
+lsp-types    = "0.95"
+crossbeam-channel = "0.5"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "0.8"
+wasm-encoder = "0.219"
+wasmparser   = "0.219"
+wasmi        = "0.40"
+
+unicode-normalization = "0.1"
+unicode-ident         = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,10 @@
+[package]
+name = "axon-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical formatter for Axon source"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-lexer = { workspace = true }

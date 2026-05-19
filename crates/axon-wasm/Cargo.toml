@@ -1,0 +1,16 @@
+[package]
+name = "axon-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AST → WebAssembly codegen for the integer subset of Axon"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-ast = { workspace = true }
+wasm-encoder = { workspace = true }
+
+[dev-dependencies]
+axon-parser = { workspace = true }
+wasmparser = { workspace = true }
+wasmi = { workspace = true }

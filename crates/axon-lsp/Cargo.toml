@@ -1,0 +1,18 @@
+[package]
+name = "axon-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Language Server Protocol implementation for Axon"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-ast = { workspace = true }
+axon-parser = { workspace = true }
+axon-tyck = { workspace = true }
+axon-types = { workspace = true }
+lsp-server = { workspace = true }
+lsp-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }

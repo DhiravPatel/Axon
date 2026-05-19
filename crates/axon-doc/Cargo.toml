@@ -1,0 +1,13 @@
+[package]
+name = "axon-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static documentation generator for Axon projects"
+
+[dependencies]
+axon-ast = { workspace = true }
+axon-diag = { workspace = true }
+axon-lexer = { workspace = true }
+axon-project = { workspace = true }
+pulldown-cmark = { workspace = true }

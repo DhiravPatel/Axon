@@ -1,0 +1,13 @@
+[package]
+name = "axon-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Manifest parsing and multi-file project loading for Axon"
+
+[dependencies]
+axon-diag = { workspace = true }
+axon-ast = { workspace = true }
+axon-parser = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

@@ -1,0 +1,11 @@
+//! Tiny calculator helpers — pure, no effects required.
+
+pub fn add(a: Int, b: Int) -> Int { a + b }
+
+pub fn sub(a: Int, b: Int) -> Int { a - b }
+
+pub fn fact(n: Int) -> Int {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+
+pub fn is_even(n: Int) -> Bool { n % 2 == 0 }

@@ -1,0 +1,8 @@
+//! Project entry point. Calls into helpers from `math.ax`.
+
+use math.{add, fact}
+
+fn main() uses { Console } {
+    print("2 + 3 =", add(2, 3))
+    print("fact(6) =", fact(6))
+}

@@ -1,0 +1,11 @@
+[package]
+name = "axon-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lexer / tokenizer for the Axon language"
+
+[dependencies]
+axon-diag = { workspace = true }
+unicode-ident = { workspace = true }
+unicode-normalization = { workspace = true }
