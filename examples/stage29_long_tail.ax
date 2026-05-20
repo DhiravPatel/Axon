@@ -1,0 +1,67 @@
+//! examples/stage29_long_tail.ax — Stage 29 demo.
+//!
+//! Closes the four sub-features the final audit surfaced:
+//!
+//!   §19   — `Result<T, E>` type annotation + `try_recover` for the
+//!           `try { ... } recover |e| { ... }` pattern.
+//!   §28   — `Stream<T>` runtime: `stream_new` / `send` / `take` /
+//!           `close` / `is_done` / `for_await`.
+//!   §29.7 — `@restart` variant validation: `Permanent | Transient | Temporary`
+//!           plus the decision table the supervisor follows.
+//!   §31.2 — `axon prof --cost <ledger.json>` (CLI; see
+//!           `crates/axon-cli/tests/stage29_long_tail.rs` for the
+//!           full ledger flow).
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage29_long_tail.ax
+
+fn divide(a: Int, b: Int) -> Result<Int, String> {
+    if b == 0 { result_err("divide by zero") } else { result_ok(a / b) }
+}
+
+fn fragile() -> dyn { panic("boom") }
+fn fallback(msg: dyn) -> Int { 99 }
+
+fn collect_value(v: dyn) -> dyn uses { Console } { print(v) }
+
+fn main() uses { Console } {
+    print("---- §19 Result + try_recover ----")
+    let r1 = divide(10, 2)
+    print("10/2 ok? ")
+    print(bool(result_is_ok(r1)))
+    print("value: ")
+    print(result_value(r1))
+    let r2 = divide(7, 0)
+    print("7/0 err? ")
+    print(bool(result_is_err(r2)))
+    print("reason: " + result_error(r2))
+    let recovered = try_recover(fragile, fallback)
+    print("recovered: ")
+    print(recovered)
+
+    print("---- §28 Stream<T> + for_await ----")
+    stream_new("events", 8, "block")
+    stream_send("events", "evt-1")
+    stream_send("events", "evt-2")
+    stream_send("events", "evt-3")
+    stream_close("events")
+    let count = for_await("events", collect_value)
+    print("drained: ")
+    print(count)
+    print("stats: ")
+    print(stream_stats("events"))
+
+    print("---- §29.7 @restart variants ----")
+    print(restart_policy_parse("Permanent"))
+    print(restart_policy_parse("Transient"))
+    print(restart_policy_parse("Temporary"))
+    print("Permanent on normal -> restart? ")
+    print(bool(restart_policy_should_restart("Permanent", "normal")))
+    print("Transient on normal -> restart? ")
+    print(bool(restart_policy_should_restart("Transient", "normal")))
+    print("Temporary on abnormal -> restart? ")
+    print(bool(restart_policy_should_restart("Temporary", "abnormal")))
+
+    print("---- §31.2 axon prof --cost ----")
+    print("(run the CLI to render: see tests/stage29_long_tail.rs)")
+}

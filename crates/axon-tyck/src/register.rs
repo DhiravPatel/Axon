@@ -156,6 +156,33 @@ impl<'a> Checker<'a> {
             "mcp_namespaces", "mcp_deferred_namespaces",
             // ---- Stage 26 §7.1 features ----
             "features_active",
+            // ---- Stage 27 §25.6 approval ----
+            "approval_open", "approval_approve", "approval_deny", "approval_get",
+            "approval_pending_count", "approval_sweep_timeouts", "approval_next_id",
+            "approval_purge_terminal",
+            // ---- Stage 27 §24.3 prompt @version ----
+            "prompt_version_register", "prompt_version_set_default",
+            "prompt_version_pick", "prompt_version_versions_for",
+            "prompt_version_prompts",
+            // ---- Stage 28 §29.5 consensus + spawn_pool ----
+            "flow_consensus", "flow_spawn_pool",
+            // ---- Stage 28 §29.9 human pseudo-agent ----
+            "human_request", "human_resolve", "human_cancel",
+            // ---- Stage 28 §30 policy block ----
+            "policy_block_new", "policy_block_allow", "policy_block_deny",
+            "policy_block_check", "policy_block_charge", "policy_block_add_budget",
+            "policy_block_add_rate", "policy_block_audit_summary",
+            // ---- Stage 28 §35.2 FFI bridges ----
+            "ffi_bridge_call",
+            // ---- Stage 28 §35.3 protocol adapters ----
+            "serve_protocol_route", "serve_protocol_wrap", "serve_render_grpc_proto",
+            // ---- Stage 29 §19 try_recover ----
+            "try_recover",
+            // ---- Stage 29 §28 streams ----
+            "stream_new", "stream_send", "stream_take", "stream_close",
+            "stream_is_done", "stream_stats", "for_await",
+            // ---- Stage 29 §29.7 @restart variants ----
+            "restart_policy_parse", "restart_policy_should_restart",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),

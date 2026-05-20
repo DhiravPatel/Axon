@@ -36,6 +36,9 @@ pub fn install(interp: &Interpreter) {
     install_stage24(interp);
     install_stage25(interp);
     install_stage26(interp);
+    install_stage27(interp);
+    install_stage28(interp);
+    install_stage29(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -5210,5 +5213,1116 @@ fn s26_features_active(_args: &[Value]) -> Result<Value, String> {
     Ok(list_value(
         active.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
     ))
+}
+
+// ===========================================================================
+// Stage 27 — @approval tool attribute (§25.6), prompt @version (§24.3).
+// ===========================================================================
+
+use axon_guard::approval as appr;
+use axon_runtime::prompt_version as pv;
+
+thread_local! {
+    static APPROVAL_REG: RefCell<appr::ApprovalRegistry> =
+        RefCell::new(appr::ApprovalRegistry::new());
+    static PROMPT_VERSIONS: RefCell<pv::PromptVersionRegistry> =
+        RefCell::new(pv::PromptVersionRegistry::new());
+}
+
+fn install_stage27(interp: &Interpreter) {
+    // ---- §25.6 approval ----
+    interp.register_native(
+        "approval_open",
+        n("approval_open", 6, Some(6), s27_approval_open),
+    );
+    interp.register_native(
+        "approval_approve",
+        n("approval_approve", 2, Some(2), s27_approval_approve),
+    );
+    interp.register_native(
+        "approval_deny",
+        n("approval_deny", 3, Some(3), s27_approval_deny),
+    );
+    interp.register_native(
+        "approval_get",
+        n("approval_get", 1, Some(1), s27_approval_get),
+    );
+    interp.register_native(
+        "approval_pending_count",
+        n(
+            "approval_pending_count",
+            0,
+            Some(0),
+            s27_approval_pending_count,
+        ),
+    );
+    interp.register_native(
+        "approval_sweep_timeouts",
+        n(
+            "approval_sweep_timeouts",
+            2,
+            Some(2),
+            s27_approval_sweep,
+        ),
+    );
+    interp.register_native(
+        "approval_next_id",
+        n("approval_next_id", 0, Some(0), s27_approval_next_id),
+    );
+    interp.register_native(
+        "approval_purge_terminal",
+        n(
+            "approval_purge_terminal",
+            0,
+            Some(0),
+            s27_approval_purge,
+        ),
+    );
+
+    // ---- §24.3 prompt @version ----
+    interp.register_native(
+        "prompt_version_register",
+        n(
+            "prompt_version_register",
+            4,
+            Some(4),
+            s27_pv_register,
+        ),
+    );
+    interp.register_native(
+        "prompt_version_set_default",
+        n(
+            "prompt_version_set_default",
+            2,
+            Some(2),
+            s27_pv_set_default,
+        ),
+    );
+    interp.register_native(
+        "prompt_version_pick",
+        n(
+            "prompt_version_pick",
+            2,
+            Some(2),
+            s27_pv_pick,
+        ),
+    );
+    interp.register_native(
+        "prompt_version_versions_for",
+        n(
+            "prompt_version_versions_for",
+            1,
+            Some(1),
+            s27_pv_versions_for,
+        ),
+    );
+    interp.register_native(
+        "prompt_version_prompts",
+        n(
+            "prompt_version_prompts",
+            0,
+            Some(0),
+            s27_pv_prompts,
+        ),
+    );
+}
+
+// --------- §25.6 approval ---------
+
+fn parse_on_timeout(s: &str) -> Result<appr::OnTimeout, String> {
+    match s {
+        "deny" => Ok(appr::OnTimeout::Deny),
+        "allow" => Ok(appr::OnTimeout::Allow),
+        "escalate" => Ok(appr::OnTimeout::Escalate),
+        other => Err(format!(
+            "approval_open: on_timeout must be deny|allow|escalate, got `{other}`"
+        )),
+    }
+}
+
+fn s27_approval_open(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "approval_open")?;
+    let tool = s_arg(args, 1, "approval_open")?;
+    let args_json = s_arg(args, 2, "approval_open")?;
+    let by = s_arg(args, 3, "approval_open")?;
+    let timeout_secs = i_arg(args, 4, "approval_open")?;
+    let on_to = s_arg(args, 5, "approval_open")?;
+    let on_to = parse_on_timeout(on_to.as_str())?;
+    APPROVAL_REG.with(|c| {
+        c.borrow_mut().open(
+            id.as_str().to_string(),
+            tool.as_str().to_string(),
+            args_json.as_str().to_string(),
+            by.as_str().to_string(),
+            timeout_secs,
+            on_to,
+            now_ns(),
+        )
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(Value::String(id))
+}
+
+fn s27_approval_approve(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "approval_approve")?;
+    let actor = s_arg(args, 1, "approval_approve")?;
+    APPROVAL_REG.with(|c| c.borrow_mut().approve(id.as_str(), actor.as_str()))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s27_approval_deny(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "approval_deny")?;
+    let actor = s_arg(args, 1, "approval_deny")?;
+    let reason = s_arg(args, 2, "approval_deny")?;
+    APPROVAL_REG.with(|c| {
+        c.borrow_mut()
+            .deny(id.as_str(), actor.as_str(), reason.as_str())
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn approval_state_name(state: appr::ApprovalState) -> &'static str {
+    match state {
+        appr::ApprovalState::Pending => "pending",
+        appr::ApprovalState::Approved => "approved",
+        appr::ApprovalState::Denied => "denied",
+        appr::ApprovalState::TimedOut => "timed_out",
+    }
+}
+
+fn approval_request_to_value(r: &appr::ApprovalRequest) -> Value {
+    let on_to = match r.on_timeout {
+        appr::OnTimeout::Deny => "deny",
+        appr::OnTimeout::Allow => "allow",
+        appr::OnTimeout::Escalate => "escalate",
+    };
+    record_to_vec(vec![
+        ("id", Value::String(Rc::new(r.id.clone()))),
+        ("tool", Value::String(Rc::new(r.tool.clone()))),
+        ("args_json", Value::String(Rc::new(r.args_json.clone()))),
+        ("by", Value::String(Rc::new(r.by.clone()))),
+        ("timeout_secs", Value::Int(r.timeout_secs)),
+        ("on_timeout", Value::String(Rc::new(on_to.to_string()))),
+        (
+            "state",
+            Value::String(Rc::new(approval_state_name(r.state).to_string())),
+        ),
+        ("actor", Value::String(Rc::new(r.actor.clone()))),
+        ("reason", Value::String(Rc::new(r.reason.clone()))),
+        ("escalated_to", Value::String(Rc::new(r.escalated_to.clone()))),
+        ("requested_at_ns", Value::Int(r.requested_at_ns)),
+    ])
+}
+
+fn s27_approval_get(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "approval_get")?;
+    APPROVAL_REG.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(approval_request_to_value)
+            .ok_or_else(|| format!("approval_get: unknown approval `{}`", id.as_str()))
+    })
+}
+
+fn s27_approval_pending_count(_args: &[Value]) -> Result<Value, String> {
+    let n = APPROVAL_REG.with(|c| c.borrow().pending_count());
+    Ok(Value::Int(n as i64))
+}
+
+fn s27_approval_sweep(args: &[Value]) -> Result<Value, String> {
+    let now = i_arg(args, 0, "approval_sweep_timeouts")?;
+    let escalate_to = s_arg(args, 1, "approval_sweep_timeouts")?;
+    let target = escalate_to.as_str().to_string();
+    let fired = APPROVAL_REG.with(|c| {
+        c.borrow_mut()
+            .sweep_timeouts(now, |_r| target.clone())
+    });
+    Ok(list_value(
+        fired.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+fn s27_approval_next_id(_args: &[Value]) -> Result<Value, String> {
+    let id = APPROVAL_REG.with(|c| c.borrow_mut().next_id());
+    Ok(Value::String(Rc::new(id)))
+}
+
+fn s27_approval_purge(_args: &[Value]) -> Result<Value, String> {
+    let n = APPROVAL_REG.with(|c| c.borrow_mut().purge_terminal());
+    Ok(Value::Int(n as i64))
+}
+
+// --------- §24.3 prompt @version ---------
+
+fn s27_pv_register(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "prompt_version_register")?;
+    let version = s_arg(args, 1, "prompt_version_register")?;
+    let body = s_arg(args, 2, "prompt_version_register")?;
+    let notes = s_arg(args, 3, "prompt_version_register")?;
+    PROMPT_VERSIONS.with(|c| {
+        c.borrow_mut().register(
+            prompt.as_str(),
+            version.as_str(),
+            body.as_str(),
+            notes.as_str(),
+            now_ns(),
+        )
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s27_pv_set_default(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "prompt_version_set_default")?;
+    let version = s_arg(args, 1, "prompt_version_set_default")?;
+    PROMPT_VERSIONS.with(|c| {
+        c.borrow_mut().set_default(prompt.as_str(), version.as_str())
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn prompt_version_to_value(v: &pv::PromptVersion) -> Value {
+    record_to_vec(vec![
+        ("prompt_name", Value::String(Rc::new(v.prompt_name.clone()))),
+        ("version", Value::String(Rc::new(v.version.clone()))),
+        ("body", Value::String(Rc::new(v.body.clone()))),
+        ("notes", Value::String(Rc::new(v.notes.clone()))),
+        ("registered_at_ns", Value::Int(v.registered_at_ns)),
+    ])
+}
+
+fn s27_pv_pick(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "prompt_version_pick")?;
+    let version_arg = s_arg(args, 1, "prompt_version_pick")?;
+    let version_opt = if version_arg.is_empty() {
+        None
+    } else {
+        Some(version_arg.as_str())
+    };
+    PROMPT_VERSIONS.with(|c| {
+        c.borrow()
+            .pick(prompt.as_str(), version_opt)
+            .map(prompt_version_to_value)
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn s27_pv_versions_for(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "prompt_version_versions_for")?;
+    let items: Vec<Value> = PROMPT_VERSIONS.with(|c| {
+        c.borrow()
+            .versions_for(prompt.as_str())
+            .into_iter()
+            .map(prompt_version_to_value)
+            .collect()
+    });
+    Ok(list_value(items))
+}
+
+fn s27_pv_prompts(_args: &[Value]) -> Result<Value, String> {
+    let names = PROMPT_VERSIONS.with(|c| c.borrow().prompts());
+    Ok(list_value(
+        names.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+// ===========================================================================
+// Stage 28 — consensus (§29.5), human pseudo-agent (§29.9), policy block
+// (§30), FFI bridges (§35.2), protocol adapters (§35.3).
+// ===========================================================================
+
+use axon_deploy::protocols as proto;
+use axon_ffi::bridges as ffi_bridges;
+use axon_flow::consensus as cons;
+use axon_guard::human as gh_human;
+use axon_guard::policy_block as pb;
+
+thread_local! {
+    static POLICY_BLOCKS: RefCell<std::collections::HashMap<String, pb::PolicyBlock>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn install_stage28(interp: &Interpreter) {
+    // ---- §29.5 consensus ----
+    interp.register_native(
+        "flow_consensus",
+        n("flow_consensus", 2, Some(2), s28_flow_consensus),
+    );
+    interp.register_native_ext(
+        "flow_spawn_pool",
+        ext("flow_spawn_pool", 2, Some(2), s28_spawn_pool),
+    );
+
+    // ---- §29.9 human pseudo-agent ----
+    interp.register_native(
+        "human_request",
+        n("human_request", 4, Some(4), s28_human_request),
+    );
+    interp.register_native(
+        "human_resolve",
+        n("human_resolve", 1, Some(1), s28_human_resolve),
+    );
+    interp.register_native(
+        "human_cancel",
+        n("human_cancel", 1, Some(1), s28_human_cancel),
+    );
+
+    // ---- §30 policy block ----
+    interp.register_native(
+        "policy_block_new",
+        n("policy_block_new", 2, Some(2), s28_pb_new),
+    );
+    interp.register_native(
+        "policy_block_allow",
+        n("policy_block_allow", 4, Some(4), s28_pb_allow),
+    );
+    interp.register_native(
+        "policy_block_deny",
+        n("policy_block_deny", 3, Some(3), s28_pb_deny),
+    );
+    interp.register_native(
+        "policy_block_check",
+        n("policy_block_check", 4, Some(4), s28_pb_check),
+    );
+    interp.register_native(
+        "policy_block_charge",
+        n("policy_block_charge", 4, Some(4), s28_pb_charge),
+    );
+    interp.register_native(
+        "policy_block_add_budget",
+        n("policy_block_add_budget", 4, Some(4), s28_pb_add_budget),
+    );
+    interp.register_native(
+        "policy_block_add_rate",
+        n("policy_block_add_rate", 4, Some(4), s28_pb_add_rate),
+    );
+    interp.register_native(
+        "policy_block_audit_summary",
+        n("policy_block_audit_summary", 1, Some(1), s28_pb_audit_summary),
+    );
+
+    // ---- §35.2 FFI bridges ----
+    interp.register_native(
+        "ffi_bridge_call",
+        n("ffi_bridge_call", 5, Some(5), s28_bridge_call),
+    );
+
+    // ---- §35.3 protocol adapters ----
+    interp.register_native(
+        "serve_protocol_route",
+        n("serve_protocol_route", 5, Some(5), s28_protocol_route),
+    );
+    interp.register_native(
+        "serve_protocol_wrap",
+        n("serve_protocol_wrap", 3, Some(3), s28_protocol_wrap),
+    );
+    interp.register_native(
+        "serve_render_grpc_proto",
+        n(
+            "serve_render_grpc_proto",
+            2,
+            Some(2),
+            s28_render_grpc_proto,
+        ),
+    );
+}
+
+// --------- §29.5 consensus ---------
+
+fn s28_flow_consensus(args: &[Value]) -> Result<Value, String> {
+    // Args: (votes_list, config_record)
+    let votes_v = match &args[0] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "flow_consensus: votes must be a List, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut votes: Vec<cons::Vote> = Vec::with_capacity(votes_v.len());
+    for (i, v) in votes_v.into_iter().enumerate() {
+        let j = value_to_json(&v);
+        let parsed: cons::Vote = serde_json::from_value(j)
+            .map_err(|e| format!("flow_consensus: votes[{i}]: {e}"))?;
+        votes.push(parsed);
+    }
+    let cfg_v = value_to_json(&args[1]);
+    let cfg: cons::ConsensusConfig =
+        serde_json::from_value(cfg_v).map_err(|e| format!("flow_consensus: config: {e}"))?;
+    let d = cons::consensus(&votes, &cfg);
+    let j = serde_json::to_value(&d).map_err(|e| format!("flow_consensus: {e}"))?;
+    Ok(json_to_value(&j))
+}
+
+/// `flow_spawn_pool(constructor, size)` calls `constructor()` N times
+/// and returns a List of the results. The synchronous interpreter
+/// today runs them in sequence; a future async scheduler can
+/// parallelize without changing call sites.
+fn s28_spawn_pool(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let constructor = args[0].clone();
+    if !is_callable(&constructor) {
+        return Err("flow_spawn_pool: constructor must be callable".into());
+    }
+    let size = i_arg(args, 1, "flow_spawn_pool")?.max(0) as usize;
+    if size == 0 {
+        return Err("flow_spawn_pool: size must be > 0".into());
+    }
+    if size > 1024 {
+        return Err(format!(
+            "flow_spawn_pool: size {size} > 1024 — refusing to spawn that many"
+        ));
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(size);
+    for i in 0..size {
+        let v = interp
+            .call_value(&constructor, &[Value::Int(i as i64)], span)
+            .map_err(|e| format!("flow_spawn_pool[{i}]: {}", eval_signal_msg(&e)))?;
+        out.push(v);
+    }
+    Ok(list_value(out))
+}
+
+// --------- §29.9 human pseudo-agent ---------
+
+fn parse_on_timeout_28(s: &str) -> Result<axon_guard::approval::OnTimeout, String> {
+    match s {
+        "deny" => Ok(axon_guard::approval::OnTimeout::Deny),
+        "allow" => Ok(axon_guard::approval::OnTimeout::Allow),
+        "escalate" => Ok(axon_guard::approval::OnTimeout::Escalate),
+        other => Err(format!(
+            "human_request: on_timeout must be deny|allow|escalate, got `{other}`"
+        )),
+    }
+}
+
+fn s28_human_request(args: &[Value]) -> Result<Value, String> {
+    let channel = s_arg(args, 0, "human_request")?;
+    let prompt = s_arg(args, 1, "human_request")?;
+    let timeout = i_arg(args, 2, "human_request")?;
+    let on_to = s_arg(args, 3, "human_request")?;
+    let on_to = parse_on_timeout_28(on_to.as_str())?;
+    let id = APPROVAL_REG.with(|c| {
+        gh_human::open_review(
+            &mut c.borrow_mut(),
+            channel.as_str(),
+            prompt.as_str(),
+            timeout,
+            on_to,
+            now_ns(),
+        )
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(Value::String(Rc::new(id)))
+}
+
+fn s28_human_resolve(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "human_resolve")?;
+    let r = APPROVAL_REG.with(|c| {
+        gh_human::resolve(&mut c.borrow_mut(), id.as_str(), now_ns())
+    });
+    match r {
+        Some(r) => Ok(approval_request_to_value(&r)),
+        None => Err(format!("human_resolve: unknown id `{}`", id.as_str())),
+    }
+}
+
+fn s28_human_cancel(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "human_cancel")?;
+    let ok = APPROVAL_REG.with(|c| gh_human::cancel(&mut c.borrow_mut(), id.as_str()));
+    Ok(Value::Bool(ok))
+}
+
+// --------- §30 policy block ---------
+
+fn parse_effect_kind(s: &str) -> Result<pb::EffectKind, String> {
+    pb::EffectKind::from_str(s)
+        .ok_or_else(|| format!("policy_block: unknown effect kind `{s}` (expected tool|net|fs|llm|memory)"))
+}
+
+fn s28_pb_new(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "policy_block_new")?;
+    let default = s_arg(args, 1, "policy_block_new")?;
+    let mut block = pb::PolicyBlock::new(name.as_str());
+    block.default_action = match default.as_str() {
+        "allow" => pb::ActionKind::Allow,
+        "deny" => pb::ActionKind::Deny,
+        other => {
+            return Err(format!(
+                "policy_block_new: default must be allow|deny, got `{other}`"
+            ));
+        }
+    };
+    POLICY_BLOCKS.with(|c| c.borrow_mut().insert(name.as_str().to_string(), block));
+    Ok(Value::String(name))
+}
+
+fn s28_pb_allow(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_allow")?;
+    let kind = s_arg(args, 1, "policy_block_allow")?;
+    let pattern = s_arg(args, 2, "policy_block_allow")?;
+    let when = s_arg(args, 3, "policy_block_allow")?;
+    let kind = parse_effect_kind(kind.as_str())?;
+    POLICY_BLOCKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(block_name.as_str())
+            .ok_or_else(|| format!("policy_block_allow: no policy `{}`", block_name.as_str()))?;
+        b.allow(kind, pattern.as_str(), when.as_str());
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s28_pb_deny(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_deny")?;
+    let kind = s_arg(args, 1, "policy_block_deny")?;
+    let pattern = s_arg(args, 2, "policy_block_deny")?;
+    let kind = parse_effect_kind(kind.as_str())?;
+    POLICY_BLOCKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(block_name.as_str())
+            .ok_or_else(|| format!("policy_block_deny: no policy `{}`", block_name.as_str()))?;
+        b.deny(kind, pattern.as_str());
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s28_pb_check(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_check")?;
+    let kind = s_arg(args, 1, "policy_block_check")?;
+    let target = s_arg(args, 2, "policy_block_check")?;
+    let when_holds = b_arg(args, 3, "policy_block_check")?;
+    let kind = parse_effect_kind(kind.as_str())?;
+    let decision = POLICY_BLOCKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(block_name.as_str())
+            .ok_or_else(|| format!("policy_block_check: no policy `{}`", block_name.as_str()))?;
+        Ok::<_, String>(b.check_effect(kind, target.as_str(), when_holds, now_ns()))
+    })?;
+    Ok(record_to_vec(vec![
+        ("allow", Value::Bool(decision.allow)),
+        (
+            "rule_index",
+            match decision.rule_index {
+                Some(i) => Value::Int(i as i64),
+                None => Value::Int(-1),
+            },
+        ),
+        ("label", Value::String(Rc::new(decision.label))),
+        (
+            "budget_remaining_usd",
+            match decision.budget_remaining_usd {
+                Some(f) => Value::Float(f),
+                None => Value::Float(-1.0),
+            },
+        ),
+        (
+            "budget_remaining_tokens",
+            match decision.budget_remaining_tokens {
+                Some(t) => Value::Int(t as i64),
+                None => Value::Int(-1),
+            },
+        ),
+    ]))
+}
+
+fn s28_pb_charge(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_charge")?;
+    let scope = s_arg(args, 1, "policy_block_charge")?;
+    let usd_cents = i_arg(args, 2, "policy_block_charge")?;
+    let tokens = i_arg(args, 3, "policy_block_charge")?.max(0) as u64;
+    let usd = usd_cents as f64 / 100.0;
+    POLICY_BLOCKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(block_name.as_str())
+            .ok_or_else(|| format!("policy_block_charge: no policy `{}`", block_name.as_str()))?;
+        b.charge(scope.as_str(), usd, tokens);
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s28_pb_add_budget(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_add_budget")?;
+    let scope = s_arg(args, 1, "policy_block_add_budget")?;
+    let max_usd_cents = i_arg(args, 2, "policy_block_add_budget")?;
+    let max_tokens = i_arg(args, 3, "policy_block_add_budget")?;
+    POLICY_BLOCKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(block_name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "policy_block_add_budget: no policy `{}`",
+                    block_name.as_str()
+                )
+            })?;
+        b.add_budget(pb::BudgetClause {
+            scope: scope.as_str().to_string(),
+            max_usd: if max_usd_cents < 0 {
+                None
+            } else {
+                Some(max_usd_cents as f64 / 100.0)
+            },
+            max_tokens: if max_tokens < 0 {
+                None
+            } else {
+                Some(max_tokens as u64)
+            },
+            max_wall_secs: None,
+            window_secs: None,
+            spent_usd: 0.0,
+            spent_tokens: 0,
+        });
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s28_pb_add_rate(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_add_rate")?;
+    let scope = s_arg(args, 1, "policy_block_add_rate")?;
+    let max_calls = i_arg(args, 2, "policy_block_add_rate")?.max(0) as u32;
+    let window_secs = i_arg(args, 3, "policy_block_add_rate")?.max(0) as u64;
+    POLICY_BLOCKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(block_name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "policy_block_add_rate: no policy `{}`",
+                    block_name.as_str()
+                )
+            })?;
+        b.add_rate(pb::RateClause {
+            scope: scope.as_str().to_string(),
+            max_calls,
+            window_secs,
+            recent_call_ns: Vec::new(),
+        });
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s28_pb_audit_summary(args: &[Value]) -> Result<Value, String> {
+    let block_name = s_arg(args, 0, "policy_block_audit_summary")?;
+    let (allow, deny) = POLICY_BLOCKS.with(|c| {
+        c.borrow()
+            .get(block_name.as_str())
+            .map(|b| b.audit_summary())
+            .unwrap_or((0, 0))
+    });
+    Ok(record_to_vec(vec![
+        ("allow", Value::Int(allow as i64)),
+        ("deny", Value::Int(deny as i64)),
+    ]))
+}
+
+// --------- §35.2 FFI bridges ---------
+
+fn s28_bridge_call(args: &[Value]) -> Result<Value, String> {
+    let kind_s = s_arg(args, 0, "ffi_bridge_call")?;
+    let target = s_arg(args, 1, "ffi_bridge_call")?;
+    let entrypoint = s_arg(args, 2, "ffi_bridge_call")?;
+    let args_json = s_arg(args, 3, "ffi_bridge_call")?;
+    let timeout_ms = i_arg(args, 4, "ffi_bridge_call")?.max(0) as u64;
+    let kind = ffi_bridges::BridgeKind::from_str(kind_s.as_str()).ok_or_else(|| {
+        format!(
+            "ffi_bridge_call: kind must be python|node|wasm|grpc, got `{}`",
+            kind_s.as_str()
+        )
+    })?;
+    let spec = ffi_bridges::BridgeSpec {
+        kind,
+        target: target.as_str().to_string(),
+        entrypoint: entrypoint.as_str().to_string(),
+        timeout_ms,
+        launcher_override: String::new(),
+    };
+    match ffi_bridges::call_bridge(&spec, args_json.as_str()) {
+        Ok(out) => Ok(record_to_vec(vec![
+            ("ok", Value::Bool(true)),
+            (
+                "value_json",
+                Value::String(Rc::new(out.value.to_string())),
+            ),
+            ("error", Value::String(Rc::new(String::new()))),
+        ])),
+        Err(e) => Ok(record_to_vec(vec![
+            ("ok", Value::Bool(false)),
+            ("value_json", Value::String(Rc::new(String::new()))),
+            ("error", Value::String(Rc::new(e.to_string()))),
+        ])),
+    }
+}
+
+// --------- §35.3 protocol adapters ---------
+
+fn parse_protocol(s: &str) -> Result<proto::ServeProtocol, String> {
+    proto::ServeProtocol::from_flag(s).ok_or_else(|| {
+        format!("serve_protocol_route: unknown protocol `{s}` (expected plain|mcp|openai|grpc|a2a)")
+    })
+}
+
+fn s28_protocol_route(args: &[Value]) -> Result<Value, String> {
+    let proto_s = s_arg(args, 0, "serve_protocol_route")?;
+    let method = s_arg(args, 1, "serve_protocol_route")?;
+    let path = s_arg(args, 2, "serve_protocol_route")?;
+    let body = s_arg(args, 3, "serve_protocol_route")?;
+    let default_handler = s_arg(args, 4, "serve_protocol_route")?;
+    let p = parse_protocol(proto_s.as_str())?;
+    let action = proto::route(
+        p,
+        &proto::IncomingRequest {
+            method: method.as_str(),
+            path: path.as_str(),
+            body: body.as_str(),
+        },
+        default_handler.as_str(),
+        "",
+    );
+    Ok(match action {
+        proto::ProtocolAction::Reply { status, body, content_type } => record_to_vec(vec![
+            ("kind", Value::String(Rc::new("reply".to_string()))),
+            ("status", Value::Int(status as i64)),
+            ("body", Value::String(Rc::new(body))),
+            ("content_type", Value::String(Rc::new(content_type))),
+            ("handler", Value::String(Rc::new(String::new()))),
+            ("prompt", Value::String(Rc::new(String::new()))),
+        ]),
+        proto::ProtocolAction::Dispatch { handler, prompt, jsonrpc_id } => record_to_vec(vec![
+            ("kind", Value::String(Rc::new("dispatch".to_string()))),
+            ("status", Value::Int(0)),
+            ("body", Value::String(Rc::new(String::new()))),
+            ("content_type", Value::String(Rc::new(String::new()))),
+            ("handler", Value::String(Rc::new(handler))),
+            ("prompt", Value::String(Rc::new(prompt))),
+            (
+                "jsonrpc_id",
+                Value::String(Rc::new(jsonrpc_id.to_string())),
+            ),
+        ]),
+    })
+}
+
+fn s28_protocol_wrap(args: &[Value]) -> Result<Value, String> {
+    let proto_s = s_arg(args, 0, "serve_protocol_wrap")?;
+    let reply = s_arg(args, 1, "serve_protocol_wrap")?;
+    let id_json = s_arg(args, 2, "serve_protocol_wrap")?;
+    let p = parse_protocol(proto_s.as_str())?;
+    let id_v: serde_json::Value =
+        serde_json::from_str(id_json.as_str()).unwrap_or(serde_json::Value::Null);
+    let (status, body, content_type) = proto::wrap_response(p, reply.as_str(), &id_v);
+    Ok(record_to_vec(vec![
+        ("status", Value::Int(status as i64)),
+        ("body", Value::String(Rc::new(body))),
+        (
+            "content_type",
+            Value::String(Rc::new(content_type.to_string())),
+        ),
+    ]))
+}
+
+fn s28_render_grpc_proto(args: &[Value]) -> Result<Value, String> {
+    let service_name = s_arg(args, 0, "serve_render_grpc_proto")?;
+    let handlers = list_of_strings(&args[1], "serve_render_grpc_proto", "handlers")?;
+    let body = proto::render_grpc_proto(service_name.as_str(), &handlers);
+    Ok(Value::String(Rc::new(body)))
+}
+
+// ===========================================================================
+// Stage 29 — Result/try_recover (§19), Stream<T> (§28), @restart variants
+// (§29.7), axon prof --cost (§31.2).
+// ===========================================================================
+
+use axon_runtime::restart_policy as rp;
+use axon_runtime::stream as rt_stream;
+
+thread_local! {
+    static STREAMS: RefCell<std::collections::HashMap<String, rt_stream::StreamHandle>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+fn install_stage29(interp: &Interpreter) {
+    // ---- §19 try_recover ----
+    interp.register_native_ext(
+        "try_recover",
+        ext("try_recover", 2, Some(2), s29_try_recover),
+    );
+    // ---- §28 streams ----
+    interp.register_native(
+        "stream_new",
+        n("stream_new", 3, Some(3), s29_stream_new),
+    );
+    interp.register_native(
+        "stream_send",
+        n("stream_send", 2, Some(2), s29_stream_send),
+    );
+    interp.register_native(
+        "stream_take",
+        n("stream_take", 1, Some(1), s29_stream_take),
+    );
+    interp.register_native(
+        "stream_close",
+        n("stream_close", 1, Some(1), s29_stream_close),
+    );
+    interp.register_native(
+        "stream_is_done",
+        n("stream_is_done", 1, Some(1), s29_stream_is_done),
+    );
+    interp.register_native(
+        "stream_stats",
+        n("stream_stats", 1, Some(1), s29_stream_stats),
+    );
+    interp.register_native_ext(
+        "for_await",
+        ext("for_await", 2, Some(2), s29_for_await),
+    );
+
+    // ---- §29.7 @restart validator ----
+    interp.register_native(
+        "restart_policy_parse",
+        n(
+            "restart_policy_parse",
+            1,
+            Some(1),
+            s29_restart_policy_parse,
+        ),
+    );
+    interp.register_native(
+        "restart_policy_should_restart",
+        n(
+            "restart_policy_should_restart",
+            2,
+            Some(2),
+            s29_restart_policy_should_restart,
+        ),
+    );
+}
+
+// --------- §19 try_recover ---------
+
+/// `try_recover(action, on_err)` — calls `action()`; if it errors,
+/// passes the message string to `on_err` and returns whatever the
+/// recovery callable produces. Mirrors `try { ... } recover |e| { ... }`
+/// without needing a parser change.
+fn s29_try_recover(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let action = args[0].clone();
+    let on_err = args[1].clone();
+    for (name, v) in [("action", &action), ("on_err", &on_err)] {
+        if !is_callable(v) {
+            return Err(format!("try_recover: `{name}` must be callable"));
+        }
+    }
+    match interp.call_value(&action, &[], span) {
+        Ok(v) => Ok(v),
+        Err(sig) => {
+            let msg = eval_signal_msg(&sig);
+            interp
+                .call_value(&on_err, &[Value::String(Rc::new(msg))], span)
+                .map_err(|e| format!("try_recover[on_err]: {}", eval_signal_msg(&e)))
+        }
+    }
+}
+
+// --------- §28 streams ---------
+
+fn parse_backpressure(s: &str) -> Result<rt_stream::BackpressurePolicy, String> {
+    match s {
+        "block" | "" => Ok(rt_stream::BackpressurePolicy::Block),
+        "drop_oldest" => Ok(rt_stream::BackpressurePolicy::DropOldest),
+        "drop_new" => Ok(rt_stream::BackpressurePolicy::DropNew),
+        other => Err(format!(
+            "stream_new: policy must be block|drop_oldest|drop_new, got `{other}`"
+        )),
+    }
+}
+
+fn s29_stream_new(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "stream_new")?;
+    let capacity = i_arg(args, 1, "stream_new")?.max(1) as usize;
+    let policy = s_arg(args, 2, "stream_new")?;
+    let policy = parse_backpressure(policy.as_str())?;
+    STREAMS.with(|c| {
+        c.borrow_mut().insert(
+            name.as_str().to_string(),
+            rt_stream::StreamHandle::new(name.as_str(), capacity, policy),
+        )
+    });
+    Ok(Value::String(name))
+}
+
+fn s29_stream_send(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "stream_send")?;
+    let value_json = value_to_json(&args[1]);
+    let outcome = STREAMS.with(|c| {
+        let mut map = c.borrow_mut();
+        let h = map
+            .get_mut(name.as_str())
+            .ok_or_else(|| format!("stream_send: no stream `{}`", name.as_str()))?;
+        Ok::<_, String>(h.send(value_json))
+    })?;
+    let s = match outcome {
+        rt_stream::SendOutcome::Buffered => "buffered",
+        rt_stream::SendOutcome::Closed => "closed",
+        rt_stream::SendOutcome::Backpressure => "backpressure",
+        rt_stream::SendOutcome::DroppedOldest => "dropped_oldest",
+        rt_stream::SendOutcome::DroppedNew => "dropped_new",
+    };
+    Ok(Value::String(Rc::new(s.to_string())))
+}
+
+fn s29_stream_take(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "stream_take")?;
+    let v = STREAMS.with(|c| {
+        let mut map = c.borrow_mut();
+        let h = map
+            .get_mut(name.as_str())
+            .ok_or_else(|| format!("stream_take: no stream `{}`", name.as_str()))?;
+        Ok::<_, String>(h.take())
+    })?;
+    match v {
+        Some(j) => Ok(record_to_vec(vec![
+            ("has_value", Value::Bool(true)),
+            ("value", json_to_value(&j)),
+        ])),
+        None => Ok(record_to_vec(vec![
+            ("has_value", Value::Bool(false)),
+            ("value", Value::Nil),
+        ])),
+    }
+}
+
+fn s29_stream_close(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "stream_close")?;
+    STREAMS.with(|c| {
+        let mut map = c.borrow_mut();
+        let h = map
+            .get_mut(name.as_str())
+            .ok_or_else(|| format!("stream_close: no stream `{}`", name.as_str()))?;
+        h.close();
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s29_stream_is_done(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "stream_is_done")?;
+    let done = STREAMS.with(|c| {
+        c.borrow()
+            .get(name.as_str())
+            .map(|h| h.is_done())
+            .unwrap_or(true)
+    });
+    Ok(Value::Bool(done))
+}
+
+fn s29_stream_stats(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "stream_stats")?;
+    let (sent, taken, dropped, len, closed) = STREAMS.with(|c| {
+        let map = c.borrow();
+        let h = map
+            .get(name.as_str())
+            .ok_or_else(|| format!("stream_stats: no stream `{}`", name.as_str()))?;
+        Ok::<_, String>((h.sent, h.taken, h.dropped, h.len(), h.closed))
+    })?;
+    Ok(record_to_vec(vec![
+        ("sent", Value::Int(sent as i64)),
+        ("taken", Value::Int(taken as i64)),
+        ("dropped", Value::Int(dropped as i64)),
+        ("buffer_len", Value::Int(len as i64)),
+        ("closed", Value::Bool(closed)),
+    ]))
+}
+
+/// `for_await(stream_name, body)` — pumps the stream into `body`
+/// until the stream is `is_done`. Drops out on the first error
+/// returned by the body; otherwise loops to exhaustion.
+fn s29_for_await(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let name = s_arg(args, 0, "for_await")?;
+    let body = args[1].clone();
+    if !is_callable(&body) {
+        return Err("for_await: `body` must be callable".into());
+    }
+    let mut count = 0i64;
+    loop {
+        let next = STREAMS.with(|c| {
+            let mut map = c.borrow_mut();
+            let h = map
+                .get_mut(name.as_str())
+                .ok_or_else(|| format!("for_await: no stream `{}`", name.as_str()))?;
+            if h.is_done() {
+                return Ok::<_, String>(None);
+            }
+            Ok(h.take())
+        })?;
+        let Some(j) = next else {
+            // Stream is either drained-and-closed, or empty-and-open.
+            let done = STREAMS.with(|c| {
+                c.borrow()
+                    .get(name.as_str())
+                    .map(|h| h.is_done())
+                    .unwrap_or(true)
+            });
+            if done {
+                break;
+            }
+            // Empty but open — return so the caller can wake later.
+            break;
+        };
+        let v = json_to_value(&j);
+        interp
+            .call_value(&body, &[v], span)
+            .map_err(|e| format!("for_await[{count}]: {}", eval_signal_msg(&e)))?;
+        count += 1;
+    }
+    Ok(Value::Int(count))
+}
+
+// --------- §29.7 @restart variants ---------
+
+fn s29_restart_policy_parse(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "restart_policy_parse")?;
+    let p = rp::RestartPolicy::from_attribute_name(name.as_str())
+        .map_err(|e| e.to_string())?;
+    Ok(Value::String(Rc::new(p.name().to_string())))
+}
+
+fn s29_restart_policy_should_restart(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "restart_policy_should_restart")?;
+    let exit = s_arg(args, 1, "restart_policy_should_restart")?;
+    let p = rp::RestartPolicy::from_attribute_name(name.as_str())
+        .map_err(|e| e.to_string())?;
+    let exit_kind = match exit.as_str() {
+        "normal" => rp::ExitKind::Normal,
+        "abnormal" => rp::ExitKind::Abnormal,
+        other => {
+            return Err(format!(
+                "restart_policy_should_restart: exit must be normal|abnormal, got `{other}`"
+            ));
+        }
+    };
+    Ok(Value::Bool(p.should_restart(exit_kind)))
 }
 

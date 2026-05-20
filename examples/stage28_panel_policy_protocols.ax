@@ -1,0 +1,93 @@
+//! examples/stage28_panel_policy_protocols.ax — Stage 28 demo.
+//!
+//! Closes the five spec gaps that remained after Stage 27:
+//!
+//!   §29.5 — Consensus + spawn_pool: build a panel of judges, broadcast
+//!           a vote, aggregate via majority / weighted / ranked-choice.
+//!   §29.9 — `human` pseudo-agent: durable approval request via the
+//!           Stage 27 registry with a typed `on_timeout` policy.
+//!   §30   — Multi-clause policy block: allow/deny rules, budget,
+//!           rate limit, audit summary.
+//!   §35.2 — FFI bridges: typed Python/Node/Wasm/gRPC subprocess call
+//!           contract (the launcher binary must be on $PATH for a real
+//!           invocation — this demo just shows the wire shape).
+//!   §35.3 — `axon serve --protocol mcp|openai|grpc|a2a`: route an
+//!           incoming HTTP request through the right wire adapter.
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage28_panel_policy_protocols.ax
+
+fn make_judge(i: Int) -> dyn { { judge_id: i, expertise: i * 10 } }
+
+fn main() uses { Console } {
+    print("---- §29.5 spawn_pool + consensus ----")
+    let pool = flow_spawn_pool(make_judge, 4)
+    print("panel size: ")
+    print(list_len(pool))
+
+    let v1 = { voter: "j0", choice: "ship", ranking: list_new(), confidence: 0.9 }
+    let v2 = { voter: "j1", choice: "ship", ranking: list_new(), confidence: 0.7 }
+    let v3 = { voter: "j2", choice: "wait", ranking: list_new(), confidence: 0.6 }
+    let v4 = { voter: "j3", choice: "ship", ranking: list_new(), confidence: 0.8 }
+    let cfg = { rule: "majority", quorum_fraction: 0.5, expected_voters: 4, weights: { } }
+    let d = flow_consensus(list_new(v1, v2, v3, v4), cfg)
+    print("majority outcome: " + d.outcome)
+    print("dissenting: ")
+    print(list_len(d.dissenting))
+
+    print("---- §29.9 human pseudo-agent ----")
+    let id = human_request("slack:#treasury", "Approve $1.2k refund?", 600, "deny")
+    let pending = human_resolve(id)
+    print("opened: " + pending.state + " via " + pending.by)
+
+    print("---- §30 policy block ----")
+    policy_block_new("support", "deny")
+    policy_block_allow("support", "tool", "kb.search", "")
+    policy_block_allow("support", "tool", "issue_refund", "amount <= 50")
+    policy_block_deny("support", "tool", "payments.charge")
+    policy_block_add_budget("support", "per_request", 50, -1)
+    policy_block_add_rate("support", "per_user", 30, 60)
+
+    let r1 = policy_block_check("support", "tool", "kb.search", true)
+    print("kb.search allowed? ")
+    print(bool(r1.allow))
+    let r2 = policy_block_check("support", "tool", "issue_refund", true)
+    print("issue_refund(when ok)? ")
+    print(bool(r2.allow))
+    let r3 = policy_block_check("support", "tool", "issue_refund", false)
+    print("issue_refund(when failed)? ")
+    print(bool(r3.allow))
+    let r4 = policy_block_check("support", "tool", "payments.charge", true)
+    print("payments.charge allowed? ")
+    print(bool(r4.allow))
+
+    policy_block_charge("support", "per_request", 60, 0)
+    let r5 = policy_block_check("support", "tool", "kb.search", true)
+    print("after $0.60 spent on a $0.50 budget: " + r5.label)
+    let s = policy_block_audit_summary("support")
+    print("audit allow/deny: ")
+    print(s.allow)
+    print(s.deny)
+
+    print("---- §35.2 FFI bridges (shape only) ----")
+    let payload = `{"text":"hello"}`
+    let result = ffi_bridge_call("python", "/no/such/script.py", "run", payload, 200)
+    print("bridge ok? ")
+    print(bool(result.ok))
+
+    print("---- §35.3 protocol adapters ----")
+    let mcp_body = `{"jsonrpc":"2.0","method":"tools/list","id":1}`
+    let action = serve_protocol_route("mcp", "POST", "/", mcp_body, "main")
+    print("mcp tools/list: " + action.kind + " status=" + str(action.status))
+
+    let openai_body = `{"messages":[{"role":"user","content":"hi"}]}`
+    let oa = serve_protocol_route("openai", "POST", "/v1/chat/completions", openai_body, "main")
+    print("openai dispatch handler: " + oa.handler)
+
+    let wrapped = serve_protocol_wrap("openai", "the answer", "null")
+    print("openai wrap status: ")
+    print(wrapped.status)
+
+    let proto = serve_render_grpc_proto("Support", list_new("Triage", "Resolve"))
+    print("grpc proto starts: " + str_substring(proto, 0, 20))
+}

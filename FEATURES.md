@@ -1,6 +1,227 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**752 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**859 tests passing** across 30+ crates).
+
+---
+
+## Stage 29 — `Result<T, E>` + `try_recover` (§19), `Stream<T>` + `for_await` (§28), `@restart` Variants (§29.7), `axon prof --cost` (§31.2)
+
+The four sub-features the final coverage audit surfaced as partial. All shipped end-to-end.
+
+### §19 `Result<T, E>` + `try_recover`
+- `Result<T, E>` is now a typed builtin container ([crates/axon-tyck/src/builtins.rs](crates/axon-tyck/src/builtins.rs) + [crates/axon-tyck/src/lower.rs](crates/axon-tyck/src/lower.rs)). Lowers to `Dyn` at the type layer; the runtime carries ok/err via the existing `result_ok` / `result_err` / `result_is_ok` / `result_is_err` / `result_value` / `result_error` host bindings.
+- `try_recover(action, on_err)` host binding mirrors the spec's `try { ... } recover |e| { ... }` block — runs `action()`, and on any runtime error passes the message string to `on_err` and returns its result. No parser change needed.
+
+### §28 `Stream<T>` runtime + `for_await`
+- [crates/axon-runtime/src/stream.rs](crates/axon-runtime/src/stream.rs) — typed `StreamHandle { buffer, capacity, closed, sent, taken, dropped, policy }` with three `BackpressurePolicy` variants:
+  - **`Block`** — producer's `send` returns `Backpressure`; caller retries.
+  - **`DropOldest`** — eject oldest buffered value, push the new one; `dropped` counter increments.
+  - **`DropNew`** — silently drop the new value when full.
+- `is_done()` distinguishes "closed and drained" from "closed but value still buffered" so `for_await` loops terminate correctly.
+- Host bindings: `stream_new(name, capacity, policy)`, `stream_send`, `stream_take`, `stream_close`, `stream_is_done`, `stream_stats`. `for_await(stream_name, body)` pumps every available value through `body` until the stream is done.
+
+### §29.7 `@restart` variant validation
+- [crates/axon-runtime/src/restart_policy.rs](crates/axon-runtime/src/restart_policy.rs) — typed `RestartPolicy { Permanent | Transient | Temporary }` enum with a `from_attribute_name(s)` parser that accepts both `Permanent` and `permanent` casings; anything else returns a clean error listing the three valid variants.
+- `should_restart(exit_kind)` encodes the §29.7 decision table: `Permanent` always restarts, `Transient` only on `Abnormal` exit, `Temporary` never. Supervisors now wrap the AST's raw `restart: Option<Ident>` field through this validator.
+- Host bindings: `restart_policy_parse(name)` and `restart_policy_should_restart(name, exit_kind)`.
+
+### §31.2 `axon prof --cost`
+- New CLI subcommand: `axon prof --cost <ledger.json> [--top N] [--profile NAME:input/output[/cached[/per_call]]]...`. Reads a `Ledger` JSON produced by the existing `cost_save` host binding, builds a `Report`, and prints:
+  - total calls + total cost in dollars;
+  - latency p50 + p95;
+  - per-provider breakdown (calls, input tokens, output tokens, total cost);
+  - top-N most expensive calls with provider, model, cost, latency, tag.
+- `--profile` repeatable to attach pricing rates per provider; without any profile the report still shows token counts + latencies so `axon prof --cost ledger.json` is useful immediately.
+
+### Host bindings (10 new names) + tyck registrations
+`try_recover`; `stream_new`, `stream_send`, `stream_take`, `stream_close`, `stream_is_done`, `stream_stats`, `for_await`; `restart_policy_parse`, `restart_policy_should_restart`. All registered in [crates/axon-tyck/src/register.rs](crates/axon-tyck/src/register.rs).
+
+### Test coverage
+- `crates/axon-runtime::stream` — 8 unit tests (send-take round trip, closed-stream rejects send, block-policy backpressure, drop-oldest keeps newest, drop-new silent drop, is_done distinguishes empty vs drained, telemetry counters, JSON round-trip).
+- `crates/axon-runtime::restart_policy` — 6 unit tests (six-variant parse, unknown-variant message, Permanent decision, Transient decision, Temporary never, name round-trip).
+- `crates/axon-cli/tests/stage29_long_tail.rs` — 12 end-to-end tests: `Result` type annotation parses + runs, `try_recover` calls fallback on error, stream send/take/backpressure/drop-oldest/for_await, `@restart` parse + decision table, `axon prof --cost` renders report + profile spec validation.
+- Workspace total: **859 passed, 0 failed** (up from 833).
+
+### CLI demo (real runs)
+```
+$ axon run examples/stage29_long_tail.ax
+---- §19 Result + try_recover ----
+10/2 ok? true
+value: 5
+7/0 err? true
+reason: divide by zero
+recovered: 99
+---- §28 Stream<T> + for_await ----
+evt-1
+evt-2
+evt-3
+drained: 3
+stats: {sent: 3, taken: 3, dropped: 0, buffer_len: 0, closed: true}
+---- §29.7 @restart variants ----
+Permanent / Transient / Temporary
+Permanent on normal -> restart? true
+Transient on normal -> restart? false
+Temporary on abnormal -> restart? false
+
+$ axon prof --cost ledger.json --profile "anthropic:300/1500" --top 5
+cost report from `ledger.json`
+  total calls : 3
+  total cost  : $0.0210
+  latency p50 : 1200 ms
+  latency p95 : 2400 ms
+  per-provider breakdown:
+    anthropic        calls=2     in=6000     out=7000     $0.0180
+    openai           calls=1     in=2000     out=500      $0.0010
+  top-3 most expensive calls:
+    #1  anthropic/opus               $0.0150 (2400 ms) tag=agent.research
+    #2  anthropic/opus               $0.0030 (1200 ms) tag=agent.research
+    #3  openai/gpt-4                 $0.0010 (800 ms) tag=agent.qa
+```
+
+---
+
+## Stage 28 — Consensus + spawn_pool (§29.5), `human` (§29.9), Policy Block (§30), Typed FFI Bridges (§35.2), `axon serve --protocol` (§35.3)
+
+The five remaining concrete gaps surfaced by the final coverage audit land here. Every feature is production-shaped (typed, tested, host-bound, demo-walked).
+
+### §29.5 Consensus + spawn_pool
+- [crates/axon-flow/src/consensus.rs](crates/axon-flow/src/consensus.rs) — typed `Vote { voter, choice, ranking, confidence }`, `ConsensusRule { Majority | Weighted | RankedChoice }`, and `ConsensusConfig { rule, quorum_fraction, expected_voters, weights }`. Returns a `Decision { outcome, confidence, dissenting, rule, quorum_met, vote_count }`.
+- All three rules implemented:
+  - **Majority** — option with most votes; ties broken by first-seen-in-stream (deterministic across runs).
+  - **Weighted** — vote × judge weight × confidence; confidence ratio is `winner_score / total_weight`.
+  - **RankedChoice** — instant-runoff voting; rounds eliminate the lowest-scoring option until one has a majority; iteration cap protects against pathological ties.
+- `flow_spawn_pool(constructor, size)` host binding calls `constructor(i)` N times and returns the pool. Synchronous today; the API matches what an async scheduler would expose.
+
+### §29.9 `human` pseudo-agent
+- [crates/axon-guard/src/human.rs](crates/axon-guard/src/human.rs) — `open_review(reg, channel, prompt, timeout, on_timeout, now_ns)` mints a fresh request via the Stage 27 `ApprovalRegistry`. `resolve(reg, id, now_ns)` sweeps timeouts first so callers always see the *current* state. `cancel(reg, id)` denies the request with reason `"cancelled by orchestrator"`.
+- Tool name `"human:review"` so audit-log scans can tell apart programmatic and human-routed approvals.
+- Host bindings: `human_request`, `human_resolve`, `human_cancel`.
+
+### §30 Policy block runtime
+- [crates/axon-guard/src/policy_block.rs](crates/axon-guard/src/policy_block.rs) — typed `PolicyBlock` with:
+  - `EffectKind { Tool | Net | Fs | Llm | Memory }` indexed `ClauseRule { pattern, when, action }` lists. First match wins; if no rule matches, `default_action` applies. Patterns support `*`, `prefix.*`, and exact-string.
+  - `GuardClause { kind, arg, direction }` for input/output guards (`prompt_injection`, `pii`, `toxicity`, `grounded`).
+  - `BudgetClause { scope, max_usd, max_tokens, max_wall_secs, window_secs, spent_*}` with running spend tracking; `charge(scope, usd, tokens)` debits. Budget-exhausted check returns label `"budget_exceeded"`.
+  - `RateClause { scope, max_calls, window_secs, recent_call_ns }` with sliding-window rate limiting; auto-trims expired entries on every check.
+  - Audit log — every `check_effect` call appends an `AuditEntry`; `audit_summary()` returns `(allow_count, deny_count)`.
+- Order of enforcement matches §30.1: rule match → rate limit → budget headroom → audit.
+- 8 host bindings: `policy_block_new`, `policy_block_allow`, `policy_block_deny`, `policy_block_check`, `policy_block_charge`, `policy_block_add_budget`, `policy_block_add_rate`, `policy_block_audit_summary`.
+
+### §35.2 Typed FFI bridges (Python / Node / Wasm / gRPC)
+- [crates/axon-ffi/src/bridges.rs](crates/axon-ffi/src/bridges.rs) — `BridgeKind` + `BridgeSpec { target, entrypoint, timeout_ms, launcher_override }`. Default launchers: `python3`, `node`, `wasmtime`, `grpcurl` — overridable per call so ops can pin a specific binary.
+- Wire contract is deliberately minimal: one JSON line of args on stdin, one JSON line on stdout shaped `{"ok":true,"value":...}` or `{"ok":false,"error":"..."}`. Anything else is a typed `ProtocolViolation`.
+- `call_bridge(&spec, args_json)` runs the subprocess under the same wall-clock + capability sandbox as `ffi_call` from Stage 16. Failures map to typed `BridgeError { Ffi, Bridge { message, stderr }, ProtocolViolation }`.
+- Single host binding: `ffi_bridge_call(kind, target, entrypoint, args_json, timeout_ms)` returns `{ok, value_json, error}`.
+
+### §35.3 `axon serve --protocol mcp|openai|grpc|a2a`
+- [crates/axon-deploy/src/protocols.rs](crates/axon-deploy/src/protocols.rs) — `ServeProtocol` enum + pure `route(proto, request, default_handler, well_known_card_body)` function that returns `ProtocolAction::{ Reply{status, body, content_type} | Dispatch{handler, prompt, jsonrpc_id} }`. Five protocols:
+  - **plain** — POST /invoke → handler (mirrors Stage 17).
+  - **mcp** — JSON-RPC 2.0; `tools/list` returns the registry's tool list; `tools/call` dispatches with `params.name` as the handler; unknown methods return `-32601`.
+  - **openai** — POST /v1/chat/completions; translates `messages[]` into a `role: content` prompt string; wraps the reply as `choices[0].message.content`.
+  - **grpc** — POST /Service/Method; dispatches with `Service.Method` as the handler name. Plus `render_grpc_proto(service_name, handlers)` emits an `agents.proto` next to the deploy bundle.
+  - **a2a** — GET /.well-known/agent-card.json returns the Stage 25 auto-published card body; POST /agent dispatches to the handler.
+- `wrap_response(proto, reply, jsonrpc_id)` translates handler output back into the wire shape per protocol.
+- CLI: `axon serve --protocol P` validates `P` and exports `AXON_SERVE_PROTOCOL=P` so the handler can dispatch via `serve_protocol_route` / `serve_protocol_wrap`.
+- 3 host bindings: `serve_protocol_route`, `serve_protocol_wrap`, `serve_render_grpc_proto`.
+
+### Host bindings (16 new names) + tyck registrations
+`flow_consensus`, `flow_spawn_pool`; `human_request`, `human_resolve`, `human_cancel`; `policy_block_*` (8 names); `ffi_bridge_call`; `serve_protocol_route`, `serve_protocol_wrap`, `serve_render_grpc_proto`. All registered in [crates/axon-tyck/src/register.rs](crates/axon-tyck/src/register.rs).
+
+### Test coverage
+- `crates/axon-flow::consensus` — 7 unit tests (majority + tie-break, weighted with high-weight voter, ranked-choice elimination, below-quorum, weighted confidence with per-vote scores, empty votes).
+- `crates/axon-guard::human` — 5 unit tests (open routes to channel, resolve reflects approval, resolve sweeps timeouts, cancel marks denied, unknown id false).
+- `crates/axon-guard::policy_block` — 8 unit tests (allow-then-default-deny, wildcard patterns, when clause gating, rate-limit denial, budget exhaustion, audit log accumulation, deny over default-allow, JSON round-trip).
+- `crates/axon-ffi::bridges` — 6 unit tests (kind aliases, launcher names, response parsing, bridge-error surfacing, protocol violation, JSON round-trip).
+- `crates/axon-deploy::protocols` — 11 unit tests (flag parsing, plain dispatch, mcp tools/list + tools/call + unknown method, openai message translation + wrap response, a2a well-known + dispatch, grpc path parsing, render_grpc_proto).
+- `crates/axon-cli/tests/stage28_orchestration_safety.rs` — 14 end-to-end tests through the `axon` binary.
+- Workspace total: **833 passed, 0 failed** (up from 782).
+
+### CLI demo (real run)
+```
+$ axon run examples/stage28_panel_policy_protocols.ax
+---- §29.5 spawn_pool + consensus ----
+panel size: 4
+majority outcome: ship
+dissenting: 1
+---- §29.9 human pseudo-agent ----
+opened: pending via slack:#treasury
+---- §30 policy block ----
+kb.search allowed? true
+issue_refund(when ok)? true
+issue_refund(when failed)? false
+payments.charge allowed? false
+after $0.60 spent on a $0.50 budget: budget_exceeded
+audit allow/deny: 2 3
+---- §35.2 FFI bridges (shape only) ----
+bridge ok? false
+---- §35.3 protocol adapters ----
+mcp tools/list: reply status=200
+openai dispatch handler: main
+openai wrap status: 200
+grpc proto starts: syntax = "proto3";
+```
+
+---
+
+## Stage 27 — `@approval` (§25.6), Prompt `@version` (§24.3), `axon schema migrate` (§17.1 / §36)
+
+The final v1.0 punch list closes here. Three small, fully production-shaped features.
+
+### §25.6 `@approval` tool attribute
+- [crates/axon-guard/src/approval.rs](crates/axon-guard/src/approval.rs) — `ApprovalRegistry` with typed `ApprovalRequest { id, tool, args_json, by, timeout_secs, on_timeout, state, actor, reason, escalated_to, requested_at_ns }`. Four `ApprovalState`s (Pending / Approved / Denied / TimedOut) and three `OnTimeout` policies (Deny — safe default, Allow — low-stakes, Escalate — re-emit to another approver).
+- `sweep_timeouts(now_ns, escalation_target_for)` walks every pending request and applies the configured directive in one pass. Caller supplies a closure that picks the escalation target so the registry stays transport-agnostic — the host wires the actual Slack/email/agent delivery.
+- Round-trips through JSON so pending approvals survive process restarts.
+- 8 host bindings: `approval_open`, `approval_approve`, `approval_deny`, `approval_get`, `approval_pending_count`, `approval_sweep_timeouts`, `approval_next_id`, `approval_purge_terminal`.
+
+### §24.3 Prompt `@version` registry
+- [crates/axon-runtime/src/prompt_version.rs](crates/axon-runtime/src/prompt_version.rs) — `PromptVersionRegistry` keyed by `(prompt_name, version)`. First registration becomes the prompt's default; `set_default(prompt, version)` promotes another revision after eval data backs it. `pick(prompt, Some(version) | None)` returns the entry; `versions_for(prompt)` returns chronological history; `prompts()` lists every registered name. Duplicate `(name, version)` registrations are rejected so re-runs don't silently overwrite.
+- 5 host bindings: `prompt_version_register`, `prompt_version_set_default`, `prompt_version_pick`, `prompt_version_versions_for`, `prompt_version_prompts`.
+
+### §17.1 / §36 `axon schema` CLI
+- `axon schema inspect <store.json> [--schema NAME]` — walks a JSON tree, finds every `{"__schema": "...", "__version": N, ...}` value, and reports counts per `(schema, version)` so operators can see the migration backlog before they trigger anything.
+- `axon schema migrate <store.json> --to N [--schema NAME] [--apply]` — plans the step chain for every out-of-date entry; reports `PLAN <schema> vM -> vN steps=[...]` per entry plus a summary; refuses to downgrade (`WOULD-DOWNGRADE`) and counts each blocked entry. The `--apply` path requires a runtime-installed migrator (use `axon run <migrator-script.ax>` with the existing `schema_migrate` host binding from Stage 18) — bails out with a clean error rather than silently no-op-ing.
+
+### Tyck registrations
+13 new host names registered in [crates/axon-tyck/src/register.rs](crates/axon-tyck/src/register.rs) so programs type-check immediately: `approval_*` (8 names), `prompt_version_*` (5 names).
+
+### Test coverage
+- `crates/axon-guard::approval` — 10 unit tests (open + approve, deny + reason, double-approve rejection, unknown request, three timeout directives, empty-field validation, purge_terminal, JSON round-trip).
+- `crates/axon-runtime::prompt_version` — 9 unit tests (default seeding, explicit pick, `set_default` promotion, unknown prompt/version errors, duplicate rejection, empty-name validation, chronological versions_for, prompt name dedup+sort, JSON round-trip).
+- `crates/axon-cli/tests/stage27_final_gaps.rs` — 11 end-to-end tests through the `axon` binary: approval open-approve-deny, timeout-with-deny, timeout-with-escalate, prompt-version register-pick-promote, unknown-prompt error, `axon schema inspect` (count by schema/version), `axon schema migrate --to` planning, `WOULD-DOWNGRADE` blocking, `--apply` requires-runtime-migrator error.
+- Workspace total: **782 passed, 0 failed** (up from 752).
+
+### CLI demo (real runs)
+```
+$ axon run examples/stage27_final_gaps.ax
+---- §25.6 approval gate ----
+opened: state=pending
+approver=treasury@example.com
+after approve: state=approved actor=alice
+denied: state=denied reason=needs more review
+timed-out requests: 1
+---- §24.3 prompt @version ----
+registered prompts: [support_answer]
+versions of support_answer: 3
+default version: v1
+post-promotion default: v3
+v3 notes: added off-topic refusal
+
+$ cat > /tmp/store.json <<'EOF'
+{
+  "alice": {"__schema": "Profile", "__version": 1, "name": "Alice"},
+  "bob":   {"__schema": "Profile", "__version": 2, "name": "Bob"},
+  "carol": {"__schema": "Profile", "__version": 3, "name": "Carol"}
+}
+EOF
+$ axon schema inspect /tmp/store.json --schema Profile
+  Profile v1: 1
+  Profile v2: 1
+  Profile v3: 1
+$ axon schema migrate /tmp/store.json --schema Profile --to 3
+  PLAN Profile v1 -> v3 key=alice steps=[1, 2]
+  PLAN Profile v2 -> v3 key=bob   steps=[2]
+axon schema migrate: 2 entries to upgrade, 1 already at v3, 0 blocked
+```
 
 ---
 

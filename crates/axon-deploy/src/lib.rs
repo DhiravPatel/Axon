@@ -24,10 +24,15 @@ pub mod health;
 pub mod http;
 pub mod manifest;
 pub mod metrics;
+pub mod protocols;
 pub mod serverless;
 
 pub use health::{AlwaysHealthy, CheckResult, HealthCheck, Liveness};
 pub use http::{Request, Response, Server};
 pub use manifest::DeployManifest;
 pub use metrics::MetricsRegistry;
+pub use protocols::{
+    render_grpc_proto, route as protocol_route, wrap_response as protocol_wrap_response,
+    IncomingRequest, ProtocolAction, ServeProtocol,
+};
 pub use serverless::{ServerlessTarget, ServerlessTrampoline};

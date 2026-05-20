@@ -111,6 +111,14 @@ fn main() -> ExitCode {
             let remaining: Vec<String> = args.collect();
             cmd_optimize(&remaining)
         }
+        "schema" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_schema(&remaining)
+        }
+        "prof" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_prof(&remaining)
+        }
         "version" | "--version" | "-V" => {
             println!("axon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -153,10 +161,15 @@ fn print_help() {
                           any file would be reformatted (useful in CI).\n\
            serve  <file> --listen ADDR --handler NAME\n\
                           [--tls-cert PATH --tls-key PATH]\n\
+                          [--protocol plain|mcp|openai|grpc|a2a]\n\
                           Start an HTTP/1.1 server. POST /invoke dispatches\n\
                           to the named handler with the request body; GET\n\
                           /healthz and /readyz return JSON health status.\n\
                           With --tls-* flags, terminate TLS via rustls.\n\
+                          With --protocol, the request shape is wrapped per\n\
+                          the chosen wire protocol (MCP, OpenAI chat,\n\
+                          gRPC, A2A); the handler reads $AXON_SERVE_PROTOCOL\n\
+                          and dispatches via `serve_protocol_route`.\n\
                           SIGINT/SIGTERM triggers graceful shutdown with\n\
                           in-flight handler drain.\n\
            login  <provider> [--vault PATH] [--key VALUE]\n\
@@ -171,6 +184,19 @@ fn print_help() {
                           an eval suite and propose a diff that beats the\n\
                           baseline (§49.6). Writes the winning variant\n\
                           alongside the input as `<name>.vN.ax`.\n\
+           schema <subcmd>  Schema migration tooling.\n\
+                          Subcommands:\n\
+                            migrate <store.json> --to N [--schema NAME]\n\
+                              Plan + (with --apply) execute the\n\
+                              registered migration chain over a JSON\n\
+                              store. Without --apply it reports what\n\
+                              steps would run.\n\
+                            inspect <store.json> [--schema NAME]\n\
+                              Count entries per (schema, version).\n\
+           prof   --cost <ledger.json> [--top N] [--by provider|model|tag]\n\
+                          Render a cost report from a recorded ledger:\n\
+                          total cents, per-provider breakdown, p50/p95\n\
+                          latency, and top-N most expensive calls.\n\
            deploy <file> -o DIR [--name N] [--port P] [--handler H]\n\
                           Package a project for deployment: write a\n\
                           `.axskill` archive plus a `deploy.json` manifest\n\
@@ -1015,6 +1041,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let mut handler = "main".to_string();
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut protocol = "plain".to_string();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1055,6 +1082,19 @@ fn cmd_serve(args: &[String]) -> ExitCode {
                 tls_key = Some(args[i].clone());
                 i += 1;
             }
+            "--protocol" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon serve: --protocol requires VAL");
+                    return ExitCode::from(2);
+                }
+                protocol = args[i].clone();
+                i += 1;
+            }
+            other if other.starts_with("--protocol=") => {
+                protocol = other["--protocol=".len()..].to_string();
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("axon serve: unknown flag `{other}`");
                 return ExitCode::from(2);
@@ -1074,10 +1114,22 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         eprintln!("axon serve: --tls-cert and --tls-key must be used together");
         return ExitCode::from(2);
     }
+    // Validate --protocol against the known set so a typo doesn't sit
+    // silently in $AXON_SERVE_PROTOCOL.
+    if !matches!(protocol.as_str(), "plain" | "mcp" | "openai" | "grpc" | "a2a") {
+        eprintln!(
+            "axon serve: --protocol must be plain|mcp|openai|grpc|a2a, got `{protocol}`"
+        );
+        return ExitCode::from(2);
+    }
+    // Expose the chosen protocol to the running handler via env. The
+    // handler reads it with `env_get("AXON_SERVE_PROTOCOL")` and uses
+    // `serve_protocol_route` to dispatch the request shape.
+    std::env::set_var("AXON_SERVE_PROTOCOL", &protocol);
     let file = match file {
         Some(f) => f,
         None => {
-            eprintln!("usage: axon serve <file> [--listen ADDR] [--handler NAME]");
+            eprintln!("usage: axon serve <file> [--listen ADDR] [--handler NAME] [--protocol P]");
             return ExitCode::from(2);
         }
     };
@@ -2273,5 +2325,457 @@ fn next_versioned_path(input: &str) -> std::path::PathBuf {
         }
     }
     parent.join(format!("{stem}.v999.ax"))
+}
+
+// ---------------------------------------------------------------------------
+// Stage 27 — `axon schema` (§17.1 / §36)
+//
+// Pure operator surface: walk a JSON store, find entries shaped like
+//   { "__schema": "Profile", "__version": 2, ... }
+// and report what migration steps would run to upgrade them to a target
+// version. With `--apply`, write each transformed value back using the
+// registered runtime migrator. v0 supports the *plan* path fully; the
+// execution path requires the migrator to be loaded from a side program
+// (a future stage hooks `axon run` to install the migrator before the
+// store sweep). Until then `--apply` errors cleanly so operators don't
+// silently get a no-op.
+// ---------------------------------------------------------------------------
+
+fn cmd_schema(args: &[String]) -> ExitCode {
+    let sub = match args.first() {
+        Some(s) => s.as_str(),
+        None => {
+            eprintln!("usage: axon schema <migrate|inspect> [args...]");
+            return ExitCode::from(2);
+        }
+    };
+    let rest = &args[1..];
+    match sub {
+        "migrate" => cmd_schema_migrate(rest),
+        "inspect" => cmd_schema_inspect(rest),
+        other => {
+            eprintln!("axon schema: unknown subcommand `{other}`");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_schema_migrate(args: &[String]) -> ExitCode {
+    let mut store_path: Option<String> = None;
+    let mut to_version: Option<u32> = None;
+    let mut schema_filter: Option<String> = None;
+    let mut apply = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon schema migrate: --to requires N");
+                    return ExitCode::from(2);
+                }
+                to_version = match args[i].parse::<u32>() {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        eprintln!("axon schema migrate: --to must be a positive integer");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 1;
+            }
+            "--schema" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon schema migrate: --schema requires NAME");
+                    return ExitCode::from(2);
+                }
+                schema_filter = Some(args[i].clone());
+                i += 1;
+            }
+            "--apply" => {
+                apply = true;
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon schema migrate: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if store_path.is_some() {
+                    eprintln!("axon schema migrate: only one store path is supported");
+                    return ExitCode::from(2);
+                }
+                store_path = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let path = match store_path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: axon schema migrate <store.json> [--schema NAME] --to N [--apply]");
+            return ExitCode::from(2);
+        }
+    };
+    let to = match to_version {
+        Some(v) => v,
+        None => {
+            eprintln!("axon schema migrate: --to N is required");
+            return ExitCode::from(2);
+        }
+    };
+
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon schema migrate: cannot read `{path}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let root: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("axon schema migrate: `{path}` is not valid JSON: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let entries = collect_schema_entries(&root, schema_filter.as_deref());
+    if entries.is_empty() {
+        println!(
+            "axon schema migrate: no `__schema`/`__version` entries found in `{path}`"
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let mut planned = 0usize;
+    let mut downgrade_blocked = 0usize;
+    let mut at_target = 0usize;
+    for e in &entries {
+        if e.version > to {
+            println!(
+                "  WOULD-DOWNGRADE {schema} stored=v{stored} target=v{target} key={key} — skipped",
+                schema = e.schema,
+                stored = e.version,
+                target = to,
+                key = e.key
+            );
+            downgrade_blocked += 1;
+            continue;
+        }
+        if e.version == to {
+            at_target += 1;
+            continue;
+        }
+        let plan: Vec<u32> = (e.version..to).collect();
+        println!(
+            "  PLAN {schema} v{stored} -> v{target} key={key} steps={plan:?}",
+            schema = e.schema,
+            stored = e.version,
+            target = to,
+            key = e.key,
+            plan = plan
+        );
+        planned += 1;
+    }
+
+    println!(
+        "axon schema migrate: {planned} entries to upgrade, {at_target} already at v{to}, {downgrade_blocked} blocked",
+    );
+
+    if apply {
+        eprintln!(
+            "axon schema migrate: --apply requires a registered migrator. Run \
+             `axon run <migrator-script.ax>` to install one, then invoke this command again. \
+             (Plan above is unchanged; no entries were modified.)"
+        );
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_schema_inspect(args: &[String]) -> ExitCode {
+    let mut store_path: Option<String> = None;
+    let mut schema_filter: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--schema" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon schema inspect: --schema requires NAME");
+                    return ExitCode::from(2);
+                }
+                schema_filter = Some(args[i].clone());
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon schema inspect: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if store_path.is_some() {
+                    eprintln!("axon schema inspect: only one store path is supported");
+                    return ExitCode::from(2);
+                }
+                store_path = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let path = match store_path {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: axon schema inspect <store.json> [--schema NAME]");
+            return ExitCode::from(2);
+        }
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon schema inspect: cannot read `{path}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let root: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("axon schema inspect: `{path}` is not valid JSON: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let entries = collect_schema_entries(&root, schema_filter.as_deref());
+    if entries.is_empty() {
+        println!("(no schema-tagged entries found)");
+        return ExitCode::SUCCESS;
+    }
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<(String, u32), usize> = BTreeMap::new();
+    for e in &entries {
+        *counts.entry((e.schema.clone(), e.version)).or_default() += 1;
+    }
+    for ((schema, version), n) in counts {
+        println!("  {schema} v{version}: {n}");
+    }
+    ExitCode::SUCCESS
+}
+
+struct SchemaEntry {
+    schema: String,
+    version: u32,
+    /// Where this entry lives in the JSON tree — a dot-path for stable
+    /// identification in the inspect/migrate report.
+    key: String,
+}
+
+fn collect_schema_entries(root: &serde_json::Value, filter: Option<&str>) -> Vec<SchemaEntry> {
+    fn walk(
+        v: &serde_json::Value,
+        path: &str,
+        filter: Option<&str>,
+        out: &mut Vec<SchemaEntry>,
+    ) {
+        match v {
+            serde_json::Value::Object(obj) => {
+                let has_schema = obj.get("__schema").and_then(|x| x.as_str());
+                let has_version = obj
+                    .get("__version")
+                    .and_then(|x| x.as_u64().map(|u| u as u32));
+                if let (Some(schema), Some(version)) = (has_schema, has_version) {
+                    if filter.map(|f| f == schema).unwrap_or(true) {
+                        out.push(SchemaEntry {
+                            schema: schema.to_string(),
+                            version,
+                            key: if path.is_empty() { "$".into() } else { path.to_string() },
+                        });
+                    }
+                }
+                for (k, child) in obj {
+                    let child_path = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    walk(child, &child_path, filter, out);
+                }
+            }
+            serde_json::Value::Array(xs) => {
+                for (i, child) in xs.iter().enumerate() {
+                    let child_path = format!("{path}[{i}]");
+                    walk(child, &child_path, filter, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", filter, &mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Stage 29 — `axon prof --cost` (§31.2)
+//
+// Renders a cost report from a recorded ledger written by the `cost_*`
+// host bindings. Supports `--profile NAME:input/output[/cached[/per_call]]`
+// to attach per-provider pricing; without profiles, totals stay at zero
+// and we still show token counts + latency percentiles.
+// ---------------------------------------------------------------------------
+
+fn cmd_prof(args: &[String]) -> ExitCode {
+    let mut ledger_path: Option<String> = None;
+    let mut top_n: usize = 10;
+    let mut profiles: Vec<axon_cost::ProviderProfile> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cost" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon prof: --cost requires PATH");
+                    return ExitCode::from(2);
+                }
+                ledger_path = Some(args[i].clone());
+                i += 1;
+            }
+            other if other.starts_with("--cost=") => {
+                ledger_path = Some(other["--cost=".len()..].to_string());
+                i += 1;
+            }
+            "--top" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon prof: --top requires N");
+                    return ExitCode::from(2);
+                }
+                top_n = match args[i].parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("axon prof: --top must be a non-negative integer");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 1;
+            }
+            "--profile" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!(
+                        "axon prof: --profile requires NAME:input/output[/cached[/per_call]]"
+                    );
+                    return ExitCode::from(2);
+                }
+                match parse_profile_spec(&args[i]) {
+                    Ok(p) => profiles.push(p),
+                    Err(e) => {
+                        eprintln!("axon prof: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon prof: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                eprintln!("axon prof: unexpected positional argument `{other}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = ledger_path else {
+        eprintln!("usage: axon prof --cost <ledger.json> [--top N] [--profile SPEC]...");
+        return ExitCode::from(2);
+    };
+    let bytes = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon prof: cannot read `{path}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let ledger: axon_cost::Ledger = match serde_json::from_str(&bytes) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("axon prof: `{path}` is not a valid ledger JSON: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = axon_cost::Report::build(&ledger, &profiles, top_n);
+    println!("cost report from `{path}`");
+    println!("  total calls : {}", report.total_calls);
+    println!(
+        "  total cost  : ${:.4}",
+        report.total_cents as f64 / 100.0
+    );
+    println!("  latency p50 : {} ms", report.p50_latency_ms);
+    println!("  latency p95 : {} ms", report.p95_latency_ms);
+    println!("  per-provider breakdown:");
+    if report.providers.is_empty() {
+        println!("    (no entries)");
+    } else {
+        for s in &report.providers {
+            println!(
+                "    {p:<16} calls={c:<5} in={i:<8} out={o:<8} ${d:.4}",
+                p = s.provider,
+                c = s.calls,
+                i = s.input_tokens,
+                o = s.output_tokens,
+                d = s.total_cents as f64 / 100.0,
+            );
+        }
+    }
+    if !report.top_calls.is_empty() {
+        println!("  top-{} most expensive calls:", report.top_calls.len());
+        for (i, c) in report.top_calls.iter().enumerate() {
+            println!(
+                "    #{i:<2} {p}/{m:<20} ${d:.4} ({lat} ms) tag={tag}",
+                i = i + 1,
+                p = c.provider,
+                m = c.model,
+                d = c.cents as f64 / 100.0,
+                lat = c.latency_ms,
+                tag = c.tag,
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn parse_profile_spec(s: &str) -> Result<axon_cost::ProviderProfile, String> {
+    let (name_part, rates_part) = s
+        .split_once(':')
+        .ok_or_else(|| format!("--profile: missing `:` in `{s}`"))?;
+    let parts: Vec<&str> = rates_part.split('/').collect();
+    let parse = |s: &str, label: &str| -> Result<u64, String> {
+        s.parse::<u64>()
+            .map_err(|e| format!("--profile: {label} `{s}`: {e}"))
+    };
+    let parse32 = |s: &str, label: &str| -> Result<u32, String> {
+        s.parse::<u32>()
+            .map_err(|e| format!("--profile: {label} `{s}`: {e}"))
+    };
+    if parts.len() < 2 || parts.len() > 4 {
+        return Err(format!(
+            "--profile: expected NAME:input/output[/cached[/per_call]], got `{s}`"
+        ));
+    }
+    Ok(axon_cost::ProviderProfile {
+        name: name_part.to_string(),
+        model: String::new(),
+        input_cents_per_million: parse(parts[0], "input_per_million")?,
+        output_cents_per_million: parse(parts[1], "output_per_million")?,
+        cached_input_cents_per_million: if parts.len() >= 3 {
+            parse(parts[2], "cached_per_million")?
+        } else {
+            0
+        },
+        per_call_cents: if parts.len() == 4 {
+            parse32(parts[3], "per_call_cents")?
+        } else {
+            0
+        },
+    })
 }
 

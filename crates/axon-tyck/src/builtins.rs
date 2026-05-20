@@ -38,7 +38,16 @@ pub fn builtin_type(name: &str) -> Option<Ty> {
 pub fn is_builtin_container(name: &str) -> bool {
     matches!(
         name,
-        "Option" | "List" | "Map" | "Set" | "Tool" | "Stream" | "Chan" | "Secret" | "Tainted"
+        "Option"
+            | "List"
+            | "Map"
+            | "Set"
+            | "Tool"
+            | "Stream"
+            | "Chan"
+            | "Secret"
+            | "Tainted"
+            | "Result"
     )
 }
 

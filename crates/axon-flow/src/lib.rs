@@ -20,6 +20,7 @@
 //! values, models, or capabilities: the CLI host crate maps `Step` onto
 //! interpreter callables when wiring `flow_*` natives.
 
+pub mod consensus;
 pub mod debate;
 mod error;
 pub mod graph;
@@ -34,6 +35,7 @@ mod sequential;
 pub mod strategy;
 pub mod tot;
 
+pub use consensus::{consensus, ConsensusConfig, ConsensusRule, Decision, Vote};
 pub use debate::{debate as debate_run, DebateOutcome, Side, Statement};
 pub use error::FlowError;
 pub use graph::{GraphEdge, GraphError, GraphNode, WorkflowGraph};
