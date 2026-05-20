@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn \"let.*= \\\\`\" \"/Users/dhiravpatel/Documents/Project 2/Axon/examples/\" --include=\"*.ax\")",
+      "Bash(./target/debug/axon check *)",
+      "Bash(awk '/test result/{p+=$4; f+=$6} END {print \"TOTAL PASSED:\", p, \"  FAILED:\", f}')"
+    ]
+  }
+}

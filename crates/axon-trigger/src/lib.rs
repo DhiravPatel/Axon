@@ -19,11 +19,13 @@
 //! niceties like `@reboot` or seconds-precision are out of scope for v0.
 
 pub mod cron;
+pub mod durable_timer;
 mod scheduler;
 mod schedule;
 mod trigger;
 
 pub use cron::CronExpr;
+pub use durable_timer::{DurableTimer, DurableTimerTable, TIMER_FORMAT_VERSION, TIMER_TABLE_KEY};
 pub use schedule::Schedule;
 pub use scheduler::{Scheduler, FiredTrigger};
 pub use trigger::{RetryPolicy, Trigger, TriggerError};

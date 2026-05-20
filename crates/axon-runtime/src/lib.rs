@@ -17,13 +17,15 @@
 mod actor;
 pub mod attrs;
 mod budget;
-mod builtin;
+pub mod builtin;
 mod caps;
+pub mod context_policy;
 mod env;
 mod error;
 mod eval;
 pub mod migrate;
 pub mod otlp;
+pub mod reasoning;
 mod record;
 pub mod supervisor;
 mod tool;
@@ -32,6 +34,7 @@ mod value;
 
 pub use actor::{Actor, AgentDef, HandlerDef, Lifecycle, LifecycleHandlerDef, StateField};
 pub use budget::{Budget, BudgetBreach, BudgetStack};
+pub use reasoning::{Effort, ReasoningBreach, ReasoningBudget, ReasoningBudgetStack};
 pub use caps::{parse_cap_list, CapSet};
 pub use env::Env;
 pub use error::{EvalResult, EvalSignal, RuntimeError, TraceFrame};

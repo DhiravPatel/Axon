@@ -1,0 +1,132 @@
+//! examples/stage24_orchestration_and_eval.ax — Stage 24 demo.
+//!
+//! Walks the four PLAN sections newly implemented:
+//!
+//!   §29  Multi-agent orchestration  — declare a `network` topology and a
+//!        workflow `graph`, run cycle/topo-order analysis on both.
+//!   §49  Reasoning & planning        — set a reasoning budget, watch it
+//!        breach; run a ReAct loop driven by typed think/act/observe steps.
+//!   §55  Trajectory eval / redteam   — populate a `Trajectory`, score it
+//!        with tool_accuracy / recovered / no_secret_exposed; load a curated
+//!        red-team suite.
+//!   §56  Cost / latency optimization — insert a stable prompt prefix into
+//!        the cache and observe a hit; race two candidate model wrappers
+//!        through `flow_race`; route by difficulty.
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage24_orchestration_and_eval.ax
+
+// ----- helpers for the typed flow callbacks ------------------------------
+
+fn pro_arg(q: dyn, transcript: dyn) -> String { "pro: ship now" }
+fn con_arg(q: dyn, transcript: dyn) -> String { "con: wait a week" }
+fn judge_arg(q: dyn, transcript: dyn) -> String { "decision: ship now" }
+
+fn cheap_model(q: String) -> String { "cheap:" + q }
+fn deep_model(q: String) -> String { "deep:" + q }
+fn fast_model(q: String) -> String { "fast:" + q }
+fn medium_model(q: String) -> String { "medium:" + q }
+fn accept_cheap(s: String) -> Bool { str_starts_with(s, "cheap") }
+
+fn think_step(log: dyn) -> String { "thought: I should search" }
+fn act_step(thought: dyn, log: dyn) -> String { "action: search('axon')" }
+fn observe_step(thought: dyn, action: dyn) -> dyn {
+    { observation: "obs: found a doc", done: true }
+}
+
+fn main() uses { Console } {
+    print("---- §29 multi-agent orchestration ----")
+
+    // Network with a cycle: critic <-> writer expands to a 2-cycle.
+    flow_network_new("Team")
+    flow_network_add_node("Team", "researcher")
+    flow_network_add_node("Team", "critic")
+    flow_network_add_node("Team", "writer")
+    flow_network_add_node("Team", "editor")
+    flow_network_add_edge("Team", "researcher", "critic", "oneway")
+    flow_network_add_edge("Team", "researcher", "writer", "oneway")
+    flow_network_add_edge("Team", "critic", "writer", "bidi")
+    flow_network_add_edge("Team", "writer", "editor", "oneway")
+    let v = flow_network_verify("Team")
+    print("network with bidi edge ok? ")
+    print(bool(v.ok))
+    print("error: " + v.error)
+
+    // A pure-DAG workflow.
+    flow_graph_new("Triage")
+    flow_graph_add_node("Triage", "classify", "fast")
+    flow_graph_add_node("Triage", "retrieve", "kb")
+    flow_graph_add_node("Triage", "draft", "brain")
+    flow_graph_add_node("Triage", "review", "judge")
+    flow_graph_add_edge("Triage", "classify", "draft")
+    flow_graph_add_edge("Triage", "retrieve", "draft")
+    flow_graph_add_edge("Triage", "draft", "review")
+    print("graph verify ok? ")
+    print(bool(flow_graph_verify("Triage").ok))
+    print("topological order:")
+    let order = flow_graph_topo("Triage")
+    print(order)
+
+    // Debate (§29.8) with scripted personas + judge.
+    let d = flow_debate("Should we ship?", pro_arg, con_arg, judge_arg, 2)
+    print("debate verdict: " + d.verdict)
+
+    print("---- §49 reasoning & planning ----")
+
+    reasoning_budget_new("plan", "high", 1000, false)
+    let breached_a = reasoning_budget_debit("plan", 400)
+    let breached_b = reasoning_budget_debit("plan", 700)
+    print("400 tokens breached? " + str(breached_a))
+    print("400+700 breached? " + str(breached_b))
+
+    let log = plan_react_loop(5, think_step, act_step, observe_step)
+    print("react steps logged: ")
+    print(list_len(log))
+
+    print("---- §55 trajectory eval + redteam ----")
+
+    eval_trajectory_new("t1", "find paper on X",
+        list_new("search", "summarize"), list_new("shell"))
+    eval_trajectory_add_step("t1", "first try", "search", "args", true, "")
+    eval_trajectory_add_step("t1", "retry", "search", "args", false, "found paper Y")
+    eval_trajectory_add_step("t1", "summarize", "summarize", "args", false, "summary")
+    eval_trajectory_set_answer("t1", "Paper Y discusses X.")
+    print("tool_accuracy: ")
+    print(eval_trajectory_tool_accuracy("t1"))
+    print("recovered_from_errors: ")
+    print(bool(eval_trajectory_recovered("t1")))
+    print("no_forbidden_tool_called: ")
+    print(bool(eval_trajectory_no_forbidden_tool("t1")))
+
+    let suite = redteam_load("std:injection")
+    print("red-team injection suite size: ")
+    print(list_len(suite))
+
+    print("---- §56 cost & latency optimization ----")
+
+    // Prompt-prefix cache: warm with a stable system prompt, observe hits.
+    cost_cache_clear()
+    cost_cache_insert("system: be precise about citations", 800, 600)
+    let lookup_a = cost_cache_lookup("system: be precise about citations")
+    let lookup_b = cost_cache_lookup("system: be precise about citations")
+    let miss = cost_cache_lookup("nothing-here")
+    print("hit / hit / miss: ")
+    print(bool(lookup_a.hit))
+    print(bool(lookup_b.hit))
+    print(bool(miss.hit))
+    print("cache stats: ")
+    print(cost_cache_stats())
+
+    // Race a cheap model against a deep model — cheap wins when its answer
+    // is acceptable, deep is never called.
+    let race = flow_race("hello", list_new(cheap_model, deep_model), accept_cheap)
+    print("race winner: " + race.value)
+    print("considered: ")
+    print(race.considered)
+
+    // Route by heuristic difficulty.
+    let routed = flow_route_difficulty(
+        "Prove that 2+2=4 step by step", fast_model, medium_model, deep_model)
+    print("routed tier: " + routed.tier)
+    print("routed answer: " + routed.value)
+}

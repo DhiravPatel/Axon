@@ -15,11 +15,23 @@
 //! that calls a model behind the scenes.
 
 pub mod metric;
+pub mod redteam;
 pub mod report;
 pub mod scenario;
+pub mod sim;
 pub mod suite;
+pub mod trajectory;
 
 pub use metric::{Contains, ExactMatch, JsonPath, LatencyP95, Metric, MetricResult, RegexLike};
+pub use redteam::{
+    redteam_suite, refusal_phrases, AttackCategory, RedteamCase, SafetyAssertion,
+};
 pub use report::{ScenarioReport, SuiteReport};
 pub use scenario::{RunResult, Scenario};
+pub use sim::{AgentBox, ScriptedAction, SimEvent, World};
 pub use suite::Suite;
+pub use trajectory::{
+    grounded_in_observations, no_forbidden_tool_called, no_secret_exposed,
+    recovered_from_errors, step_efficiency, tool_accuracy, ToolCall, Trajectory,
+    TrajectoryStep,
+};

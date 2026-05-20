@@ -9,6 +9,7 @@ description = "Tree-walking interpreter for the Axon programming language"
 axon-diag = { workspace = true }
 axon-ast = { workspace = true }
 axon-models = { workspace = true }
+serde      = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

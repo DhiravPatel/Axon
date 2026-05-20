@@ -33,6 +33,9 @@ pub fn install(interp: &Interpreter) {
     install_supervisor(interp);
     install_migrate(interp);
     install_otlp(interp);
+    install_stage24(interp);
+    install_stage25(interp);
+    install_stage26(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -2881,3 +2884,2331 @@ fn trace_export_otlp_ext(
         .map_err(|e| format!("trace_export_otlp: {e}"))?;
     Ok(Value::Unit)
 }
+
+// ===========================================================================
+// Stage 24 — multi-agent orchestration (§29), reasoning & planning (§49),
+// trajectory eval & red-teaming (§55), cost/latency optimization (§56).
+//
+// Stateful objects (Network, Graph, ReasoningBudget, Trajectory, World) are
+// stored in thread-local registries keyed by string ids. Programs pass the
+// id around like a handle. This keeps Axon's value model simple (string +
+// records) while still supporting the full builder-pattern construction.
+// ===========================================================================
+
+use axon_cost::PrefixCache;
+use axon_eval::redteam as rt_suite;
+use axon_eval::sim as eval_sim;
+use axon_eval::trajectory as traj;
+use axon_flow::{DifficultyThresholds, GraphError, NetworkError};
+
+thread_local! {
+    static NETWORKS: RefCell<std::collections::HashMap<String, axon_flow::Network>> =
+        RefCell::new(std::collections::HashMap::new());
+    static GRAPHS: RefCell<std::collections::HashMap<String, axon_flow::WorkflowGraph>> =
+        RefCell::new(std::collections::HashMap::new());
+    static REASONING_BUDGETS: RefCell<std::collections::HashMap<String, axon_runtime::ReasoningBudget>> =
+        RefCell::new(std::collections::HashMap::new());
+    static TRAJECTORIES: RefCell<std::collections::HashMap<String, traj::Trajectory>> =
+        RefCell::new(std::collections::HashMap::new());
+    static SIM_WORLDS: RefCell<std::collections::HashMap<String, eval_sim::World>> =
+        RefCell::new(std::collections::HashMap::new());
+    static PREFIX_CACHE: PrefixCache = PrefixCache::new();
+}
+
+fn install_stage24(interp: &Interpreter) {
+    // ---- §29.2 networks ----
+    interp.register_native("flow_network_new", n("flow_network_new", 1, Some(1), s24_network_new));
+    interp.register_native(
+        "flow_network_add_node",
+        n("flow_network_add_node", 2, Some(2), s24_network_add_node),
+    );
+    interp.register_native(
+        "flow_network_add_edge",
+        n("flow_network_add_edge", 4, Some(4), s24_network_add_edge),
+    );
+    interp.register_native(
+        "flow_network_verify",
+        n("flow_network_verify", 1, Some(1), s24_network_verify),
+    );
+    interp.register_native(
+        "flow_network_unreachable_from",
+        n(
+            "flow_network_unreachable_from",
+            2,
+            Some(2),
+            s24_network_unreachable_from,
+        ),
+    );
+
+    // ---- §29.6 workflow graphs ----
+    interp.register_native("flow_graph_new", n("flow_graph_new", 1, Some(1), s24_graph_new));
+    interp.register_native(
+        "flow_graph_add_node",
+        n("flow_graph_add_node", 3, Some(3), s24_graph_add_node),
+    );
+    interp.register_native(
+        "flow_graph_add_edge",
+        n("flow_graph_add_edge", 3, Some(3), s24_graph_add_edge),
+    );
+    interp.register_native(
+        "flow_graph_verify",
+        n("flow_graph_verify", 1, Some(1), s24_graph_verify),
+    );
+    interp.register_native(
+        "flow_graph_topo",
+        n("flow_graph_topo", 1, Some(1), s24_graph_topo),
+    );
+    interp.register_native(
+        "flow_graph_roots",
+        n("flow_graph_roots", 1, Some(1), s24_graph_roots),
+    );
+    interp.register_native(
+        "flow_graph_leaves",
+        n("flow_graph_leaves", 1, Some(1), s24_graph_leaves),
+    );
+    interp.register_native_ext(
+        "flow_graph_run",
+        ext("flow_graph_run", 3, Some(3), s24_graph_run),
+    );
+
+    // ---- §29.8 / §49.2 / §56.3 extra combinators ----
+    interp.register_native_ext(
+        "flow_debate",
+        ext("flow_debate", 5, Some(5), s24_flow_debate),
+    );
+    interp.register_native_ext(
+        "flow_tree_of_thought",
+        ext("flow_tree_of_thought", 5, Some(5), s24_flow_tot),
+    );
+    interp.register_native_ext(
+        "flow_race",
+        ext("flow_race", 3, Some(3), s24_flow_race),
+    );
+    interp.register_native_ext(
+        "flow_batch",
+        ext("flow_batch", 2, Some(2), s24_flow_batch),
+    );
+
+    // ---- §56.4 difficulty router ----
+    interp.register_native(
+        "flow_estimate_difficulty",
+        n(
+            "flow_estimate_difficulty",
+            1,
+            Some(1),
+            s24_estimate_difficulty,
+        ),
+    );
+    interp.register_native_ext(
+        "flow_route_difficulty",
+        ext(
+            "flow_route_difficulty",
+            4,
+            Some(4),
+            s24_route_difficulty,
+        ),
+    );
+
+    // ---- §49.1 reasoning budgets ----
+    interp.register_native(
+        "reasoning_budget_new",
+        n(
+            "reasoning_budget_new",
+            4,
+            Some(4),
+            s24_reasoning_budget_new,
+        ),
+    );
+    interp.register_native(
+        "reasoning_budget_debit",
+        n(
+            "reasoning_budget_debit",
+            2,
+            Some(2),
+            s24_reasoning_budget_debit,
+        ),
+    );
+    interp.register_native(
+        "reasoning_budget_status",
+        n(
+            "reasoning_budget_status",
+            1,
+            Some(1),
+            s24_reasoning_budget_status,
+        ),
+    );
+
+    // ---- §49.2 ReAct loop driver ----
+    interp.register_native_ext(
+        "plan_react_loop",
+        ext("plan_react_loop", 4, Some(4), s24_plan_react_loop),
+    );
+
+    // ---- §55.1 trajectory eval ----
+    interp.register_native(
+        "eval_trajectory_new",
+        n(
+            "eval_trajectory_new",
+            4,
+            Some(4),
+            s24_traj_new,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_add_step",
+        n(
+            "eval_trajectory_add_step",
+            6,
+            Some(6),
+            s24_traj_add_step,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_set_answer",
+        n(
+            "eval_trajectory_set_answer",
+            2,
+            Some(2),
+            s24_traj_set_answer,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_tool_accuracy",
+        n(
+            "eval_trajectory_tool_accuracy",
+            1,
+            Some(1),
+            s24_traj_tool_accuracy,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_step_efficiency",
+        n(
+            "eval_trajectory_step_efficiency",
+            1,
+            Some(1),
+            s24_traj_step_efficiency,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_recovered",
+        n(
+            "eval_trajectory_recovered",
+            1,
+            Some(1),
+            s24_traj_recovered,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_no_forbidden_tool",
+        n(
+            "eval_trajectory_no_forbidden_tool",
+            1,
+            Some(1),
+            s24_traj_no_forbidden,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_grounded",
+        n(
+            "eval_trajectory_grounded",
+            1,
+            Some(1),
+            s24_traj_grounded,
+        ),
+    );
+    interp.register_native(
+        "eval_trajectory_no_secret_exposed",
+        n(
+            "eval_trajectory_no_secret_exposed",
+            2,
+            Some(2),
+            s24_traj_no_secret,
+        ),
+    );
+
+    // ---- §55.2 redteam ----
+    interp.register_native(
+        "redteam_load",
+        n("redteam_load", 1, Some(1), s24_redteam_load),
+    );
+    interp.register_native(
+        "redteam_refusal_phrases",
+        n(
+            "redteam_refusal_phrases",
+            0,
+            Some(0),
+            s24_redteam_refusal_phrases,
+        ),
+    );
+
+    // ---- §55.3 sim world ----
+    interp.register_native("sim_world_new", n("sim_world_new", 2, Some(2), s24_sim_new));
+    interp.register_native(
+        "sim_world_spawn",
+        n("sim_world_spawn", 2, Some(2), s24_sim_spawn),
+    );
+    interp.register_native(
+        "sim_world_script_send",
+        n("sim_world_script_send", 4, Some(4), s24_sim_script_send),
+    );
+    interp.register_native(
+        "sim_world_script_note",
+        n("sim_world_script_note", 4, Some(4), s24_sim_script_note),
+    );
+    interp.register_native(
+        "sim_world_script_settle",
+        n("sim_world_script_settle", 2, Some(2), s24_sim_script_settle),
+    );
+    interp.register_native(
+        "sim_world_send_to",
+        n("sim_world_send_to", 3, Some(3), s24_sim_send_to),
+    );
+    interp.register_native(
+        "sim_world_advance",
+        n("sim_world_advance", 2, Some(2), s24_sim_advance),
+    );
+    interp.register_native(
+        "sim_world_run_until_settled",
+        n(
+            "sim_world_run_until_settled",
+            4,
+            Some(4),
+            s24_sim_run_until_settled,
+        ),
+    );
+    interp.register_native(
+        "sim_world_events",
+        n("sim_world_events", 1, Some(1), s24_sim_events),
+    );
+    interp.register_native(
+        "sim_world_rand_u64",
+        n("sim_world_rand_u64", 1, Some(1), s24_sim_rand),
+    );
+
+    // ---- §56.1 prefix cache ----
+    interp.register_native(
+        "cost_cache_insert",
+        n("cost_cache_insert", 3, Some(3), s24_cache_insert),
+    );
+    interp.register_native(
+        "cost_cache_lookup",
+        n("cost_cache_lookup", 1, Some(1), s24_cache_lookup),
+    );
+    interp.register_native(
+        "cost_cache_stats",
+        n("cost_cache_stats", 0, Some(0), s24_cache_stats),
+    );
+    interp.register_native(
+        "cost_cache_clear",
+        n("cost_cache_clear", 0, Some(0), s24_cache_clear),
+    );
+}
+
+// --------- helpers ---------
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn b_arg(args: &[Value], idx: usize, fn_name: &str) -> Result<bool, String> {
+    match &args[idx] {
+        Value::Bool(b) => Ok(*b),
+        other => Err(format!(
+            "`{fn_name}` expected a Bool at position {idx}, got `{}`",
+            other.type_name()
+        )),
+    }
+}
+
+fn list_of_strings(v: &Value, fn_name: &str, field: &str) -> Result<Vec<String>, String> {
+    match v {
+        Value::List(l) => l
+            .borrow()
+            .iter()
+            .map(|item| match item {
+                Value::String(s) => Ok(s.as_str().to_string()),
+                other => Err(format!(
+                    "{fn_name}: {field} elements must be String, got `{}`",
+                    other.type_name()
+                )),
+            })
+            .collect(),
+        other => Err(format!(
+            "{fn_name}: {field} must be List<String>, got `{}`",
+            other.type_name()
+        )),
+    }
+}
+
+fn record_to_vec(fields: Vec<(&str, Value)>) -> Value {
+    let v: Vec<(String, Value)> = fields
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    Value::Record(Rc::new(RefCell::new(v)))
+}
+
+fn list_value(items: Vec<Value>) -> Value {
+    Value::List(Rc::new(RefCell::new(items)))
+}
+
+fn ok_err_record(ok: bool, error: &str) -> Value {
+    record_to_vec(vec![
+        ("ok", Value::Bool(ok)),
+        ("error", Value::String(Rc::new(error.to_string()))),
+    ])
+}
+
+// --------- §29.2 networks ---------
+
+fn s24_network_new(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "flow_network_new")?;
+    NETWORKS.with(|c| {
+        c.borrow_mut()
+            .insert(name.as_str().to_string(), axon_flow::Network::new(name.as_str()))
+    });
+    Ok(Value::String(name))
+}
+
+fn s24_network_add_node(args: &[Value]) -> Result<Value, String> {
+    let net = s_arg(args, 0, "flow_network_add_node")?;
+    let node = s_arg(args, 1, "flow_network_add_node")?;
+    NETWORKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let n = map
+            .get_mut(net.as_str())
+            .ok_or_else(|| format!("flow_network_add_node: no network `{}`", net.as_str()))?;
+        n.add_node(node.as_str())
+            .map_err(|e: NetworkError| e.to_string())?;
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_network_add_edge(args: &[Value]) -> Result<Value, String> {
+    let net = s_arg(args, 0, "flow_network_add_edge")?;
+    let from = s_arg(args, 1, "flow_network_add_edge")?;
+    let to = s_arg(args, 2, "flow_network_add_edge")?;
+    let kind_str = s_arg(args, 3, "flow_network_add_edge")?;
+    let kind = match kind_str.as_str() {
+        "oneway" | "one_way" | "->" => axon_flow::EdgeKind::OneWay,
+        "bidi" | "bidirectional" | "<->" => axon_flow::EdgeKind::Bidirectional,
+        other => {
+            return Err(format!(
+                "flow_network_add_edge: kind must be `oneway`|`bidi`, got `{other}`"
+            ));
+        }
+    };
+    NETWORKS.with(|c| {
+        let mut map = c.borrow_mut();
+        let n = map
+            .get_mut(net.as_str())
+            .ok_or_else(|| format!("flow_network_add_edge: no network `{}`", net.as_str()))?;
+        n.add_edge(from.as_str(), to.as_str(), kind);
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_network_verify(args: &[Value]) -> Result<Value, String> {
+    let net = s_arg(args, 0, "flow_network_verify")?;
+    let res = NETWORKS.with(|c| {
+        c.borrow()
+            .get(net.as_str())
+            .map(|n| n.verify())
+            .unwrap_or_else(|| {
+                Err(NetworkError::Empty)
+            })
+    });
+    Ok(match res {
+        Ok(_) => ok_err_record(true, ""),
+        Err(e) => ok_err_record(false, &e.to_string()),
+    })
+}
+
+fn s24_network_unreachable_from(args: &[Value]) -> Result<Value, String> {
+    let net = s_arg(args, 0, "flow_network_unreachable_from")?;
+    let root = s_arg(args, 1, "flow_network_unreachable_from")?;
+    let names: Vec<String> = NETWORKS.with(|c| {
+        c.borrow()
+            .get(net.as_str())
+            .map(|n| n.unreachable_from(root.as_str()))
+            .unwrap_or_default()
+    });
+    Ok(list_value(
+        names.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+// --------- §29.6 graphs ---------
+
+fn s24_graph_new(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "flow_graph_new")?;
+    GRAPHS.with(|c| {
+        c.borrow_mut().insert(
+            name.as_str().to_string(),
+            axon_flow::WorkflowGraph::new(name.as_str()),
+        )
+    });
+    Ok(Value::String(name))
+}
+
+fn s24_graph_add_node(args: &[Value]) -> Result<Value, String> {
+    let g = s_arg(args, 0, "flow_graph_add_node")?;
+    let name = s_arg(args, 1, "flow_graph_add_node")?;
+    let label = s_arg(args, 2, "flow_graph_add_node")?;
+    GRAPHS.with(|c| {
+        let mut map = c.borrow_mut();
+        let gg = map
+            .get_mut(g.as_str())
+            .ok_or_else(|| format!("flow_graph_add_node: no graph `{}`", g.as_str()))?;
+        gg.add_node(name.as_str(), label.as_str())
+            .map_err(|e: GraphError| e.to_string())?;
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_graph_add_edge(args: &[Value]) -> Result<Value, String> {
+    let g = s_arg(args, 0, "flow_graph_add_edge")?;
+    let from = s_arg(args, 1, "flow_graph_add_edge")?;
+    let to = s_arg(args, 2, "flow_graph_add_edge")?;
+    GRAPHS.with(|c| {
+        let mut map = c.borrow_mut();
+        let gg = map
+            .get_mut(g.as_str())
+            .ok_or_else(|| format!("flow_graph_add_edge: no graph `{}`", g.as_str()))?;
+        gg.add_edge(from.as_str(), to.as_str());
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_graph_verify(args: &[Value]) -> Result<Value, String> {
+    let g = s_arg(args, 0, "flow_graph_verify")?;
+    let res = GRAPHS.with(|c| {
+        c.borrow()
+            .get(g.as_str())
+            .map(|gg| gg.verify())
+            .unwrap_or(Err(GraphError::Empty))
+    });
+    Ok(match res {
+        Ok(_) => ok_err_record(true, ""),
+        Err(e) => ok_err_record(false, &e.to_string()),
+    })
+}
+
+fn s24_graph_topo(args: &[Value]) -> Result<Value, String> {
+    let g = s_arg(args, 0, "flow_graph_topo")?;
+    let order = GRAPHS.with(|c| {
+        c.borrow()
+            .get(g.as_str())
+            .map(|gg| gg.topological_order())
+            .unwrap_or_else(|| Ok(Vec::new()))
+    });
+    let order = order.map_err(|e| e.to_string())?;
+    Ok(list_value(
+        order.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+fn s24_graph_roots(args: &[Value]) -> Result<Value, String> {
+    let g = s_arg(args, 0, "flow_graph_roots")?;
+    let r = GRAPHS.with(|c| {
+        c.borrow()
+            .get(g.as_str())
+            .map(|gg| gg.roots())
+            .unwrap_or_default()
+    });
+    Ok(list_value(r.into_iter().map(|s| Value::String(Rc::new(s))).collect()))
+}
+
+fn s24_graph_leaves(args: &[Value]) -> Result<Value, String> {
+    let g = s_arg(args, 0, "flow_graph_leaves")?;
+    let r = GRAPHS.with(|c| {
+        c.borrow()
+            .get(g.as_str())
+            .map(|gg| gg.leaves())
+            .unwrap_or_default()
+    });
+    Ok(list_value(r.into_iter().map(|s| Value::String(Rc::new(s))).collect()))
+}
+
+/// `flow_graph_run(graph_name, node_step_map, initial_value)`
+///
+/// `node_step_map` is a Record mapping node name -> callable.
+/// Each callable receives `(node_name, predecessors_results_record)` and
+/// returns a Value. Nodes are scheduled in topological order; an empty
+/// predecessor record is passed to roots.
+fn s24_graph_run(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let g_name = s_arg(args, 0, "flow_graph_run")?;
+    let step_map = match &args[1] {
+        Value::Record(r) => r.borrow().clone(),
+        other => {
+            return Err(format!(
+                "flow_graph_run: node_step_map must be a Record, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let _initial = args[2].clone();
+
+    let (order, edges) = GRAPHS.with(|c| {
+        let map = c.borrow();
+        let gg = map
+            .get(g_name.as_str())
+            .ok_or_else(|| format!("flow_graph_run: no graph `{}`", g_name.as_str()))?;
+        let order = gg.topological_order().map_err(|e| e.to_string())?;
+        let edges = gg.edges.clone();
+        Ok::<_, String>((order, edges))
+    })?;
+
+    use std::collections::HashMap;
+    let mut results: HashMap<String, Value> = HashMap::new();
+    for node in &order {
+        let step = step_map
+            .iter()
+            .find(|(k, _)| k == node)
+            .map(|(_, v)| v.clone());
+        let Some(step) = step else {
+            return Err(format!(
+                "flow_graph_run: no step provided for node `{node}`"
+            ));
+        };
+        if !is_callable(&step) {
+            return Err(format!(
+                "flow_graph_run: step for `{node}` is not callable"
+            ));
+        }
+        // Build the predecessor results record for this node.
+        let mut preds: Vec<(String, Value)> = Vec::new();
+        for e in &edges {
+            if e.to == *node {
+                if let Some(v) = results.get(&e.from) {
+                    preds.push((e.from.clone(), v.clone()));
+                }
+            }
+        }
+        let pred_rec = Value::Record(Rc::new(RefCell::new(preds)));
+        let call_args = [Value::String(Rc::new(node.clone())), pred_rec];
+        let v = interp
+            .call_value(&step, &call_args, span)
+            .map_err(|e| format!("flow_graph_run[{node}]: {}", eval_signal_msg(&e)))?;
+        results.insert(node.clone(), v);
+    }
+    let final_record: Vec<(String, Value)> = order
+        .into_iter()
+        .filter_map(|n| results.remove(&n).map(|v| (n, v)))
+        .collect();
+    Ok(Value::Record(Rc::new(RefCell::new(final_record))))
+}
+
+// --------- §29.8 / §49.2 combinators ---------
+
+fn s24_flow_debate(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let question = s_arg(args, 0, "flow_debate")?;
+    let pro = args[1].clone();
+    let con = args[2].clone();
+    let judge = args[3].clone();
+    let rounds = i_arg(args, 4, "flow_debate")?.max(0) as usize;
+    for (name, v) in [("pro", &pro), ("con", &con), ("judge", &judge)] {
+        if !is_callable(v) {
+            return Err(format!("flow_debate: `{name}` is not callable"));
+        }
+    }
+    // Build wrappers that delegate to the interpreter — closures over
+    // `interp` aren't safe across the Step trait, so we keep state out.
+    // We implement the loop inline; flow::debate is the reference shape.
+    let mut transcript: Vec<axon_flow::Statement> = Vec::new();
+    for round in 0..rounds {
+        let transcript_v = transcript_to_value(&transcript);
+        let pro_text = interp
+            .call_value(
+                &pro,
+                &[Value::String(Rc::new(question.as_str().to_string())), transcript_v.clone()],
+                span,
+            )
+            .map_err(|e| format!("flow_debate[pro:{round}]: {}", eval_signal_msg(&e)))?;
+        let pro_s = match &pro_text {
+            Value::String(s) => s.as_str().to_string(),
+            _ => format!("{}", pro_text),
+        };
+        transcript.push(axon_flow::Statement {
+            side: axon_flow::Side::Pro,
+            round,
+            text: pro_s,
+        });
+        let transcript_v = transcript_to_value(&transcript);
+        let con_text = interp
+            .call_value(
+                &con,
+                &[Value::String(Rc::new(question.as_str().to_string())), transcript_v],
+                span,
+            )
+            .map_err(|e| format!("flow_debate[con:{round}]: {}", eval_signal_msg(&e)))?;
+        let con_s = match &con_text {
+            Value::String(s) => s.as_str().to_string(),
+            _ => format!("{}", con_text),
+        };
+        transcript.push(axon_flow::Statement {
+            side: axon_flow::Side::Con,
+            round,
+            text: con_s,
+        });
+    }
+    let transcript_v = transcript_to_value(&transcript);
+    let verdict = interp
+        .call_value(
+            &judge,
+            &[Value::String(Rc::new(question.as_str().to_string())), transcript_v.clone()],
+            span,
+        )
+        .map_err(|e| format!("flow_debate[judge]: {}", eval_signal_msg(&e)))?;
+    let verdict_s = match &verdict {
+        Value::String(s) => s.as_str().to_string(),
+        _ => format!("{}", verdict),
+    };
+    Ok(record_to_vec(vec![
+        ("transcript", transcript_v),
+        ("verdict", Value::String(Rc::new(verdict_s))),
+    ]))
+}
+
+fn transcript_to_value(t: &[axon_flow::Statement]) -> Value {
+    let items: Vec<Value> = t
+        .iter()
+        .map(|s| {
+            let side = match s.side {
+                axon_flow::Side::Pro => "pro",
+                axon_flow::Side::Con => "con",
+            };
+            record_to_vec(vec![
+                ("side", Value::String(Rc::new(side.to_string()))),
+                ("round", Value::Int(s.round as i64)),
+                ("text", Value::String(Rc::new(s.text.clone()))),
+            ])
+        })
+        .collect();
+    list_value(items)
+}
+
+fn s24_flow_tot(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let seed = args[0].clone();
+    let expand = args[1].clone();
+    let score = args[2].clone();
+    let width = i_arg(args, 3, "flow_tree_of_thought")?.max(1) as usize;
+    let depth = i_arg(args, 4, "flow_tree_of_thought")?.max(0) as usize;
+    for (name, v) in [("expand", &expand), ("score", &score)] {
+        if !is_callable(v) {
+            return Err(format!("flow_tree_of_thought: `{name}` is not callable"));
+        }
+    }
+    // Run beam search inline since closures over `interp` can't satisfy
+    // the Step trait directly.
+    fn score_call(
+        interp: &mut Interpreter,
+        score: &Value,
+        v: &Value,
+        span: axon_diag::Span,
+    ) -> Result<f64, String> {
+        let r = interp
+            .call_value(score, &[v.clone()], span)
+            .map_err(|e| format!("flow_tree_of_thought[score]: {}", eval_signal_msg(&e)))?;
+        match numeric_value(&r) {
+            Some(f) if f.is_finite() => Ok(f),
+            _ => Ok(f64::NEG_INFINITY),
+        }
+    }
+    let root_score = score_call(interp, &score, &seed, span)?;
+    #[derive(Clone)]
+    struct ST {
+        thought: Value,
+        score: f64,
+        depth: usize,
+    }
+    let mut frontier: Vec<ST> = vec![ST {
+        thought: seed.clone(),
+        score: root_score,
+        depth: 0,
+    }];
+    let mut best = frontier[0].clone();
+    let mut expansions = 0usize;
+    for d in 1..=depth {
+        let mut next: Vec<ST> = Vec::new();
+        for parent in &frontier {
+            let children_v = interp
+                .call_value(
+                    &expand,
+                    &[parent.thought.clone(), Value::Int((d - 1) as i64)],
+                    span,
+                )
+                .map_err(|e| {
+                    format!("flow_tree_of_thought[expand:{d}]: {}", eval_signal_msg(&e))
+                })?;
+            expansions += 1;
+            let children = match children_v {
+                Value::List(l) => l.borrow().clone(),
+                other => {
+                    return Err(format!(
+                        "flow_tree_of_thought: expand must return a List, got `{}`",
+                        other.type_name()
+                    ));
+                }
+            };
+            for child in children {
+                let s = score_call(interp, &score, &child, span)?;
+                let st = ST {
+                    thought: child,
+                    score: s,
+                    depth: d,
+                };
+                if s > best.score {
+                    best = st.clone();
+                }
+                next.push(st);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        next.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        next.truncate(width);
+        frontier = next;
+    }
+    let frontier_v = list_value(
+        frontier
+            .into_iter()
+            .map(|st| {
+                record_to_vec(vec![
+                    ("thought", st.thought),
+                    ("score", Value::Float(st.score)),
+                    ("depth", Value::Int(st.depth as i64)),
+                ])
+            })
+            .collect(),
+    );
+    Ok(record_to_vec(vec![
+        (
+            "best",
+            record_to_vec(vec![
+                ("thought", best.thought),
+                ("score", Value::Float(best.score)),
+                ("depth", Value::Int(best.depth as i64)),
+            ]),
+        ),
+        ("frontier", frontier_v),
+        ("expansions", Value::Int(expansions as i64)),
+    ]))
+}
+
+fn s24_flow_race(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let input = args[0].clone();
+    let cands = callables_arg(args, 1, "flow_race")?;
+    let accept = args[2].clone();
+    if !is_callable(&accept) {
+        return Err("flow_race: accept must be callable".into());
+    }
+    if cands.is_empty() {
+        return Err("flow_race: no candidates".into());
+    }
+    let mut last: Option<(usize, Value)> = None;
+    for (i, c) in cands.iter().enumerate() {
+        if !is_callable(c) {
+            return Err(format!("flow_race: candidate {i} is not callable"));
+        }
+        let r = interp
+            .call_value(c, &[input.clone()], span)
+            .map_err(|e| format!("flow_race[candidate={i}]: {}", eval_signal_msg(&e)))?;
+        let ok = interp
+            .call_value(&accept, &[r.clone()], span)
+            .map_err(|e| format!("flow_race[accept]: {}", eval_signal_msg(&e)))?;
+        let accepted = matches!(ok, Value::Bool(true));
+        if accepted {
+            return Ok(record_to_vec(vec![
+                ("winner_index", Value::Int(i as i64)),
+                ("value", r),
+                ("considered", Value::Int((i + 1) as i64)),
+                ("accepted", Value::Bool(true)),
+            ]));
+        }
+        last = Some((i, r));
+    }
+    let (i, v) = last.unwrap();
+    let considered = cands.len();
+    Ok(record_to_vec(vec![
+        ("winner_index", Value::Int(i as i64)),
+        ("value", v),
+        ("considered", Value::Int(considered as i64)),
+        ("accepted", Value::Bool(false)),
+    ]))
+}
+
+fn s24_flow_batch(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let step = args[0].clone();
+    if !is_callable(&step) {
+        return Err("flow_batch: step must be callable".into());
+    }
+    let inputs = match &args[1] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "flow_batch: inputs must be a List, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(inputs.len());
+    for (i, inp) in inputs.into_iter().enumerate() {
+        let r = interp
+            .call_value(&step, &[inp], span)
+            .map_err(|e| format!("flow_batch[{i}]: {}", eval_signal_msg(&e)))?;
+        out.push(r);
+    }
+    Ok(list_value(out))
+}
+
+// --------- §56.4 difficulty router ---------
+
+fn s24_estimate_difficulty(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "flow_estimate_difficulty")?;
+    let t = DifficultyThresholds::default();
+    let d = axon_flow::estimate_difficulty(prompt.as_str(), &t);
+    let name = match d {
+        axon_flow::Difficulty::Trivial => "trivial",
+        axon_flow::Difficulty::Normal => "normal",
+        axon_flow::Difficulty::Hard => "hard",
+    };
+    Ok(Value::String(Rc::new(name.to_string())))
+}
+
+fn s24_route_difficulty(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "flow_route_difficulty")?;
+    let trivial = args[1].clone();
+    let normal = args[2].clone();
+    let hard = args[3].clone();
+    for (n_, v) in [("trivial", &trivial), ("normal", &normal), ("hard", &hard)] {
+        if !is_callable(v) {
+            return Err(format!("flow_route_difficulty: `{n_}` is not callable"));
+        }
+    }
+    let t = DifficultyThresholds::default();
+    let tier = axon_flow::estimate_difficulty(prompt.as_str(), &t);
+    let (tier_name, step) = match tier {
+        axon_flow::Difficulty::Trivial => ("trivial", &trivial),
+        axon_flow::Difficulty::Normal => ("normal", &normal),
+        axon_flow::Difficulty::Hard => ("hard", &hard),
+    };
+    let v = interp
+        .call_value(step, &[Value::String(prompt)], span)
+        .map_err(|e| format!("flow_route_difficulty[{tier_name}]: {}", eval_signal_msg(&e)))?;
+    Ok(record_to_vec(vec![
+        ("tier", Value::String(Rc::new(tier_name.to_string()))),
+        ("value", v),
+    ]))
+}
+
+// --------- §49.1 reasoning budgets ---------
+
+fn s24_reasoning_budget_new(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "reasoning_budget_new")?;
+    let effort_s = s_arg(args, 1, "reasoning_budget_new")?;
+    let max_thinking = i_arg(args, 2, "reasoning_budget_new")?.max(0) as u64;
+    let expose = b_arg(args, 3, "reasoning_budget_new")?;
+    let effort = match effort_s.as_str() {
+        "low" => axon_runtime::Effort::Low,
+        "medium" => axon_runtime::Effort::Medium,
+        "high" => axon_runtime::Effort::High,
+        "adaptive" => axon_runtime::Effort::Adaptive,
+        other => {
+            return Err(format!(
+                "reasoning_budget_new: effort must be low|medium|high|adaptive, got `{other}`"
+            ));
+        }
+    };
+    REASONING_BUDGETS.with(|c| {
+        c.borrow_mut().insert(
+            id.as_str().to_string(),
+            axon_runtime::ReasoningBudget::new(effort, max_thinking, expose),
+        )
+    });
+    Ok(Value::String(id))
+}
+
+fn s24_reasoning_budget_debit(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "reasoning_budget_debit")?;
+    let tokens = i_arg(args, 1, "reasoning_budget_debit")?.max(0) as u64;
+    let breach = REASONING_BUDGETS.with(|c| {
+        let mut map = c.borrow_mut();
+        let b = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("reasoning_budget_debit: no budget `{}`", id.as_str()))?;
+        Ok::<_, String>(b.debit(tokens))
+    })?;
+    Ok(Value::Bool(breach.is_some()))
+}
+
+fn s24_reasoning_budget_status(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "reasoning_budget_status")?;
+    REASONING_BUDGETS.with(|c| {
+        let map = c.borrow();
+        let b = map
+            .get(id.as_str())
+            .ok_or_else(|| format!("reasoning_budget_status: no budget `{}`", id.as_str()))?;
+        let effort_s = match b.effort {
+            axon_runtime::Effort::Low => "low",
+            axon_runtime::Effort::Medium => "medium",
+            axon_runtime::Effort::High => "high",
+            axon_runtime::Effort::Adaptive => "adaptive",
+        };
+        Ok::<Value, String>(record_to_vec(vec![
+            ("spent", Value::Int(b.spent_thinking_tokens as i64)),
+            ("max", Value::Int(b.max_thinking_tokens as i64)),
+            (
+                "remaining",
+                Value::Int(b.remaining().min(i64::MAX as u64) as i64),
+            ),
+            ("breached", Value::Bool(b.breach().is_some())),
+            ("effort", Value::String(Rc::new(effort_s.to_string()))),
+            ("expose", Value::Bool(b.expose)),
+        ]))
+    })
+}
+
+// --------- §49.2 ReAct loop driver ---------
+
+/// `plan_react_loop(max_steps, think, act, observe)` — typed ReAct driver
+/// implementing think -> act -> observe. `observe(thought, action)` must
+/// return a record `{ observation: String, done: Bool }`. Returns a list
+/// of step records.
+fn s24_plan_react_loop(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let max_steps = i_arg(args, 0, "plan_react_loop")?.max(0) as usize;
+    let think = args[1].clone();
+    let act = args[2].clone();
+    let observe = args[3].clone();
+    for (n_, v) in [("think", &think), ("act", &act), ("observe", &observe)] {
+        if !is_callable(v) {
+            return Err(format!("plan_react_loop: `{n_}` is not callable"));
+        }
+    }
+    let mut log: Vec<Value> = Vec::new();
+    for step in 0..max_steps {
+        let log_v = list_value(log.clone());
+        let thought = interp
+            .call_value(&think, &[log_v.clone()], span)
+            .map_err(|e| format!("plan_react_loop[think:{step}]: {}", eval_signal_msg(&e)))?;
+        let action = interp
+            .call_value(&act, &[thought.clone(), log_v.clone()], span)
+            .map_err(|e| format!("plan_react_loop[act:{step}]: {}", eval_signal_msg(&e)))?;
+        let obs_rec = interp
+            .call_value(&observe, &[thought.clone(), action.clone()], span)
+            .map_err(|e| {
+                format!("plan_react_loop[observe:{step}]: {}", eval_signal_msg(&e))
+            })?;
+        let (obs, done) = match &obs_rec {
+            Value::Record(r) => {
+                let r = r.borrow();
+                let obs = r
+                    .iter()
+                    .find(|(k, _)| k == "observation")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::String(Rc::new(String::new())));
+                let done = r
+                    .iter()
+                    .find(|(k, _)| k == "done")
+                    .map(|(_, v)| matches!(v, Value::Bool(true)))
+                    .unwrap_or(false);
+                (obs, done)
+            }
+            other => {
+                return Err(format!(
+                    "plan_react_loop: observe must return Record{{observation, done}}, got `{}`",
+                    other.type_name()
+                ));
+            }
+        };
+        log.push(record_to_vec(vec![
+            ("step_index", Value::Int(step as i64)),
+            ("thought", thought),
+            ("action", action),
+            ("observation", obs),
+        ]));
+        if done {
+            break;
+        }
+    }
+    Ok(list_value(log))
+}
+
+// --------- §55.1 trajectory eval ---------
+
+fn s24_traj_new(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_new")?;
+    let task = s_arg(args, 1, "eval_trajectory_new")?;
+    let allowed = list_of_strings(&args[2], "eval_trajectory_new", "allowed_tools")?;
+    let forbidden = list_of_strings(&args[3], "eval_trajectory_new", "forbidden_tools")?;
+    TRAJECTORIES.with(|c| {
+        c.borrow_mut().insert(
+            id.as_str().to_string(),
+            traj::Trajectory {
+                task: task.as_str().to_string(),
+                steps: Vec::new(),
+                answer: String::new(),
+                allowed_tools: allowed,
+                forbidden_tools: forbidden,
+                optimal_steps: 0,
+            },
+        )
+    });
+    Ok(Value::String(id))
+}
+
+fn s24_traj_add_step(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_add_step")?;
+    let thought = s_arg(args, 1, "eval_trajectory_add_step")?;
+    let tool_name = s_arg(args, 2, "eval_trajectory_add_step")?;
+    let args_json = s_arg(args, 3, "eval_trajectory_add_step")?;
+    let errored = b_arg(args, 4, "eval_trajectory_add_step")?;
+    let observation = s_arg(args, 5, "eval_trajectory_add_step")?;
+    TRAJECTORIES.with(|c| {
+        let mut map = c.borrow_mut();
+        let t = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("eval_trajectory_add_step: no trajectory `{}`", id.as_str()))?;
+        let tool_call = if tool_name.is_empty() {
+            None
+        } else {
+            Some(traj::ToolCall {
+                name: tool_name.as_str().to_string(),
+                args_json: args_json.as_str().to_string(),
+                errored,
+            })
+        };
+        let idx = t.steps.len();
+        t.steps.push(traj::TrajectoryStep {
+            index: idx,
+            thought: thought.as_str().to_string(),
+            tool_call,
+            observation: observation.as_str().to_string(),
+            error: None,
+        });
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_traj_set_answer(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_set_answer")?;
+    let ans = s_arg(args, 1, "eval_trajectory_set_answer")?;
+    TRAJECTORIES.with(|c| {
+        let mut map = c.borrow_mut();
+        let t = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("eval_trajectory_set_answer: no trajectory `{}`", id.as_str()))?;
+        t.answer = ans.as_str().to_string();
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_traj_tool_accuracy(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_tool_accuracy")?;
+    let v = TRAJECTORIES.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(traj::tool_accuracy)
+            .unwrap_or(0.0)
+    });
+    Ok(Value::Float(v))
+}
+
+fn s24_traj_step_efficiency(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_step_efficiency")?;
+    let v = TRAJECTORIES.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(traj::step_efficiency)
+            .unwrap_or(0.0)
+    });
+    Ok(Value::Float(v))
+}
+
+fn s24_traj_recovered(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_recovered")?;
+    let v = TRAJECTORIES.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(traj::recovered_from_errors)
+            .unwrap_or(false)
+    });
+    Ok(Value::Bool(v))
+}
+
+fn s24_traj_no_forbidden(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_no_forbidden_tool")?;
+    let v = TRAJECTORIES.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(traj::no_forbidden_tool_called)
+            .unwrap_or(true)
+    });
+    Ok(Value::Bool(v))
+}
+
+fn s24_traj_grounded(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_grounded")?;
+    let v = TRAJECTORIES.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(traj::grounded_in_observations)
+            .unwrap_or(1.0)
+    });
+    Ok(Value::Float(v))
+}
+
+fn s24_traj_no_secret(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "eval_trajectory_no_secret_exposed")?;
+    let secrets = list_of_strings(&args[1], "eval_trajectory_no_secret_exposed", "secrets")?;
+    let v = TRAJECTORIES.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(|t| traj::no_secret_exposed(t, &secrets))
+            .unwrap_or(true)
+    });
+    Ok(Value::Bool(v))
+}
+
+// --------- §55.2 redteam ---------
+
+fn s24_redteam_load(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "redteam_load")?;
+    let cases = rt_suite::redteam_suite(name.as_str());
+    let items: Vec<Value> = cases
+        .into_iter()
+        .map(|c| {
+            let cat = match c.category {
+                rt_suite::AttackCategory::PromptInjection => "prompt_injection",
+                rt_suite::AttackCategory::Jailbreak => "jailbreak",
+                rt_suite::AttackCategory::ToolAbuse => "tool_abuse",
+                rt_suite::AttackCategory::Exfiltration => "exfiltration",
+                rt_suite::AttackCategory::PiiTrap => "pii_trap",
+            };
+            let assertion_str = match c.assertion {
+                rt_suite::SafetyAssertion::NoToolCalled { .. } => "no_tool_called",
+                rt_suite::SafetyAssertion::NoSecretExposed => "no_secret_exposed",
+                rt_suite::SafetyAssertion::AnswerOmitsCanary => "answer_omits_canary",
+                rt_suite::SafetyAssertion::Refuses => "refuses",
+            };
+            record_to_vec(vec![
+                ("id", Value::String(Rc::new(c.id))),
+                ("category", Value::String(Rc::new(cat.to_string()))),
+                ("payload", Value::String(Rc::new(c.payload))),
+                (
+                    "watched_tools",
+                    list_value(
+                        c.watched_tools
+                            .into_iter()
+                            .map(|s| Value::String(Rc::new(s)))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "secrets",
+                    list_value(
+                        c.secrets
+                            .into_iter()
+                            .map(|s| Value::String(Rc::new(s)))
+                            .collect(),
+                    ),
+                ),
+                ("assertion", Value::String(Rc::new(assertion_str.to_string()))),
+            ])
+        })
+        .collect();
+    Ok(list_value(items))
+}
+
+fn s24_redteam_refusal_phrases(_args: &[Value]) -> Result<Value, String> {
+    let phrases: Vec<Value> = rt_suite::refusal_phrases()
+        .iter()
+        .map(|p| Value::String(Rc::new((*p).to_string())))
+        .collect();
+    Ok(list_value(phrases))
+}
+
+// --------- §55.3 sim world ---------
+
+fn s24_sim_new(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_new")?;
+    let seed = i_arg(args, 1, "sim_world_new")?;
+    SIM_WORLDS.with(|c| {
+        c.borrow_mut().insert(
+            id.as_str().to_string(),
+            eval_sim::World::new(seed as u64, 0),
+        )
+    });
+    Ok(Value::String(id))
+}
+
+fn s24_sim_spawn(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_spawn")?;
+    let name = s_arg(args, 1, "sim_world_spawn")?;
+    SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_spawn: no world `{}`", id.as_str()))?;
+        w.spawn(name.as_str(), Vec::new());
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_sim_script_send(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_script_send")?;
+    let agent = s_arg(args, 1, "sim_world_script_send")?;
+    let to = s_arg(args, 2, "sim_world_script_send")?;
+    let payload = s_arg(args, 3, "sim_world_script_send")?;
+    SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_script_send: no world `{}`", id.as_str()))?;
+        let a = w
+            .agents
+            .iter_mut()
+            .find(|a| a.name == agent.as_str())
+            .ok_or_else(|| {
+                format!("sim_world_script_send: no agent `{}`", agent.as_str())
+            })?;
+        a.script.push(eval_sim::ScriptedAction::Send {
+            to: to.as_str().to_string(),
+            payload: payload.as_str().to_string(),
+        });
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_sim_script_note(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_script_note")?;
+    let agent = s_arg(args, 1, "sim_world_script_note")?;
+    let kind = s_arg(args, 2, "sim_world_script_note")?;
+    let payload = s_arg(args, 3, "sim_world_script_note")?;
+    SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_script_note: no world `{}`", id.as_str()))?;
+        let a = w
+            .agents
+            .iter_mut()
+            .find(|a| a.name == agent.as_str())
+            .ok_or_else(|| {
+                format!("sim_world_script_note: no agent `{}`", agent.as_str())
+            })?;
+        a.script.push(eval_sim::ScriptedAction::Note {
+            kind: kind.as_str().to_string(),
+            payload: payload.as_str().to_string(),
+        });
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_sim_script_settle(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_script_settle")?;
+    let agent = s_arg(args, 1, "sim_world_script_settle")?;
+    SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_script_settle: no world `{}`", id.as_str()))?;
+        let a = w
+            .agents
+            .iter_mut()
+            .find(|a| a.name == agent.as_str())
+            .ok_or_else(|| {
+                format!("sim_world_script_settle: no agent `{}`", agent.as_str())
+            })?;
+        a.script.push(eval_sim::ScriptedAction::Settle);
+        Ok::<_, String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_sim_send_to(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_send_to")?;
+    let agent = s_arg(args, 1, "sim_world_send_to")?;
+    let payload = s_arg(args, 2, "sim_world_send_to")?;
+    SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_send_to: no world `{}`", id.as_str()))?;
+        w.send_to(agent.as_str(), payload.as_str().to_string())
+    })?;
+    Ok(Value::Unit)
+}
+
+fn s24_sim_advance(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_advance")?;
+    let dt_ns = i_arg(args, 1, "sim_world_advance")?.max(0) as u64;
+    let n = SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_advance: no world `{}`", id.as_str()))?;
+        Ok::<_, String>(w.advance(dt_ns))
+    })?;
+    Ok(Value::Int(n as i64))
+}
+
+fn s24_sim_run_until_settled(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_run_until_settled")?;
+    let agent_name = s_arg(args, 1, "sim_world_run_until_settled")?;
+    let dt_ns = i_arg(args, 2, "sim_world_run_until_settled")?.max(0) as u64;
+    let max_ticks = i_arg(args, 3, "sim_world_run_until_settled")?.max(0) as usize;
+    let hit = SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_run_until_settled: no world `{}`", id.as_str()))?;
+        let target = agent_name.as_str().to_string();
+        Ok::<_, String>(w.run_until(dt_ns, max_ticks, |w| {
+            w.agent_settled(&target)
+        }))
+    })?;
+    Ok(Value::Bool(hit))
+}
+
+fn s24_sim_events(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_events")?;
+    let evts: Vec<Value> = SIM_WORLDS.with(|c| {
+        c.borrow()
+            .get(id.as_str())
+            .map(|w| w.events.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| {
+                record_to_vec(vec![
+                    ("step", Value::Int(e.step as i64)),
+                    ("at_ns", Value::Int(e.at_ns as i64)),
+                    ("agent", Value::String(Rc::new(e.agent))),
+                    ("action", Value::String(Rc::new(e.action))),
+                    ("payload", Value::String(Rc::new(e.payload))),
+                ])
+            })
+            .collect()
+    });
+    Ok(list_value(evts))
+}
+
+fn s24_sim_rand(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "sim_world_rand_u64")?;
+    let v = SIM_WORLDS.with(|c| {
+        let mut map = c.borrow_mut();
+        let w = map
+            .get_mut(id.as_str())
+            .ok_or_else(|| format!("sim_world_rand_u64: no world `{}`", id.as_str()))?;
+        Ok::<_, String>(w.rand_u64())
+    })?;
+    // Mask to i64 range for Axon's Int.
+    Ok(Value::Int((v as i64).wrapping_abs()))
+}
+
+// --------- §56.1 prefix cache ---------
+
+fn s24_cache_insert(args: &[Value]) -> Result<Value, String> {
+    let text = s_arg(args, 0, "cost_cache_insert")?;
+    let tokens = i_arg(args, 1, "cost_cache_insert")?.max(0) as u32;
+    let ttl = i_arg(args, 2, "cost_cache_insert")?.max(0);
+    let key = PREFIX_CACHE.with(|c| c.insert(text.as_str(), tokens, now_ns(), ttl));
+    Ok(Value::String(Rc::new(format!("{:016x}", key.0))))
+}
+
+fn s24_cache_lookup(args: &[Value]) -> Result<Value, String> {
+    let text = s_arg(args, 0, "cost_cache_lookup")?;
+    let r = PREFIX_CACHE.with(|c| c.lookup(text.as_str(), now_ns()));
+    Ok(match r {
+        Some((tokens, hits)) => record_to_vec(vec![
+            ("hit", Value::Bool(true)),
+            ("tokens", Value::Int(tokens as i64)),
+            ("hits", Value::Int(hits as i64)),
+        ]),
+        None => record_to_vec(vec![
+            ("hit", Value::Bool(false)),
+            ("tokens", Value::Int(0)),
+            ("hits", Value::Int(0)),
+        ]),
+    })
+}
+
+fn s24_cache_stats(_args: &[Value]) -> Result<Value, String> {
+    let s = PREFIX_CACHE.with(|c| c.stats());
+    Ok(record_to_vec(vec![
+        ("lookups", Value::Int(s.lookups as i64)),
+        ("hits", Value::Int(s.hits as i64)),
+        ("misses", Value::Int(s.misses as i64)),
+        ("tokens_saved", Value::Int(s.tokens_saved as i64)),
+        ("entries", Value::Int(s.entries as i64)),
+        ("hit_rate", Value::Float(s.hit_rate())),
+    ]))
+}
+
+fn s24_cache_clear(_args: &[Value]) -> Result<Value, String> {
+    PREFIX_CACHE.with(|c| c.clear());
+    Ok(Value::Unit)
+}
+
+// ===========================================================================
+// Stage 25 — context policy (§27.3), saga (§52), durable timers (§52.2),
+// RAG grounding (§50.2/50.3), media generation (§51.2/51.3), skill_use
+// (§53), agent-card auto-publish (§54.1), /metrics + serverless render
+// (§41). C ABI (§35.4) is a separate cdylib + axvm.h header.
+// ===========================================================================
+
+use axon_a2a::auto_publish as a2a_auto;
+use axon_deploy::{metrics::MetricsRegistry, serverless as svless};
+use axon_flow::{run_saga as flow_run_saga, SagaStep, StepState};
+use axon_media::generate as media_gen;
+use axon_rag::grounding as rag_ground;
+use axon_runtime::context_policy as ctx;
+use axon_skill::use_skill as sk_use;
+use axon_trigger::durable_timer as dtimer;
+
+thread_local! {
+    static TIMER_TABLE: RefCell<dtimer::DurableTimerTable> =
+        RefCell::new(dtimer::DurableTimerTable::new());
+    static METRICS: std::sync::Arc<MetricsRegistry> = MetricsRegistry::new();
+    static MEDIA_PROVIDER: RefCell<Box<dyn media_gen::MediaProvider + Send>> =
+        RefCell::new(Box::new(media_gen::MockProvider::new("default")));
+}
+
+fn install_stage25(interp: &Interpreter) {
+    // ---- §27.3 context policy ----
+    interp.register_native(
+        "context_policy_plan",
+        n("context_policy_plan", 2, Some(2), s25_ctx_plan),
+    );
+
+    // ---- §52 saga ----
+    interp.register_native_ext(
+        "flow_saga_run",
+        ext("flow_saga_run", 3, Some(3), s25_saga_run),
+    );
+
+    // ---- §52.2 durable timers ----
+    interp.register_native(
+        "timer_arm",
+        n("timer_arm", 4, Some(4), s25_timer_arm),
+    );
+    interp.register_native(
+        "timer_cancel",
+        n("timer_cancel", 1, Some(1), s25_timer_cancel),
+    );
+    interp.register_native(
+        "timer_due",
+        n("timer_due", 1, Some(1), s25_timer_due),
+    );
+    interp.register_native(
+        "timer_mark_fired",
+        n("timer_mark_fired", 1, Some(1), s25_timer_mark_fired),
+    );
+    interp.register_native(
+        "timer_pending_count",
+        n("timer_pending_count", 0, Some(0), s25_timer_pending_count),
+    );
+    interp.register_native(
+        "timer_save",
+        n("timer_save", 1, Some(1), s25_timer_save),
+    );
+    interp.register_native(
+        "timer_load",
+        n("timer_load", 1, Some(1), s25_timer_load),
+    );
+
+    // ---- §50.2 / §50.3 RAG grounding ----
+    interp.register_native(
+        "rag_assess_grounding",
+        n("rag_assess_grounding", 4, Some(4), s25_rag_assess),
+    );
+
+    // ---- §51.2 / §51.3 media generation ----
+    interp.register_native(
+        "media_generate_image",
+        n("media_generate_image", 6, Some(6), s25_media_image),
+    );
+    interp.register_native(
+        "media_generate_audio",
+        n("media_generate_audio", 5, Some(5), s25_media_audio),
+    );
+
+    // ---- §53 skill use ----
+    interp.register_native(
+        "skill_bind",
+        n("skill_bind", 3, Some(3), s25_skill_bind),
+    );
+    interp.register_native(
+        "skill_narrow_effects",
+        n("skill_narrow_effects", 2, Some(2), s25_skill_narrow),
+    );
+
+    // ---- §54.1 agent-card auto publish ----
+    interp.register_native(
+        "agent_card_derive",
+        n("agent_card_derive", 2, Some(2), s25_card_derive),
+    );
+    interp.register_native(
+        "agent_card_well_known_path",
+        n(
+            "agent_card_well_known_path",
+            0,
+            Some(0),
+            s25_well_known_path,
+        ),
+    );
+
+    // ---- §41 metrics + serverless ----
+    interp.register_native(
+        "metrics_record",
+        n("metrics_record", 4, Some(4), s25_metrics_record),
+    );
+    interp.register_native(
+        "metrics_render_prometheus",
+        n(
+            "metrics_render_prometheus",
+            0,
+            Some(0),
+            s25_metrics_render,
+        ),
+    );
+    interp.register_native(
+        "serverless_render",
+        n("serverless_render", 3, Some(3), s25_serverless_render),
+    );
+}
+
+// --------- §27.3 ---------
+
+fn s25_ctx_plan(args: &[Value]) -> Result<Value, String> {
+    // Args: (policy_record, messages_list)
+    let policy_json = value_to_json(&args[0]);
+    let policy: ctx::ContextPolicy = serde_json::from_value(policy_json)
+        .map_err(|e| format!("context_policy_plan: bad policy: {e}"))?;
+    let msgs_v = match &args[1] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "context_policy_plan: messages must be a List, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut messages: Vec<ctx::Message> = Vec::with_capacity(msgs_v.len());
+    for (i, m) in msgs_v.into_iter().enumerate() {
+        let m_json = value_to_json(&m);
+        let mut msg: ctx::Message = serde_json::from_value(m_json)
+            .map_err(|e| format!("context_policy_plan: msg #{i}: {e}"))?;
+        if msg.tokens == 0 {
+            msg.tokens = ctx::estimate_tokens(&msg.text);
+        }
+        if msg.seq == 0 {
+            msg.seq = i as u64;
+        }
+        messages.push(msg);
+    }
+    let outcome = policy
+        .plan(&messages)
+        .map_err(|e| format!("context_policy_plan: {e}"))?;
+    let j = serde_json::to_value(&outcome)
+        .map_err(|e| format!("context_policy_plan: encode: {e}"))?;
+    Ok(json_to_value(&j))
+}
+
+// --------- §52 saga ---------
+
+fn s25_saga_run(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let input = args[0].clone();
+    let names = list_of_strings(&args[1], "flow_saga_run", "step names")?;
+    let actions = match &args[2] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "flow_saga_run: actions must be a List of records, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    if names.len() != actions.len() {
+        return Err(format!(
+            "flow_saga_run: {} names vs {} actions",
+            names.len(),
+            actions.len()
+        ));
+    }
+
+    // Walk forward; on failure, walk compensations in reverse.
+    #[derive(Clone)]
+    struct StepLog {
+        name: String,
+        state: StepState,
+        message: String,
+    }
+    let mut trail: Vec<StepLog> = names
+        .iter()
+        .map(|n| StepLog {
+            name: n.clone(),
+            state: StepState::Skipped,
+            message: String::new(),
+        })
+        .collect();
+
+    // Each entry is a record `{ action: fn, compensate: fn|nil }`.
+    let parsed: Vec<(Value, Option<Value>)> = actions
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| match v {
+            Value::Record(r) => {
+                let r = r.borrow();
+                let action = r
+                    .iter()
+                    .find(|(k, _)| k == "action")
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| {
+                        format!("flow_saga_run: actions[{i}] missing `action`")
+                    })?;
+                let comp = r
+                    .iter()
+                    .find(|(k, _)| k == "compensate")
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| !matches!(v, Value::Nil | Value::Unit));
+                Ok::<_, String>((action, comp))
+            }
+            other => Err(format!(
+                "flow_saga_run: actions[{i}] must be a record, got `{}`",
+                other.type_name()
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut succeeded: Vec<(usize, Value)> = Vec::new();
+    let mut failed_at: Option<usize> = None;
+    for (i, (action, _comp)) in parsed.iter().enumerate() {
+        if !is_callable(action) {
+            return Err(format!("flow_saga_run: actions[{i}].action not callable"));
+        }
+        match interp.call_value(action, &[input.clone()], span) {
+            Ok(v) => {
+                trail[i].state = StepState::Succeeded;
+                succeeded.push((i, v));
+            }
+            Err(sig) => {
+                trail[i].state = StepState::Failed;
+                trail[i].message = eval_signal_msg(&sig);
+                failed_at = Some(i);
+                break;
+            }
+        }
+    }
+
+    let mut status = "committed";
+    let mut any_comp_failed = false;
+    if let Some(_fail_idx) = failed_at {
+        status = "compensated";
+        for (i, value) in succeeded.into_iter().rev() {
+            let Some(comp) = parsed[i].1.clone() else {
+                continue;
+            };
+            if !is_callable(&comp) {
+                return Err(format!(
+                    "flow_saga_run: actions[{i}].compensate not callable"
+                ));
+            }
+            match interp.call_value(&comp, &[value], span) {
+                Ok(_) => trail[i].state = StepState::Compensated,
+                Err(sig) => {
+                    any_comp_failed = true;
+                    trail[i].state = StepState::CompensationFailed;
+                    trail[i].message = eval_signal_msg(&sig);
+                }
+            }
+        }
+        if any_comp_failed {
+            status = "aborted";
+        }
+    }
+
+    let trail_v = list_value(
+        trail
+            .into_iter()
+            .map(|r| {
+                let state_s = match r.state {
+                    StepState::Succeeded => "succeeded",
+                    StepState::Failed => "failed",
+                    StepState::Compensated => "compensated",
+                    StepState::CompensationFailed => "compensation_failed",
+                    StepState::Skipped => "skipped",
+                };
+                record_to_vec(vec![
+                    ("name", Value::String(Rc::new(r.name))),
+                    ("state", Value::String(Rc::new(state_s.to_string()))),
+                    ("message", Value::String(Rc::new(r.message))),
+                ])
+            })
+            .collect(),
+    );
+    Ok(record_to_vec(vec![
+        ("status", Value::String(Rc::new(status.to_string()))),
+        ("trail", trail_v),
+    ]))
+}
+
+// Keep flow_run_saga / SagaStep referenced (and silence warnings) so the
+// Rust API stays exposed for callers that link the crate directly.
+#[allow(dead_code)]
+fn _saga_keep_alive() {
+    let act = |_: i64| Ok::<_, axon_flow::FlowError>(1i64);
+    let comp = |_: i64| Ok::<_, axon_flow::FlowError>(());
+    let steps = vec![SagaStep::new("x", &act).with_compensation(&comp)];
+    let _ = flow_run_saga(0i64, steps);
+}
+
+// --------- §52.2 durable timers ---------
+
+fn s25_timer_arm(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "timer_arm")?;
+    let name = s_arg(args, 1, "timer_arm")?;
+    let deadline_ns = i_arg(args, 2, "timer_arm")?;
+    let payload = s_arg(args, 3, "timer_arm")?;
+    let armed_ns = now_ns();
+    TIMER_TABLE.with(|c| {
+        c.borrow_mut().arm(dtimer::DurableTimer {
+            id: id.as_str().to_string(),
+            name: name.as_str().to_string(),
+            deadline_ns,
+            armed_ns,
+            fired: false,
+            cancelled: false,
+            payload: payload.as_str().to_string(),
+        })
+    })?;
+    Ok(Value::String(id))
+}
+
+fn s25_timer_cancel(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "timer_cancel")?;
+    let cancelled = TIMER_TABLE.with(|c| c.borrow_mut().cancel(id.as_str()));
+    Ok(Value::Bool(cancelled))
+}
+
+fn s25_timer_due(args: &[Value]) -> Result<Value, String> {
+    let now = i_arg(args, 0, "timer_due")?;
+    let ids = TIMER_TABLE.with(|c| c.borrow().due(now));
+    Ok(list_value(
+        ids.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+fn s25_timer_mark_fired(args: &[Value]) -> Result<Value, String> {
+    let id = s_arg(args, 0, "timer_mark_fired")?;
+    let ok = TIMER_TABLE.with(|c| c.borrow_mut().mark_fired(id.as_str()));
+    Ok(Value::Bool(ok))
+}
+
+fn s25_timer_pending_count(_args: &[Value]) -> Result<Value, String> {
+    let n = TIMER_TABLE.with(|c| c.borrow().pending_count());
+    Ok(Value::Int(n as i64))
+}
+
+fn s25_timer_save(args: &[Value]) -> Result<Value, String> {
+    let path = s_arg(args, 0, "timer_save")?;
+    let bytes = TIMER_TABLE.with(|c| serde_json::to_vec_pretty(&*c.borrow()))
+        .map_err(|e| format!("timer_save: encode: {e}"))?;
+    std::fs::write(path.as_str(), bytes)
+        .map_err(|e| format!("timer_save: write `{}`: {e}", path.as_str()))?;
+    Ok(Value::Unit)
+}
+
+fn s25_timer_load(args: &[Value]) -> Result<Value, String> {
+    let path = s_arg(args, 0, "timer_load")?;
+    let bytes = std::fs::read(path.as_str())
+        .map_err(|e| format!("timer_load: read `{}`: {e}", path.as_str()))?;
+    let tbl: dtimer::DurableTimerTable = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("timer_load: parse: {e}"))?;
+    TIMER_TABLE.with(|c| *c.borrow_mut() = tbl);
+    let n = TIMER_TABLE.with(|c| c.borrow().pending_count());
+    Ok(Value::Int(n as i64))
+}
+
+// --------- §50.2 / §50.3 RAG grounding ---------
+
+fn s25_rag_assess(args: &[Value]) -> Result<Value, String> {
+    let answer = s_arg(args, 0, "rag_assess_grounding")?;
+    let passages = match &args[1] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "rag_assess_grounding: passages must be a List, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let citations = match &args[2] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "rag_assess_grounding: citations must be a List, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let cfg_v = value_to_json(&args[3]);
+    let cfg: rag_ground::GroundingConfig =
+        serde_json::from_value(cfg_v).unwrap_or_default();
+
+    let ps: Vec<rag_ground::CitationPassage> = passages
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let j = value_to_json(&v);
+            serde_json::from_value(j)
+                .map_err(|e| format!("rag_assess_grounding: passages[{i}]: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let cs: Vec<rag_ground::Citation> = citations
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let j = value_to_json(&v);
+            serde_json::from_value(j)
+                .map_err(|e| format!("rag_assess_grounding: citations[{i}]: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let report = rag_ground::assess_grounding(answer.as_str(), &ps, &cs, &cfg);
+    let j = serde_json::to_value(&report)
+        .map_err(|e| format!("rag_assess_grounding: encode: {e}"))?;
+    Ok(json_to_value(&j))
+}
+
+// --------- §51.2 / §51.3 media generation ---------
+
+fn s25_media_image(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "media_generate_image")?;
+    let width = i_arg(args, 1, "media_generate_image")?.max(0) as u32;
+    let height = i_arg(args, 2, "media_generate_image")?.max(0) as u32;
+    let format_s = s_arg(args, 3, "media_generate_image")?;
+    let seed = i_arg(args, 4, "media_generate_image")?.max(0) as u64;
+    let n = i_arg(args, 5, "media_generate_image")?.max(1) as u32;
+    let format = match format_s.as_str() {
+        "png" => media_gen::GenImageFormat::Png,
+        "jpeg" | "jpg" => media_gen::GenImageFormat::Jpeg,
+        "webp" => media_gen::GenImageFormat::Webp,
+        other => {
+            return Err(format!(
+                "media_generate_image: unsupported format `{other}`"
+            ));
+        }
+    };
+    let req = media_gen::GenerateImageRequest {
+        prompt: prompt.as_str().to_string(),
+        width,
+        height,
+        format,
+        negative_prompt: String::new(),
+        seed,
+        n,
+    };
+    let out = MEDIA_PROVIDER
+        .with(|cell| cell.borrow().generate_image(&req))
+        .map_err(|e| format!("media_generate_image: {e}"))?;
+    let images: Vec<Value> = out
+        .into_iter()
+        .map(|g| {
+            let fmt_s = match g.format {
+                media_gen::GenImageFormat::Png => "png",
+                media_gen::GenImageFormat::Jpeg => "jpeg",
+                media_gen::GenImageFormat::Webp => "webp",
+            };
+            record_to_vec(vec![
+                ("bytes_len", Value::Int(g.bytes.len() as i64)),
+                ("format", Value::String(Rc::new(fmt_s.to_string()))),
+                ("width", Value::Int(g.width as i64)),
+                ("height", Value::Int(g.height as i64)),
+                ("provider_id", Value::String(Rc::new(g.provider_id))),
+            ])
+        })
+        .collect();
+    Ok(list_value(images))
+}
+
+fn s25_media_audio(args: &[Value]) -> Result<Value, String> {
+    let prompt = s_arg(args, 0, "media_generate_audio")?;
+    let voice = s_arg(args, 1, "media_generate_audio")?;
+    let sample_rate = i_arg(args, 2, "media_generate_audio")?.max(0) as u32;
+    let format_s = s_arg(args, 3, "media_generate_audio")?;
+    let seed = i_arg(args, 4, "media_generate_audio")?.max(0) as u64;
+    let format = match format_s.as_str() {
+        "mp3" => media_gen::GenAudioFormat::Mp3,
+        "wav" => media_gen::GenAudioFormat::Wav,
+        "flac" => media_gen::GenAudioFormat::Flac,
+        "opus" => media_gen::GenAudioFormat::Opus,
+        other => {
+            return Err(format!(
+                "media_generate_audio: unsupported format `{other}`"
+            ));
+        }
+    };
+    let req = media_gen::GenerateAudioRequest {
+        prompt: prompt.as_str().to_string(),
+        voice: voice.as_str().to_string(),
+        sample_rate,
+        format,
+        max_duration_secs: 0,
+        seed,
+    };
+    let out = MEDIA_PROVIDER
+        .with(|cell| cell.borrow().generate_audio(&req))
+        .map_err(|e| format!("media_generate_audio: {e}"))?;
+    let fmt_s = match out.format {
+        media_gen::GenAudioFormat::Mp3 => "mp3",
+        media_gen::GenAudioFormat::Wav => "wav",
+        media_gen::GenAudioFormat::Flac => "flac",
+        media_gen::GenAudioFormat::Opus => "opus",
+    };
+    Ok(record_to_vec(vec![
+        ("bytes_len", Value::Int(out.bytes.len() as i64)),
+        ("format", Value::String(Rc::new(fmt_s.to_string()))),
+        ("sample_rate", Value::Int(out.sample_rate as i64)),
+        ("duration_ms", Value::Int(out.duration_ms as i64)),
+        ("provider_id", Value::String(Rc::new(out.provider_id))),
+    ]))
+}
+
+// --------- §53 skill use ---------
+
+fn s25_skill_bind(args: &[Value]) -> Result<Value, String> {
+    let manifest_json = s_arg(args, 0, "skill_bind")?;
+    let caller_caps = list_of_strings(&args[1], "skill_bind", "caller_caps")?;
+    let alias_v = s_arg(args, 2, "skill_bind")?;
+    let alias = if alias_v.is_empty() { None } else { Some(alias_v.as_str()) };
+    let manifest: axon_skill::Manifest = serde_json::from_str(manifest_json.as_str())
+        .map_err(|e| format!("skill_bind: bad manifest json: {e}"))?;
+    let binding = sk_use::bind_skill(&manifest, caller_caps, alias);
+    let j = serde_json::to_value(&binding)
+        .map_err(|e| format!("skill_bind: encode: {e}"))?;
+    let mut record = json_to_value(&j);
+    if let Value::Record(r) = &record {
+        let mut fields = r.borrow().clone();
+        if let Some(msg) = sk_use::explain_missing(&binding) {
+            fields.push(("error".to_string(), Value::String(Rc::new(msg))));
+        } else {
+            fields.push(("error".to_string(), Value::String(Rc::new(String::new()))));
+        }
+        record = Value::Record(Rc::new(RefCell::new(fields)));
+    }
+    Ok(record)
+}
+
+fn s25_skill_narrow(args: &[Value]) -> Result<Value, String> {
+    let callee = list_of_strings(&args[0], "skill_narrow_effects", "callee")?;
+    let caller = list_of_strings(&args[1], "skill_narrow_effects", "caller")?;
+    let callee_set: std::collections::BTreeSet<String> = callee.into_iter().collect();
+    let caller_set: std::collections::BTreeSet<String> = caller.into_iter().collect();
+    let narrowed = sk_use::narrow_effects(&callee_set, &caller_set);
+    Ok(list_value(
+        narrowed
+            .into_iter()
+            .map(|s| Value::String(Rc::new(s)))
+            .collect(),
+    ))
+}
+
+// --------- §54.1 agent-card auto publish ---------
+
+fn s25_card_derive(args: &[Value]) -> Result<Value, String> {
+    let summary_json = s_arg(args, 0, "agent_card_derive")?;
+    let base_url = s_arg(args, 1, "agent_card_derive")?;
+    let summary: a2a_auto::AgentSummary = serde_json::from_str(summary_json.as_str())
+        .map_err(|e| format!("agent_card_derive: bad summary json: {e}"))?;
+    let card = a2a_auto::derive_agent_card(&summary, base_url.as_str());
+    card.verify().map_err(|e| format!("agent_card_derive: {e}"))?;
+    let body = a2a_auto::render_well_known(&card)
+        .map_err(|e| format!("agent_card_derive: {e}"))?;
+    let json_str = String::from_utf8(body).map_err(|e| format!("agent_card_derive: {e}"))?;
+    Ok(Value::String(Rc::new(json_str)))
+}
+
+fn s25_well_known_path(_args: &[Value]) -> Result<Value, String> {
+    Ok(Value::String(Rc::new(
+        axon_a2a::WELL_KNOWN_PATH.to_string(),
+    )))
+}
+
+// --------- §41 metrics + serverless ---------
+
+fn s25_metrics_record(args: &[Value]) -> Result<Value, String> {
+    let status = i_arg(args, 0, "metrics_record")?.max(0) as u16;
+    let body_in = i_arg(args, 1, "metrics_record")?.max(0) as u64;
+    let body_out = i_arg(args, 2, "metrics_record")?.max(0) as u64;
+    let dur_us = i_arg(args, 3, "metrics_record")?.max(0) as u64;
+    METRICS.with(|m| m.record_request(status, body_in, body_out, dur_us));
+    Ok(Value::Unit)
+}
+
+fn s25_metrics_render(_args: &[Value]) -> Result<Value, String> {
+    let body = METRICS.with(|m| m.render_prometheus());
+    Ok(Value::String(Rc::new(body)))
+}
+
+fn s25_serverless_render(args: &[Value]) -> Result<Value, String> {
+    let target_s = s_arg(args, 0, "serverless_render")?;
+    let handler = s_arg(args, 1, "serverless_render")?;
+    let skill = s_arg(args, 2, "serverless_render")?;
+    let target = svless::ServerlessTarget::from_attribute(target_s.as_str())
+        .ok_or_else(|| {
+            format!(
+                "serverless_render: unknown target `{}` — expected lambda|gcp_function|cf_worker",
+                target_s.as_str()
+            )
+        })?;
+    let tramp = svless::ServerlessTrampoline::new(target, handler.as_str().to_string());
+    let body = match target {
+        svless::ServerlessTarget::Lambda => svless::render_lambda_yaml(&tramp, skill.as_str()),
+        svless::ServerlessTarget::GcpFunction => {
+            svless::render_gcp_function_yaml(&tramp, skill.as_str())
+        }
+        svless::ServerlessTarget::CfWorker => {
+            svless::render_cf_worker_toml(&tramp, skill.as_str())
+        }
+    };
+    Ok(Value::String(Rc::new(body)))
+}
+
+// ===========================================================================
+// Stage 26 — features (§7.1), MCP (§25.5), deterministic helpers (§39.2).
+// ===========================================================================
+
+use axon_project::mcp as proj_mcp;
+
+thread_local! {
+    static MCP_REGISTRY: RefCell<proj_mcp::McpRegistry> =
+        RefCell::new(proj_mcp::McpRegistry::default());
+}
+
+fn install_stage26(interp: &Interpreter) {
+    // ---- §39.2 deterministic helpers ----
+    interp.register_native(
+        "clock_freeze",
+        n("clock_freeze", 1, Some(1), s26_clock_freeze),
+    );
+    interp.register_native(
+        "clock_unfreeze",
+        n("clock_unfreeze", 0, Some(0), s26_clock_unfreeze),
+    );
+    interp.register_native(
+        "rand_seed",
+        n("rand_seed", 1, Some(1), s26_rand_seed),
+    );
+
+    // ---- §25.5 MCP registry ----
+    interp.register_native(
+        "mcp_load_from_toml",
+        n("mcp_load_from_toml", 1, Some(1), s26_mcp_load),
+    );
+    interp.register_native(
+        "mcp_list_tools",
+        n("mcp_list_tools", 1, Some(1), s26_mcp_list_tools),
+    );
+    interp.register_native(
+        "mcp_call_tool",
+        n("mcp_call_tool", 3, Some(3), s26_mcp_call_tool),
+    );
+    interp.register_native(
+        "mcp_namespaces",
+        n("mcp_namespaces", 0, Some(0), s26_mcp_namespaces),
+    );
+    interp.register_native(
+        "mcp_deferred_namespaces",
+        n(
+            "mcp_deferred_namespaces",
+            0,
+            Some(0),
+            s26_mcp_deferred,
+        ),
+    );
+
+    // ---- §7.1 feature introspection ----
+    interp.register_native(
+        "features_active",
+        n("features_active", 0, Some(0), s26_features_active),
+    );
+}
+
+// --------- §39.2 deterministic helpers ---------
+
+fn s26_clock_freeze(args: &[Value]) -> Result<Value, String> {
+    let ns = i_arg(args, 0, "clock_freeze")?;
+    axon_runtime::builtin::set_frozen_clock(Some(ns));
+    Ok(Value::Unit)
+}
+
+fn s26_clock_unfreeze(_args: &[Value]) -> Result<Value, String> {
+    axon_runtime::builtin::set_frozen_clock(None);
+    Ok(Value::Unit)
+}
+
+fn s26_rand_seed(args: &[Value]) -> Result<Value, String> {
+    let seed = i_arg(args, 0, "rand_seed")?;
+    axon_runtime::builtin::set_rng_seed(seed as u64);
+    Ok(Value::Unit)
+}
+
+// --------- §25.5 MCP ---------
+
+fn s26_mcp_load(args: &[Value]) -> Result<Value, String> {
+    let path = s_arg(args, 0, "mcp_load_from_toml")?;
+    let text = std::fs::read_to_string(path.as_str())
+        .map_err(|e| format!("mcp_load_from_toml: read `{}`: {e}", path.as_str()))?;
+    let manifest = axon_project::Manifest::parse(&text)
+        .map_err(|e| format!("mcp_load_from_toml: {e}"))?;
+    let registry = proj_mcp::McpRegistry::from_hashmap(&manifest.tools);
+    let n_loaded = registry.tools.len() as i64;
+    MCP_REGISTRY.with(|c| *c.borrow_mut() = registry);
+    Ok(Value::Int(n_loaded))
+}
+
+fn s26_mcp_list_tools(args: &[Value]) -> Result<Value, String> {
+    let namespace = s_arg(args, 0, "mcp_list_tools")?;
+    let tools = MCP_REGISTRY.with(|c| {
+        c.borrow()
+            .tools_in(namespace.as_str())
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let items: Vec<Value> = tools
+        .into_iter()
+        .map(|t| {
+            record_to_vec(vec![
+                ("namespace", Value::String(Rc::new(t.namespace))),
+                ("name", Value::String(Rc::new(t.name))),
+                ("description", Value::String(Rc::new(t.description))),
+                ("input_schema", Value::String(Rc::new(t.input_schema))),
+                ("provider", Value::String(Rc::new(t.provider))),
+            ])
+        })
+        .collect();
+    Ok(list_value(items))
+}
+
+fn s26_mcp_call_tool(args: &[Value]) -> Result<Value, String> {
+    let namespace = s_arg(args, 0, "mcp_call_tool")?;
+    let name = s_arg(args, 1, "mcp_call_tool")?;
+    let args_json = s_arg(args, 2, "mcp_call_tool")?;
+    let result = MCP_REGISTRY.with(|c| {
+        let reg = c.borrow();
+        let client = proj_mcp::StaticMcpClient {
+            registry: reg.clone(),
+            namespace: namespace.as_str().to_string(),
+        };
+        proj_mcp::McpClient::call_tool(&client, name.as_str(), args_json.as_str())
+    });
+    match result {
+        Ok(body) => Ok(record_to_vec(vec![
+            ("ok", Value::Bool(true)),
+            ("body", Value::String(Rc::new(body))),
+            ("error", Value::String(Rc::new(String::new()))),
+        ])),
+        Err(e) => Ok(record_to_vec(vec![
+            ("ok", Value::Bool(false)),
+            ("body", Value::String(Rc::new(String::new()))),
+            ("error", Value::String(Rc::new(e))),
+        ])),
+    }
+}
+
+fn s26_mcp_namespaces(_args: &[Value]) -> Result<Value, String> {
+    let mut seen: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    MCP_REGISTRY.with(|c| {
+        for t in &c.borrow().tools {
+            seen.insert(t.namespace.clone());
+        }
+    });
+    Ok(list_value(
+        seen.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+fn s26_mcp_deferred(_args: &[Value]) -> Result<Value, String> {
+    let deferred = MCP_REGISTRY.with(|c| c.borrow().deferred_namespaces.clone());
+    Ok(list_value(
+        deferred
+            .into_iter()
+            .map(|s| Value::String(Rc::new(s)))
+            .collect(),
+    ))
+}
+
+// --------- §7.1 feature introspection ---------
+//
+// The active set is exposed via `features_active()` so programs can
+// conditionally branch at runtime in addition to the static
+// `#[cfg(feature = "X")]` gate. The host populates a thread-local from
+// the CLI's `--features` flag before running.
+
+thread_local! {
+    static ACTIVE_FEATURES: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+pub fn set_active_features(features: Vec<String>) {
+    ACTIVE_FEATURES.with(|c| *c.borrow_mut() = features);
+}
+
+fn s26_features_active(_args: &[Value]) -> Result<Value, String> {
+    let active = ACTIVE_FEATURES.with(|c| c.borrow().clone());
+    Ok(list_value(
+        active.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+

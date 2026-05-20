@@ -1,0 +1,18 @@
+[package]
+name = "axon-vm-cabi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI for embedding AxVM in host applications (§35.4)."
+
+[lib]
+name = "axvm"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+axon-vm     = { workspace = true }
+axon-ast    = { workspace = true }
+axon-parser = { workspace = true }
+axon-tyck   = { workspace = true }
+axon-diag   = { workspace = true }
+serde_json  = { workspace = true }

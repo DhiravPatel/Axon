@@ -24,6 +24,7 @@ use crate::value::Value;
 
 /// Result of compiling a [`Program`]: every top-level function chunk plus a
 /// flat list of every global name the program touches.
+#[derive(Clone)]
 pub struct CompiledProgram {
     /// All compiled function chunks. Each named item is one entry.
     pub functions: Vec<std::rc::Rc<Function>>,

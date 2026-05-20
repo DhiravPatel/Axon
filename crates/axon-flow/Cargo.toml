@@ -3,4 +3,8 @@ name = "axon-flow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Axon orchestration & reasoning combinators: Step trait, sequential/parallel/refine patterns."
+description = "Axon orchestration & reasoning combinators: sequential/parallel/refine + debate/ToT/race/batch + network/graph topology + planning strategies."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

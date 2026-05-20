@@ -105,6 +105,57 @@ impl<'a> Checker<'a> {
             // ---- Stage 23 dynamic-library FFI + delegated identity ----
             "ffi_dlib_call",
             "a2a_sign_delegation", "a2a_verify_delegation",
+            // ---- Stage 24 §29 networks + workflow graphs ----
+            "flow_network_new", "flow_network_add_node", "flow_network_add_edge",
+            "flow_network_verify", "flow_network_unreachable_from",
+            "flow_graph_new", "flow_graph_add_node", "flow_graph_add_edge",
+            "flow_graph_verify", "flow_graph_topo", "flow_graph_roots", "flow_graph_leaves",
+            "flow_graph_run",
+            // ---- Stage 24 §29.8 / §49.2 / §56.3 / §56.4 combinators ----
+            "flow_debate", "flow_tree_of_thought", "flow_race", "flow_batch",
+            "flow_estimate_difficulty", "flow_route_difficulty",
+            // ---- Stage 24 §49.1 reasoning budgets ----
+            "reasoning_budget_new", "reasoning_budget_debit", "reasoning_budget_status",
+            // ---- Stage 24 §49.2 plan loop drivers ----
+            "plan_react_loop",
+            // ---- Stage 24 §55.1 trajectory eval ----
+            "eval_trajectory_new", "eval_trajectory_add_step", "eval_trajectory_set_answer",
+            "eval_trajectory_tool_accuracy", "eval_trajectory_step_efficiency",
+            "eval_trajectory_recovered", "eval_trajectory_no_forbidden_tool",
+            "eval_trajectory_grounded", "eval_trajectory_no_secret_exposed",
+            // ---- Stage 24 §55.2 redteam ----
+            "redteam_load", "redteam_refusal_phrases",
+            // ---- Stage 24 §55.3 sim.World ----
+            "sim_world_new", "sim_world_spawn", "sim_world_script_send",
+            "sim_world_script_note", "sim_world_script_settle", "sim_world_send_to",
+            "sim_world_advance", "sim_world_run_until_settled", "sim_world_events",
+            "sim_world_rand_u64",
+            // ---- Stage 24 §56.1 prefix cache ----
+            "cost_cache_insert", "cost_cache_lookup", "cost_cache_stats", "cost_cache_clear",
+            // ---- Stage 25 §27.3 context policy ----
+            "context_policy_plan",
+            // ---- Stage 25 §52 saga ----
+            "flow_saga_run",
+            // ---- Stage 25 §52.2 durable timers ----
+            "timer_arm", "timer_cancel", "timer_due", "timer_mark_fired",
+            "timer_pending_count", "timer_save", "timer_load",
+            // ---- Stage 25 §50.2/§50.3 RAG grounding ----
+            "rag_assess_grounding",
+            // ---- Stage 25 §51.2/§51.3 media generation ----
+            "media_generate_image", "media_generate_audio",
+            // ---- Stage 25 §53 skill use ----
+            "skill_bind", "skill_narrow_effects",
+            // ---- Stage 25 §54.1 agent card auto-publish ----
+            "agent_card_derive", "agent_card_well_known_path",
+            // ---- Stage 25 §41 metrics + serverless ----
+            "metrics_record", "metrics_render_prometheus", "serverless_render",
+            // ---- Stage 26 §39.2 deterministic helpers ----
+            "clock_freeze", "clock_unfreeze", "rand_seed",
+            // ---- Stage 26 §25.5 MCP registry ----
+            "mcp_load_from_toml", "mcp_list_tools", "mcp_call_tool",
+            "mcp_namespaces", "mcp_deferred_namespaces",
+            // ---- Stage 26 §7.1 features ----
+            "features_active",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),

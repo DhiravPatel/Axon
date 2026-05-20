@@ -509,13 +509,30 @@ fn builtin_write_file(args: &[Value]) -> Result<Value, String> {
 // Time
 // ===========================================================================
 
+thread_local! {
+    /// Frozen wall-clock value in nanoseconds since Unix epoch, set by
+    /// `clock_freeze`. `None` (the default) means use the real system
+    /// clock. Tests that need deterministic time use `clock_freeze(ns)`
+    /// at the start and `clock_unfreeze()` at the end.
+    static FROZEN_CLOCK_NS: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
+}
+
+pub fn set_frozen_clock(ns: Option<i64>) {
+    FROZEN_CLOCK_NS.with(|cell| cell.set(ns));
+}
+
 fn builtin_time_now(_args: &[Value]) -> Result<Value, String> {
-    // Returns nanoseconds since the Unix epoch as a Duration. Wall-clock
-    // dates land when the stdlib's `DateTime` module ships.
+    if let Some(ns) = FROZEN_CLOCK_NS.with(|cell| cell.get()) {
+        return Ok(Value::Duration(ns));
+    }
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| format!("time_now: {e}"))?;
     Ok(Value::Duration(elapsed.as_nanos() as i64))
+}
+
+pub fn set_rng_seed(seed: u64) {
+    RNG_STATE.with(|cell| cell.set(if seed == 0 { 0xCAFEBABE_DEADBEEF } else { seed }));
 }
 
 // ===========================================================================

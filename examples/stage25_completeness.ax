@@ -1,0 +1,98 @@
+//! examples/stage25_completeness.ax — Stage 25 demo.
+//!
+//! Closes the remaining PLAN gaps in one runnable program:
+//!
+//!   §27.3 — context policy: assemble a too-large prompt and watch the
+//!           DropOldest strategy shed the right messages.
+//!   §52   — saga with LIFO compensations on a failed final step.
+//!   §52.2 — durable timer arm / due / mark_fired round trip.
+//!   §50   — RAG grounding: claim grounded in passages → passed; an
+//!           ungrounded claim drops the score below threshold.
+//!   §51   — media generation: typed image request through the mock
+//!           provider.
+//!   §53   — skill_bind narrows effects to the importer's caps.
+//!   §54.1 — derive an agent card + canonical well-known path.
+//!   §41   — /metrics body + serverless lambda template render.
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage25_completeness.ax
+
+fn act_a(input: dyn) -> String { "seat-42" }
+fn comp_a(value: dyn) -> dyn uses { Console } { print("released:" + str(value)) }
+fn act_b(input: dyn) -> String { "payment-99" }
+fn comp_b(value: dyn) -> dyn uses { Console } { print("refunded:" + str(value)) }
+fn act_c_fails(input: dyn) -> String { panic("printer offline") }
+
+fn main() uses { Console } {
+    print("---- §27.3 context policy ----")
+    let policy = { on_overflow: { kind: "drop_oldest" }, max_tokens: 20, reserved_for_response: 5 }
+    let m0 = { role: "system", text: str_repeat("s", 80), tokens: 0, seq: 0, relevance: 0.0 }
+    let m1 = { role: "user", text: str_repeat("u", 80), tokens: 0, seq: 1, relevance: 0.0 }
+    let m2 = { role: "assistant", text: str_repeat("a", 80), tokens: 0, seq: 2, relevance: 0.0 }
+    let m3 = { role: "user", text: "qqqqq", tokens: 0, seq: 3, relevance: 0.0 }
+    let outcome = context_policy_plan(policy, list_new(m0, m1, m2, m3))
+    print("action: " + outcome.action)
+    print("kept: ")
+    print(list_len(outcome.kept))
+    print("removed: ")
+    print(list_len(outcome.removed))
+
+    print("---- §52 saga with compensations ----")
+    let actions = list_new(
+        { action: act_a, compensate: comp_a },
+        { action: act_b, compensate: comp_b },
+        { action: act_c_fails, compensate: nil }
+    )
+    let r = flow_saga_run(0, list_new("reserve", "charge", "issue"), actions)
+    print("saga status: " + r.status)
+
+    print("---- §52.2 durable timers ----")
+    timer_arm("payroll", "wake_for_payroll", 5000, "empty")
+    timer_arm("backup", "weekly_backup", 999999999999999, "empty")
+    print("pending: ")
+    print(timer_pending_count())
+    let due = timer_due(10000)
+    print("due now: " + list_get(due, 0))
+    timer_mark_fired("payroll")
+    print("pending after fire: ")
+    print(timer_pending_count())
+
+    print("---- §50.2 RAG grounding ----")
+    let p1 = { id: "p1", text: "Cats sleep most of the day.", source: "", url: "" }
+    let answer = "Cats sleep most of the day. Dolphins read poetry."
+    let cfg = { min_overlap: 0.6, grounded_threshold: 0.8, citation_threshold: 1.0 }
+    let g = rag_assess_grounding(answer, list_new(p1), list_new(), cfg)
+    print("grounded fraction: ")
+    print(g.grounded_fraction)
+    print("passed? ")
+    print(bool(g.passed))
+
+    print("---- §51 multimodal generation ----")
+    let imgs = media_generate_image("a serene koi pond", 256, 256, "png", 7, 1)
+    print("first image bytes: ")
+    print(list_get(imgs, 0).bytes_len)
+
+    print("---- §53 skill_bind narrows effects ----")
+    let manifest = `{"name":"scraper","version":"0.1.0","entrypoint":"src/lib.ax","capabilities":["Net","Fs.Write"]}`
+    let b = skill_bind(manifest, list_new("Net"), "")
+    print("satisfied? ")
+    print(bool(b.is_satisfied))
+    print("error: " + b.error)
+
+    print("---- §54.1 agent card auto-publish ----")
+    let summary = `{"name":"Research","version":"1.0.0","description":"demo","handlers":[{"name":"Research","description":"literature search"}],"schemas":{}}`
+    let card_json = agent_card_derive(summary, "https://research.example.com")
+    print("well-known path: " + agent_card_well_known_path())
+    print("card endpoint encoded? ")
+    print(bool(str_contains(card_json, "research.example.com/agent")))
+
+    print("---- §41 metrics + serverless ----")
+    metrics_record(200, 120, 240, 800)
+    metrics_record(500, 60, 80, 100)
+    let body = metrics_render_prometheus()
+    print("metrics has counter? ")
+    print(bool(str_contains(body, "axon_requests_total 2")))
+    let yaml = serverless_render("lambda", "main", "research")
+    print("lambda yaml mentions axskill? ")
+    print(bool(str_contains(yaml, "research.axskill")))
+}

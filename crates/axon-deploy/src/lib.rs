@@ -23,7 +23,11 @@ pub mod dotenv;
 pub mod health;
 pub mod http;
 pub mod manifest;
+pub mod metrics;
+pub mod serverless;
 
 pub use health::{AlwaysHealthy, CheckResult, HealthCheck, Liveness};
 pub use http::{Request, Response, Server};
 pub use manifest::DeployManifest;
+pub use metrics::MetricsRegistry;
+pub use serverless::{ServerlessTarget, ServerlessTrampoline};

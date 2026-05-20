@@ -13,11 +13,13 @@
 //! Cents-not-dollars everywhere so we don't have to deal with float
 //! pennies in money fields.
 
+pub mod cache;
 mod entry;
 mod ledger;
 mod profile;
 mod report;
 
+pub use cache::{CacheStats, CachedEntry, PrefixCache, PrefixCacheKey};
 pub use entry::CostEntry;
 pub use ledger::{Ledger, LedgerError};
 pub use profile::ProviderProfile;

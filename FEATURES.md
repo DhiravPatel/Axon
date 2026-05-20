@@ -1,6 +1,224 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**579 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**752 tests passing** across 30+ crates).
+
+---
+
+## Stage 26 — `[features]` Gating (§7.1), MCP Tool Declarations (§25.5), Deterministic Test Helpers (§39.2)
+
+Final long-tail closure: the three remaining "minor" PLAN items.
+
+### §7.1 `[features]` conditional compilation
+- [crates/axon-project/src/features.rs](crates/axon-project/src/features.rs) — `resolve_features(table, requested, enable_default)` returns the transitive closure of the user's requested feature set (Cargo-compatible shape: `default = [...]` is auto-enabled unless `--no-default-features`). `filter_program(program, active)` strips top-level items whose `#[cfg(feature = "X")]` predicate doesn't match.
+- Accepted shapes for the predicate: `#[cfg(feature("name"))]`, `#[cfg(feature = "name")]`, and a bare `#[cfg("name")]`. Unrecognized predicates leave the item untouched so adding new conditions later doesn't silently strip code.
+- `axon run` / `axon test` accept `--features F1,F2,...` and `--no-default-features` flags.
+- `features_active()` host binding returns the resolved set to running programs so they can branch at runtime alongside compile-time gating.
+
+### §25.5 MCP server declarations in `axon.toml`
+- [crates/axon-project/src/mcp.rs](crates/axon-project/src/mcp.rs) — `McpRegistry::from_manifest_tools(tools)` resolves every `[tools.<namespace>]` block into a typed `McpTool { namespace, name, description, input_schema, provider }`. Three provider shapes:
+  - `tools = [{name, description, input_schema}]` — inline declarations, available immediately.
+  - `mcp = "https://..."` — remote MCP endpoint; namespace recorded in `deferred_namespaces` until a wire driver lands.
+  - `mcp_command = "node mcp-fs/index.js"` — subprocess MCP server; also deferred.
+- `McpClient` trait (`list_tools` / `call_tool`) with concrete `StaticMcpClient` driver returning the inline tool table — useful for tests and for declaring tools entirely in `axon.toml` without a separate process.
+- Host bindings: `mcp_load_from_toml(path)`, `mcp_list_tools(namespace)`, `mcp_call_tool(namespace, name, args_json)`, `mcp_namespaces()`, `mcp_deferred_namespaces()`.
+
+### §39.2 Deterministic testing helpers
+- `mock_model(name, response)` — already shipped in Stage 6.
+- New `clock_freeze(ns)` / `clock_unfreeze()` thread-local frozen clock override for `time_now` ([crates/axon-runtime/src/builtin.rs](crates/axon-runtime/src/builtin.rs)).
+- New `rand_seed(seed)` sets the internal xorshift64 RNG state, making `random_int` / `random_float` byte-reproducible across runs with the same seed.
+- All three exposed as host bindings without disturbing the existing `Time` / `Random` capability gates — the helpers don't require capabilities to *set* the state; they just override what the gated functions return.
+
+### Host bindings (10 new names) + tyck registrations
+`clock_freeze`, `clock_unfreeze`, `rand_seed`, `mcp_load_from_toml`, `mcp_list_tools`, `mcp_call_tool`, `mcp_namespaces`, `mcp_deferred_namespaces`, `features_active`. CLI flags `--features F1,F2,...` and `--no-default-features` added to `axon run` and `axon test`.
+
+### Test coverage
+- `crates/axon-project::features` — 6 unit tests (default seeding, transitive closure, no-default-features, unknown name, empty table, deduplication).
+- `crates/axon-project::mcp` — 6 unit tests (inline registration order, deferred namespaces, static client list+call, unknown tool, empty table).
+- `crates/axon-cli/tests/stage26_minor_gaps.rs` — 7 end-to-end tests through the `axon` binary: clock freeze identity, rand seed determinism, MCP load + list + call + deferred, `features_active` default seeding, `--no-default-features`, and `#[cfg(feature = "X")]` item stripping (call to a gated helper succeeds only when the feature is on).
+- Workspace total: **752 passed, 0 failed** (up from 733).
+
+### CLI demo (real run)
+```
+$ axon run examples/stage26_features_mcp_helpers.ax
+---- §39.2 deterministic helpers ----
+frozen clock identical?
+true
+same seed, same draw?
+true
+unfrozen clock advances?
+true
+---- §25.5 MCP server declarations ----
+registered namespaces: 0
+deferred-transport namespaces: 0
+---- §7.1 feature introspection ----
+active features (single-file demo - empty): 0
+
+$ axon run --features redis,my-feature examples/some_project/
+# `#[cfg(feature = "redis")]` items are now in scope; default features still seeded
+```
+
+---
+
+## Stage 25 — Closing the Long Tail: Context Policy, Sagas, Durable Timers, Grounding, Media Gen, Skill Use, Auto-Publish, AxVM C ABI, Metrics, Serverless
+
+Stage 25 closes every remaining PLAN gap that surfaced after the Stage 24 sweep: nine self-contained features, each fully tested + host-bound.
+
+### §27.3 Context policy
+- [crates/axon-runtime/src/context_policy.rs](crates/axon-runtime/src/context_policy.rs) — `ContextPolicy { on_overflow: OverflowStrategy, max_tokens, reserved_for_response }` with four strategies:
+  - `SummarizeOldest { with, target_ratio }` (default — emits which old messages the caller should feed to a cheap summarizer);
+  - `DropOldest` (sliding window; protects `system` and the last conversational turn);
+  - `DropLeastRelevant { score_fn_id }` (host-evaluated relevance scorer);
+  - `Error` (fail closed — refuse to call the model when the prompt won't fit).
+- `ContextPolicy::plan(messages)` returns a `ContextOutcome { kept, removed, action, original_tokens, final_tokens, budget }` — bookkeeping only; the host actually performs any summarize call.
+- Conservative token-count heuristic (`chars / 4`, ceil) when the provider hasn't returned a real counter.
+
+### §52 Sagas with compensations
+- [crates/axon-flow/src/saga.rs](crates/axon-flow/src/saga.rs) — `SagaStep { name, action, compensate? }` and `run_saga(input, steps)` running every action forward; on the first failure compensations run **LIFO** against the values their respective forwards produced. Status `committed | compensated | aborted`, audit trail per step (`Succeeded | Failed | Compensated | CompensationFailed | Skipped`). Compensation errors don't halt the rollback — they're recorded and the next compensation runs.
+
+### §52.2 Durable timers (`sleep_until`)
+- [crates/axon-trigger/src/durable_timer.rs](crates/axon-trigger/src/durable_timer.rs) — `DurableTimerTable` keyed by string id; persists via JSON round-trip through `axon-memory`. `arm(timer)`, `cancel(id)`, `due(now_ns)` (sorted by deadline), `mark_fired(id)`, `purge_fired_or_cancelled()`. Survives process restarts; the runtime loads on startup and only fires timers whose wall-clock deadline has actually passed.
+
+### §50.2 / §50.3 RAG grounding & citations
+- [crates/axon-rag/src/grounding.rs](crates/axon-rag/src/grounding.rs) — `CitationPassage`, `Citation`, `assess_grounding(answer, passages, citations, config)` → `GroundingReport { claims, citations, grounded_fraction, citation_validity, passed }`. Per-claim sentence split + lexical overlap against supporting passages; per-citation existence + span-overlap check. Configurable `min_overlap`, `grounded_threshold`, `citation_threshold`. Stop-word filter so "the cat is" isn't penalized for empty content.
+
+### §51.2 / §51.3 Multimodal generation
+- [crates/axon-media/src/generate.rs](crates/axon-media/src/generate.rs) — `MediaProvider` trait with default `generate_image` / `generate_audio` returning `Unsupported`; concrete `MockProvider` produces a valid PNG signature + WAV RIFF header so end-to-end plumbing works without a real backend. Typed `GenerateImageRequest { prompt, width, height, format, negative_prompt, seed, n }` / `GenerateAudioRequest { prompt, voice, sample_rate, format, max_duration_secs, seed }` with bounds validation (dims ≤4096, n ≤8, sample_rate 8000..=192000).
+
+### §53 Skill use + effect narrowing
+- [crates/axon-skill/src/use_skill.rs](crates/axon-skill/src/use_skill.rs) — `bind_skill(manifest, caller_caps, alias?)` → `SkillBinding { alias, caller_caps, skill_caps, effective_caps, is_satisfied, missing_caps }`. `narrow_effects(callee_caps, caller_caps)` intersects rows. `explain_missing(binding)` returns a stable diagnostic listing the missing rows. Importer-with-fewer-caps cannot accidentally hand a Net-needing skill to a pure caller.
+
+### §54.1 Agent card auto-publication
+- [crates/axon-a2a/src/auto_publish.rs](crates/axon-a2a/src/auto_publish.rs) — `derive_agent_card(summary, base_url)` produces a verified `AgentCard` from a compile-time `AgentSummary { name, version, description, handlers, auth, schemas }`. Endpoint follows `<base>/agent`. `render_well_known(card)` returns the pretty-printed JSON body the serve layer returns from `/.well-known/agent-card.json`.
+
+### §35.4 AxVM C ABI
+- [crates/axon-vm-cabi/](crates/axon-vm-cabi/) — new `staticlib + cdylib + rlib` crate. `axvm_compile(source)` → opaque `AxvmHandle*`, `axvm_set_caps(handle, "Console,Net")`, `axvm_call_main(handle, &mut out_json)` returns the result as a JSON string the caller frees with `axvm_free_string`. Per-thread `axvm_last_error()`. C header at [crates/axon-vm-cabi/include/axvm.h](crates/axon-vm-cabi/include/axvm.h). Embed Axon in any language with a C FFI by linking `libaxvm.{a,so,dylib}`.
+
+### §41 `/metrics`, serverless render
+- [crates/axon-deploy/src/metrics.rs](crates/axon-deploy/src/metrics.rs) — `MetricsRegistry` with atomic counters (requests_total, success, error, bytes_in, bytes_out, handler_us_total, in_flight, uptime). `render_prometheus()` emits standard 0.0.4 text-exposition format with `# HELP` / `# TYPE` blocks for every metric.
+- [crates/axon-deploy/src/serverless.rs](crates/axon-deploy/src/serverless.rs) — `ServerlessTarget { Lambda | GcpFunction | CfWorker }` driven from `#[lambda]` / `#[gcp_function]` / `#[cf_worker]` attribute hints. `render_lambda_yaml` emits an AWS SAM template; `render_gcp_function_yaml` emits a GCF spec; `render_cf_worker_toml` emits a wrangler.toml. The trampoline carries memory + timeout + env so `axon deploy --target=cf_worker` can produce ready-to-deploy scaffolding next to the `.axskill` archive.
+
+### §43 Formal EBNF grammar
+- [spec/grammar.ebnf](spec/grammar.ebnf) — normative ISO/IEC 14977 EBNF for every top-level item, statement, expression, pattern, and literal, including agent / actor / supervisor / graph / network / orchestrate declarations, the prompt-slot DSL, and the `Tainted<T>` / refinement type syntax.
+
+### Host bindings (24 new names) + tyck registrations
+`context_policy_plan`, `flow_saga_run`, `timer_arm`/`cancel`/`due`/`mark_fired`/`pending_count`/`save`/`load`, `rag_assess_grounding`, `media_generate_image`/`audio`, `skill_bind`/`narrow_effects`, `agent_card_derive`/`well_known_path`, `metrics_record`/`render_prometheus`, `serverless_render`.
+
+### Test coverage
+- `crates/axon-runtime::context_policy` — 6 tests.
+- `crates/axon-flow::saga` — 5 tests.
+- `crates/axon-trigger::durable_timer` — 7 tests.
+- `crates/axon-rag::grounding` — 6 tests.
+- `crates/axon-media::generate` — 6 tests.
+- `crates/axon-skill::use_skill` — 6 tests.
+- `crates/axon-a2a::auto_publish` — 6 tests.
+- `crates/axon-vm-cabi` — 6 tests (compile, run, set_caps, errors, drop-NULL).
+- `crates/axon-deploy::metrics` — 3 tests; `::serverless` — 6 tests.
+- `crates/axon-cli/tests/stage25_end_to_end.rs` — 9 end-to-end tests through the `axon` binary.
+- Workspace total: **733 passed, 0 failed** (up from 666).
+
+### CLI demo (real run)
+```
+$ axon run examples/stage25_completeness.ax
+---- §27.3 context policy ----
+action: drop_oldest
+kept: 2
+removed: 2
+---- §52 saga with compensations ----
+refunded:payment-99
+released:seat-42
+saga status: compensated
+---- §52.2 durable timers ----
+pending: 2
+due now: payroll
+pending after fire: 1
+---- §50.2 RAG grounding ----
+grounded fraction: 0.5
+passed? false
+---- §51 multimodal generation ----
+first image bytes: 8
+---- §53 skill_bind narrows effects ----
+satisfied? false
+error: skill `scraper` requires capabilities the importer doesn't hold: Fs.Write
+---- §54.1 agent card auto-publish ----
+well-known path: .well-known/agent-card.json
+---- §41 metrics + serverless ----
+metrics has counter? true
+lambda yaml mentions axskill? true
+```
+
+---
+
+## Stage 24 — Multi-Agent Orchestration (§29), Reasoning & Planning (§49), Trajectory Eval (§55), Cost/Latency Optimization (§56)
+
+The "intelligence layer" lands as four production-quality pillars on top of Axon's existing language + agent infrastructure.
+
+### §29 Multi-agent orchestration
+- **`axon-flow::network::Network`** — declarative agent topology with `OneWay` and `Bidirectional` edges. Verification runs three structural checks: edges reference known nodes, no cycles (DFS with full cycle-path reconstruction), and reachability from any root via BFS. Bidirectional edges deliberately expand to two one-way edges so the cycle detector catches the `critic <-> writer` deadlock the spec uses as its canonical hazard.
+- **`axon-flow::graph::WorkflowGraph`** — explicit DAG of typed steps (§29.6). Kahn's-algorithm topological order with deterministic intra-layer alphabetical ordering, plus `roots()` / `leaves()` for entry/exit attribution. The host's `flow_graph_run` schedules nodes in topo order, threading each node's predecessors' results into the node's callable as a record so users can write graphs without learning a new scheduling API.
+- **`axon-flow::debate`** — two personas argue, a judge decides (§29.8). Each round runs `pro(question, transcript)` then `con(question, transcript)` then accumulates the typed `Statement` into the transcript so positions can sharpen across rounds; the final `judge(question, transcript)` returns the verdict.
+- **`axon-flow::tree_of_thought`** — beam-search over branched candidate steps (§29.8, §49.2). At each depth level, every surviving thought spawns children via `expand`; children are scored by `score`; the top-`width` (by score) survive. Non-finite scores are clamped to `f64::NEG_INFINITY` so NaN doesn't corrupt the heap.
+
+### §49 Reasoning & planning
+- **`axon-runtime::reasoning::ReasoningBudget`** — first-class thinking-token budget (§49.1) distinct from I/O-token budgets. `Effort { Low | Medium | High | Adaptive }`, `max_thinking_tokens`, `expose` flag controlling whether the reasoning trace is returned as a `Tainted<Stream<Thought>>` to UIs. `ReasoningBudgetStack` mirrors the existing `BudgetStack` so a child scope can't escape a parent reasoning ceiling.
+- **`axon-flow::strategy::PlanningStrategy`** — pluggable `plan` loop shapes (§49.2): `ReAct | PlanExecute | Reflexion { rounds } | TreeOfThought { width, depth } | Debate { rounds } | Custom { step_id }`. Tagged-JSON-serializable so strategies round-trip through `axon trace` and `axon replay`.
+- **`axon-flow::strategy::DirectiveOnError`** — typed `on_step_error` directives (§49.4): `Backoff { secs } | Replan { hint } | Repair | FinalizeBest | Escalate { to } | Abort`. Each strategy interprets the directive in its own loop shape.
+- **`plan_react_loop(max_steps, think, act, observe)`** — host-side ReAct driver. Returns a list of `{ step_index, thought, action, observation }` records; observe returns `{ observation, done }` and the loop stops as soon as `done = true`.
+- **`axon optimize <prompt.ax> --eval <suite.ax> [--trials N]`** (§49.6) — searches the cartesian product of `// VARIANT:` swap points against the eval suite, scores each combo via `axon check` + the suite's pass count, writes the winner as `<name>.vN.ax`. Makes "prompt engineering" a measured, gated, reviewable change instead of guesswork.
+
+### §55 Trajectory eval, red-teaming, simulation
+- **`axon-eval::trajectory::Trajectory`** — typed view of a recorded run with `steps[]` (each step holding optional `tool_call`, `observation`, `error`), `allowed_tools`, `forbidden_tools`, `optimal_steps`, and the final `answer`. Pure-function metrics over this struct:
+  - `tool_accuracy` — fraction of tool calls that named an allowed tool and didn't error.
+  - `step_efficiency` — clamped ratio of optimal-steps to actual-steps.
+  - `recovered_from_errors` — true iff an error step is followed by a non-error step.
+  - `no_forbidden_tool_called` / `no_secret_exposed(secrets)` — safety predicates.
+  - `grounded_in_observations` — fraction of answer-claims (sentence-split) that appear verbatim in some step's observation.
+- **`axon-eval::redteam`** — curated adversarial suites (§55.2). `redteam_suite("std:injection" | "std:jailbreak" | "std:tool_abuse" | "std:exfiltration" | "std:pii_trap" | "std:all")` returns typed `RedteamCase { id, category, payload, watched_tools, secrets, assertion }`. The `assertion` is structural (`NoToolCalled` / `NoSecretExposed` / `AnswerOmitsCanary` / `Refuses`) so the host evaluates the *behavioural* outcome — the capability/policy/taint layers must still prevent unsafe acts even if the model is talked into trying.
+- **`axon-eval::sim::World`** — deterministic simulation harness (§55.3). Owns a virtual clock (`clock_ns`), a seeded splitmix64 PRNG (same seed → same draws byte-identically), a list of `AgentBox`es with FIFO mailboxes and a scripted action stream (`Send { to, payload } | Note { kind, payload } | Settle`), and an event log. `World::advance(dt_ns)` steps every agent once in name order; `World::run_until(dt_ns, max_ticks, predicate)` runs until the predicate fires or the tick cap hits.
+
+### §56 Cost & latency optimization
+- **`axon-cost::cache::PrefixCache`** — provider-side prompt-prefix cache shadow (§56.1). FNV-1a keyed entries with `(tokens, inserted_at, expires_at, hits)`; `lookup` increments hits and tokens-saved telemetry; expired entries are swept on the miss path. `CacheStats { lookups, hits, misses, tokens_saved, entries, hit_rate() }` flows into `cost_cache_stats()` so the agent program can show cache effectiveness in `axon prof --cost`.
+- **`axon-flow::race`** — speculative cheap-then-deep execution (§56.3). Runs candidates in order until one is `accept`-ed; returns `{ winner_index, value, considered, accepted }` so callers can measure "what fraction of queries actually needed the expensive model."
+- **`axon-flow::batch`** — issue N independent inputs through one step (§56.3). The synchronous shape preserves the API a future async batched executor would expose, so call sites don't change.
+- **`axon-flow::route::DifficultyRouter`** — heuristic difficulty-routed model selection (§56.4). `estimate_difficulty(prompt, thresholds)` returns `Trivial | Normal | Hard` based on length + question-mark count + hard-keyword triggers (`prove`, `derive`, `step by step`, `compare and contrast`, ...). Conservatively biased toward `Hard` — wrong direction wastes the user's time more than wasting money.
+
+### Host bindings (35 new names)
+`flow_network_new` / `flow_network_add_node` / `flow_network_add_edge` / `flow_network_verify` / `flow_network_unreachable_from`; `flow_graph_new` / `flow_graph_add_node` / `flow_graph_add_edge` / `flow_graph_verify` / `flow_graph_topo` / `flow_graph_roots` / `flow_graph_leaves` / `flow_graph_run`; `flow_debate` / `flow_tree_of_thought` / `flow_race` / `flow_batch`; `flow_estimate_difficulty` / `flow_route_difficulty`; `reasoning_budget_new` / `reasoning_budget_debit` / `reasoning_budget_status`; `plan_react_loop`; `eval_trajectory_new` / `eval_trajectory_add_step` / `eval_trajectory_set_answer` and six metric queries; `redteam_load` / `redteam_refusal_phrases`; `sim_world_new` plus 9 world manipulation bindings; `cost_cache_insert` / `cost_cache_lookup` / `cost_cache_stats` / `cost_cache_clear`.
+
+### Test coverage
+- `crates/axon-flow` — 46 unit tests (network, graph, debate, ToT, race, batch, route, strategy, refine, sequential, parallel).
+- `crates/axon-cost::cache` — 7 prefix-cache tests.
+- `crates/axon-runtime::reasoning` — 7 reasoning-budget tests.
+- `crates/axon-eval` — trajectory metrics (10), redteam suites (5), sim.World (6).
+- `crates/axon-cli/tests/stage24_orchestration.rs` — 6 end-to-end tests through the binary.
+- `crates/axon-cli/tests/stage24_reasoning_eval.rs` — 7 end-to-end tests.
+- `crates/axon-cli/tests/axon_optimize.rs` — 3 CLI tests for `axon optimize`.
+- Workspace total: **666 passed, 0 failed** (up from 579).
+
+### CLI demo (real run)
+```
+$ axon run examples/stage24_orchestration_and_eval.ax
+---- §29 multi-agent orchestration ----
+network with bidi edge ok?
+false
+error: network has cycle: critic -> writer -> critic
+graph verify ok?
+true
+topological order: [classify, retrieve, draft, review]
+debate verdict: decision: ship now
+---- §49 reasoning & planning ----
+400 tokens breached? false
+400+700 breached? true
+react steps logged: 1
+---- §55 trajectory eval + redteam ----
+tool_accuracy: 0.666...
+recovered_from_errors: true
+red-team injection suite size: 3
+---- §56 cost & latency optimization ----
+hit / hit / miss: true / true / false
+cache stats: {lookups: 3, hits: 2, ..., hit_rate: 0.666...}
+race winner: cheap:hello
+routed tier: hard
+```
 
 ---
 
