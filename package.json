@@ -1,0 +1,17 @@
+{
+  "name": "axon-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Axon — the programming language for autonomous AI agents (root workspace).",
+  "scripts": {
+    "web:dev": "pnpm --filter @axon/web dev",
+    "web:build": "pnpm --filter @axon/web build",
+    "web:start": "pnpm --filter @axon/web start",
+    "rust:build": "cargo build --workspace",
+    "rust:test": "cargo test --workspace"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

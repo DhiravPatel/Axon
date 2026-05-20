@@ -6,7 +6,15 @@
       "Bash(awk '/test result/{p+=$4; f+=$6} END {print \"TOTAL PASSED:\", p, \"  FAILED:\", f}')",
       "Bash(awk '{p+=$4; f+=$6} END {print \"TOTAL PASSED:\", p, \"  FAILED:\", f}')",
       "Read(//Users/dhiravpatel/Documents/Project\\\\ 2/Axon/**)",
-      "Bash(grep -E \"§[0-9]{1,2}\" PLAN.md)"
+      "Bash(grep -E \"§[0-9]{1,2}\" PLAN.md)",
+      "Bash(pnpm --version)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm typecheck *)",
+      "Bash(pnpm build *)",
+      "Bash(rm \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec/page.tsx\" \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/features/page.tsx\"; mkdir -p \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec/[slug]\" \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/features/[slug]\")"
+    ],
+    "additionalDirectories": [
+      "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec"
     ]
   }
 }
