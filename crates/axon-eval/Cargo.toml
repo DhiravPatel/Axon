@@ -1,0 +1,10 @@
+[package]
+name = "axon-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon trajectory evaluation: scenarios, metrics, suite runner."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

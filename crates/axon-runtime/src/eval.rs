@@ -104,6 +104,23 @@ impl Interpreter {
         &self.active_caps
     }
 
+    /// Install a native function in the global environment under `name`.
+    ///
+    /// Downstream crates (the standard library, host integrations) call this
+    /// to extend the runtime without modifying it. Idempotent — re-binding
+    /// the same name overwrites the previous value.
+    pub fn register_native(&self, name: &'static str, native: NativeFn) {
+        self.globals.define(name, Value::Native(Rc::new(native)));
+    }
+
+    /// Like [`Interpreter::register_native`], but for natives that need to
+    /// re-enter the interpreter (call user closures supplied as arguments).
+    /// Used by Stage 13 orchestration primitives.
+    pub fn register_native_ext(&self, name: &'static str, native: crate::value::NativeExtFn) {
+        self.globals
+            .define(name, Value::NativeExt(Rc::new(native)));
+    }
+
     /// Install a tracer. Subsequent ask/plan/generate/tool/handler steps
     /// will open and close spans against it. Idempotent — calling twice
     /// installs the second tracer and discards spans from the first.
@@ -940,6 +957,48 @@ impl Interpreter {
                     }
                 }
                 (n.call)(args).map_err(|e| EvalSignal::error(e, call_site))
+            }
+            Value::NativeExt(n) => {
+                // Same arity + caps check as Native, then re-enter the
+                // interpreter via `call_value` so the body can invoke user
+                // closures supplied as arguments.
+                if args.len() < n.min_arity {
+                    return Err(EvalSignal::error(
+                        format!(
+                            "built-in `{}` expects at least {} arg(s), got {}",
+                            n.name,
+                            n.min_arity,
+                            args.len()
+                        ),
+                        call_site,
+                    ));
+                }
+                if let Some(max) = n.max_arity {
+                    if args.len() > max {
+                        return Err(EvalSignal::error(
+                            format!(
+                                "built-in `{}` expects at most {} arg(s), got {}",
+                                n.name,
+                                max,
+                                args.len()
+                            ),
+                            call_site,
+                        ));
+                    }
+                }
+                for required in n.required_caps {
+                    if !self.active_caps.has(required) {
+                        return Err(EvalSignal::error(
+                            format!(
+                                "built-in `{}` requires capability `{}`, which is not in scope (active: {})",
+                                n.name, required, self.active_caps
+                            ),
+                            call_site,
+                        ));
+                    }
+                }
+                let call = n.call;
+                call(self, args, call_site).map_err(|e| EvalSignal::error(e, call_site))
             }
             other => Err(EvalSignal::error(
                 format!("value of type `{}` is not callable", other.type_name()),

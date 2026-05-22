@@ -1,0 +1,6 @@
+[package]
+name = "axon-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon orchestration & reasoning combinators: Step trait, sequential/parallel/refine patterns."

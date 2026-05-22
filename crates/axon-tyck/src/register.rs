@@ -24,6 +24,70 @@ impl<'a> Checker<'a> {
         const PURE: &[&str] = &[
             "len", "str", "int", "float", "bool", "abs", "min", "max", "chan", "assert",
             "assert_eq", "panic", "anthropic", "mock_model", "local_memory",
+            // ---- Stage 11 stdlib: std.string ----
+            "str_upper", "str_lower", "str_trim", "str_trim_start", "str_trim_end",
+            "str_split", "str_join", "str_contains", "str_starts_with", "str_ends_with",
+            "str_replace", "str_repeat", "str_len", "str_chars", "str_index_of",
+            "str_substring",
+            // ---- Stage 11 stdlib: std.list ----
+            "list_new", "list_len", "list_push", "list_pop", "list_get", "list_set",
+            "list_first", "list_last", "list_contains", "list_reverse", "list_sort",
+            "list_take", "list_drop", "list_concat", "list_index_of", "list_remove_at",
+            // ---- Stage 11 stdlib: std.map ----
+            "map_new", "map_len", "map_get", "map_get_or", "map_set", "map_remove",
+            "map_contains", "map_keys", "map_values", "map_merge",
+            // ---- Stage 11 stdlib: std.set ----
+            "set_new", "set_len", "set_add", "set_remove", "set_contains", "set_union",
+            "set_intersection", "set_difference", "set_to_list",
+            // ---- Stage 11 stdlib: std.option ----
+            "opt_some", "opt_none", "opt_is_some", "opt_is_none", "opt_unwrap_or", "opt_or",
+            // ---- Stage 11 stdlib: std.result ----
+            "result_ok", "result_err", "result_is_ok", "result_is_err", "result_unwrap_or",
+            "result_value", "result_error",
+            // ---- Stage 11 stdlib: std.math ----
+            "math_pow", "math_sqrt", "math_floor", "math_ceil", "math_round", "math_sin",
+            "math_cos", "math_tan", "math_log", "math_log2", "math_exp", "math_pi",
+            "math_e", "math_gcd",
+            // ---- Stage 11 stdlib: std.time (pure helpers; clock is in EFFECTFUL) ----
+            "dur_seconds", "dur_millis", "dur_from_seconds", "dur_from_millis",
+            "date_year", "date_month", "date_day", "date_make", "date_is_leap",
+            // ---- Stage 11 memory: host-installed kv store ----
+            "mem_open_file", "mem_open_ephemeral", "mem_set", "mem_get", "mem_remove",
+            "mem_keys", "mem_len", "mem_contains",
+            // ---- Stage 12 rag: retrieval index ----
+            "rag_index_new", "rag_index_len", "rag_chunk", "rag_ingest", "rag_retrieve",
+            "rag_save", "rag_load",
+            // ---- Stage 12 media: typed multimodal primitives ----
+            "media_image_load", "media_audio_load", "media_document_load", "media_sniff",
+            // ---- Stage 13 flow: orchestration + reasoning combinators ----
+            "flow_seq", "flow_parallel", "flow_refine",
+            // ---- Stage 14 triggers: durable scheduling ----
+            "trigger_every", "trigger_at", "trigger_cron", "trigger_remove", "trigger_len",
+            "trigger_tick", "trigger_save", "trigger_load",
+            // ---- Stage 14 skills: .axskill packaging ----
+            "skill_pack", "skill_install", "skill_inspect",
+            // ---- Stage 14 a2a: agent-to-agent discovery ----
+            "a2a_card_load", "a2a_card_fetch", "a2a_card_save", "a2a_card_has_capability",
+            // ---- Stage 15 guardrails: PII/injection/policy ----
+            "guard_scan_pii", "guard_scan_secrets", "guard_injection_score",
+            "guard_policy_evaluate",
+            // ---- Stage 15 secrets: redaction-aware vault ----
+            "secret_open", "secret_get", "secret_set", "secret_remove", "secret_names",
+            "secret_redact",
+            // ---- Stage 15 sandbox: resource-limited subprocesses ----
+            "sandbox_run",
+            // ---- Stage 16 eval: trajectory eval suite runner ----
+            "eval_suite_new", "eval_add_scenario", "eval_add_metric",
+            "eval_set_latency_budget", "eval_run", "eval_report_junit",
+            // ---- Stage 16 cost: cost ledger ----
+            "cost_record", "cost_profile_add", "cost_report",
+            "cost_save", "cost_load", "cost_reset",
+            // ---- Stage 16 ffi: subprocess FFI ----
+            "ffi_call",
+            // ---- Stage 17 env: environment binding ----
+            "env_get", "env_get_or", "env_load_dotenv",
+            // ---- Stage 17 deploy: HTTP server + manifest ----
+            "serve_run", "deploy_write_manifest",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),
