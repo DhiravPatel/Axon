@@ -17,9 +17,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod auto_publish;
 mod errors;
+pub mod identity;
 
+pub use auto_publish::{derive_agent_card, render_well_known, AgentSummary, HandlerSummary};
 pub use errors::A2aError;
+pub use identity::{
+    Delegation, IdentityError, KeyPair, Signature, SignedAgentCard, SignedDelegation, TrustStore,
+};
 
 pub const CARD_FORMAT_VERSION: u32 = 1;
 

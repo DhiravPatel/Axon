@@ -1,0 +1,74 @@
+//! examples/stage27_final_gaps.ax — Stage 27 demo.
+//!
+//! Closes the three v1.0 PLAN holes left over after Stage 26:
+//!
+//!   §25.6 — `@approval` tool attribute: human-in-the-loop gate with a
+//!           `deny | allow | escalate` on_timeout policy.
+//!   §24.3 — prompt `@version` registry for A/B testing prompt revisions.
+//!   §17.1 / §36 — `axon schema migrate` CLI for planning + (with a
+//!           registered runtime migrator) executing schema migrations
+//!           over a stored JSON value.
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage27_final_gaps.ax
+//!
+//! For the schema-migrate CLI flow see
+//! `crates/axon-cli/tests/stage27_final_gaps.rs::schema_*`.
+
+fn main() uses { Console } {
+    print("---- §25.6 approval gate ----")
+
+    approval_open("req-001", "wire_transfer",
+        "amount=1000;to=acct-42",
+        "treasury@example.com",
+        60,
+        "deny")
+
+    let pending = approval_get("req-001")
+    print("opened: state=" + pending.state)
+    print("approver=" + pending.by)
+
+    // Approver acts.
+    approval_approve("req-001", "alice")
+    let final = approval_get("req-001")
+    print("after approve: state=" + final.state + " actor=" + final.actor)
+
+    // A second, deny-flow.
+    approval_open("req-002", "publish", "draft-id=42",
+        "editor@example.com", 60, "deny")
+    approval_deny("req-002", "editor", "needs more review")
+    let denied = approval_get("req-002")
+    print("denied: state=" + denied.state + " reason=" + denied.reason)
+
+    // On-timeout: open a request with a 1-second timeout, sweep past it.
+    approval_open("req-003", "cleanup", "", "ops", 1, "deny")
+    let fired = approval_sweep_timeouts(5000000000000000000, "")
+    print("timed-out requests: ")
+    print(list_len(fired))
+
+    print("---- §24.3 prompt @version ----")
+
+    prompt_version_register("support_answer", "v1", "be terse", "first cut")
+    prompt_version_register("support_answer", "v2",
+        "be terse and cite every claim", "added citation guidance")
+    prompt_version_register("support_answer", "v3",
+        "be terse, cite every claim, and refuse off-topic",
+        "added off-topic refusal")
+
+    print("registered prompts: ")
+    print(prompt_version_prompts())
+    print("versions of support_answer: ")
+    print(list_len(prompt_version_versions_for("support_answer")))
+
+    // Default = first-registered (v1).
+    print("default version: " + prompt_version_pick("support_answer", "").version)
+
+    // Promote v3 for the next release.
+    prompt_version_set_default("support_answer", "v3")
+    print("post-promotion default: " + prompt_version_pick("support_answer", "").version)
+    print("v3 notes: " + prompt_version_pick("support_answer", "v3").notes)
+
+    print("---- §17.1 / §36 schema migrate (CLI) ----")
+    print("see: axon schema inspect <store.json>")
+    print("     axon schema migrate <store.json> --to N [--apply]")
+}

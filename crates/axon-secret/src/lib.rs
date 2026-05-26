@@ -16,8 +16,10 @@
 //! Both pieces participate in the same `Secret<T>` redaction so casual
 //! debugging never leaks a value.
 
+pub mod oauth;
 pub mod secret;
 pub mod vault;
 
+pub use oauth::{OauthToken, RefreshOutcome, TokenRefreshError};
 pub use secret::Secret;
 pub use vault::{Vault, VaultError};

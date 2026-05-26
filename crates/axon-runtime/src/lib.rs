@@ -15,19 +15,32 @@
 //!     either a `Value` or a `RuntimeError`.
 
 mod actor;
+pub mod attrs;
 mod budget;
-mod builtin;
+pub mod builtin;
 mod caps;
+pub mod context_policy;
 mod env;
 mod error;
 mod eval;
+pub mod migrate;
+pub mod otlp;
+pub mod prompt_version;
+pub mod reasoning;
 mod record;
+pub mod restart_policy;
+pub mod stream;
+pub mod supervisor;
 mod tool;
 mod trace;
 mod value;
 
 pub use actor::{Actor, AgentDef, HandlerDef, Lifecycle, LifecycleHandlerDef, StateField};
 pub use budget::{Budget, BudgetBreach, BudgetStack};
+pub use prompt_version::{PromptVersion, PromptVersionError, PromptVersionRegistry};
+pub use reasoning::{Effort, ReasoningBreach, ReasoningBudget, ReasoningBudgetStack};
+pub use restart_policy::{ExitKind, RestartPolicy};
+pub use stream::{BackpressurePolicy, SendOutcome, StreamHandle};
 pub use caps::{parse_cap_list, CapSet};
 pub use env::Env;
 pub use error::{EvalResult, EvalSignal, RuntimeError, TraceFrame};

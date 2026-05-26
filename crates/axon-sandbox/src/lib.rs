@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 mod errors;
+pub mod platform;
 
 pub use errors::SandboxError;
+pub use platform::{PlatformProfile, PlatformSandbox};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {

@@ -16,11 +16,16 @@
 pub mod bm25;
 pub mod chunk;
 pub mod embed;
+pub mod grounding;
 pub mod index;
 pub mod retrieve;
 
 pub use bm25::Bm25;
 pub use chunk::{Chunk, Chunker, RecursiveChunker};
 pub use embed::{Embedder, HashEmbedder};
+pub use grounding::{
+    assess_grounding, Citation, CitationCheck, CitationPassage, ClaimAssessment,
+    GroundingConfig, GroundingReport,
+};
 pub use index::{Index, Passage};
 pub use retrieve::{Hit, Retriever};

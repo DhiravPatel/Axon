@@ -2243,6 +2243,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::When) => self.parse_when_expr(),
             TokenKind::Keyword(Kw::For) => self.parse_for_expr(),
             TokenKind::Keyword(Kw::While) => self.parse_while_expr(),
+            TokenKind::Keyword(Kw::Select) => self.parse_select_expr(),
             TokenKind::Keyword(Kw::Ask) => self.parse_ask_expr(),
             TokenKind::Keyword(Kw::Generate) | TokenKind::Keyword(Kw::Gen) => {
                 self.parse_generate_expr()
@@ -2455,13 +2456,20 @@ impl<'a> Parser<'a> {
     fn parse_for_expr(&mut self) -> Expr {
         let start = self.peek_span();
         self.bump();
+        // Optional `await` between `for` and the pattern → async-stream form.
+        let is_await = self.eat_kw(Kw::Await);
         let pat = self.parse_pattern();
         self.expect_kw(Kw::In);
         let iter = self.parse_expr_bp(1);
         let body = self.parse_block();
         Expr {
             span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
-            kind: Box::new(ExprKind::For { pat, iter, body }),
+            kind: Box::new(ExprKind::For {
+                pat,
+                iter,
+                body,
+                is_await,
+            }),
         }
     }
 
@@ -2473,6 +2481,100 @@ impl<'a> Parser<'a> {
         Expr {
             span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
             kind: Box::new(ExprKind::While { cond, body }),
+        }
+    }
+
+    /// Parse `select { ... arms ... }` where each arm has one of three
+    /// shapes (using existing tokens — no `<-` operator):
+    ///
+    ///   * `name = recv(channel_expr) => block_or_expr`
+    ///   * `_ = timeout(duration_expr) => block_or_expr`
+    ///   * `else => block_or_expr`
+    ///
+    /// Arms are tried in declaration order. The first arm whose channel
+    /// has a value pending wins; if none is ready the `timeout` arm fires
+    /// (if any), or the `else` arm (if any), otherwise the runtime errors.
+    fn parse_select_expr(&mut self) -> Expr {
+        let start = self.peek_span();
+        self.bump(); // `select`
+        self.expect(&TokenKind::LBrace, "`{` to open `select`");
+        self.eat_newlines();
+        let mut arms: Vec<axon_ast::SelectArm> = Vec::new();
+        while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+            let arm_start = self.peek_span();
+            let kind = if matches!(self.peek(), TokenKind::Keyword(Kw::Else)) {
+                self.bump();
+                axon_ast::SelectArmKind::Else
+            } else {
+                // binding ident, then `=`
+                let binding = self.parse_ident();
+                self.expect(&TokenKind::Eq, "`=` after select-arm binding");
+                // RHS is `recv(expr)` or `timeout(expr)` — recognized by name.
+                let lookahead_ident = if let TokenKind::Ident(name) = self.peek() {
+                    Some(name.clone())
+                } else {
+                    None
+                };
+                match lookahead_ident.as_deref() {
+                    Some("recv") => {
+                        self.bump();
+                        self.expect(&TokenKind::LParen, "`(` after `recv`");
+                        let channel = self.parse_expr_bp(1);
+                        self.expect(&TokenKind::RParen, "`)` to close `recv(...)`");
+                        axon_ast::SelectArmKind::Recv { binding, channel }
+                    }
+                    Some("timeout") => {
+                        self.bump();
+                        self.expect(&TokenKind::LParen, "`(` after `timeout`");
+                        let duration = self.parse_expr_bp(1);
+                        self.expect(&TokenKind::RParen, "`)` to close `timeout(...)`");
+                        axon_ast::SelectArmKind::Timeout { duration }
+                    }
+                    _ => {
+                        let span = self.peek_span();
+                        self.error(
+                            "expected `recv(chan)` or `timeout(dur)` in select arm",
+                            span,
+                        );
+                        // Recover: skip to the next FatArrow or RBrace.
+                        while !matches!(
+                            self.peek(),
+                            TokenKind::FatArrow | TokenKind::RBrace | TokenKind::Eof
+                        ) {
+                            self.bump();
+                        }
+                        axon_ast::SelectArmKind::Else
+                    }
+                }
+            };
+            self.expect(&TokenKind::FatArrow, "`=>` after select-arm header");
+            let body = if matches!(self.peek(), TokenKind::LBrace) {
+                self.parse_block()
+            } else {
+                // Single-expression body: wrap as a block with tail expr.
+                let e = self.parse_expr_bp(1);
+                let span = e.span;
+                axon_ast::Block {
+                    span,
+                    stmts: Vec::new(),
+                    tail: Some(e),
+                }
+            };
+            arms.push(axon_ast::SelectArm {
+                kind,
+                body,
+                span: Span::in_file(arm_start.start as usize, self.prev_end(), self.file_id),
+            });
+            self.eat_newlines();
+            if matches!(self.peek(), TokenKind::Comma) {
+                self.bump();
+                self.eat_newlines();
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` to close `select`");
+        Expr {
+            span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+            kind: Box::new(ExprKind::Select(arms)),
         }
     }
 

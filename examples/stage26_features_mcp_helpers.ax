@@ -1,0 +1,60 @@
+//! examples/stage26_features_mcp_helpers.ax — Stage 26 demo.
+//!
+//! Closes the three remaining "minor" PLAN gaps:
+//!
+//!   §7.1  — `[features]` conditional compilation + `features_active()`
+//!   §25.5 — MCP server declarations in `axon.toml` + `mcp_*` host bindings
+//!   §39.2 — Deterministic helpers: `clock_freeze`, `clock_unfreeze`,
+//!           `rand_seed`
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage26_features_mcp_helpers.ax
+//!
+//! Note: this is a single-file demo, so the `[features]` and
+//! `[tools.<name>]` sections from `axon.toml` aren't applied here.
+//! For the full feature-gating flow see
+//! `crates/axon-cli/tests/stage26_minor_gaps.rs`.
+
+fn main() uses { Console, Time, Random } {
+    print("---- §39.2 deterministic helpers ----")
+
+    // Freeze the clock so `time_now` is bit-exact across runs.
+    clock_freeze(1700000000000000000)
+    let t1 = time_now()
+    let t2 = time_now()
+    print("frozen clock identical? ")
+    print(t1 == t2)
+
+    // Seed the RNG so `random_int`/`random_float` produce known draws.
+    rand_seed(42)
+    let r1 = random_int(0, 1000000)
+    rand_seed(42)
+    let r2 = random_int(0, 1000000)
+    print("same seed, same draw? ")
+    print(r1 == r2)
+
+    clock_unfreeze()
+    let t3 = time_now()
+    print("unfrozen clock advances? ")
+    print(t3 != t1)
+
+    print("---- §25.5 MCP server declarations ----")
+    // In a real project, axon.toml contains:
+    //   [tools.calculator]
+    //   tools = [{ name = "add", description = "...", input_schema = "..." }]
+    // The host loads it; programs see the discovered tool list.
+    //
+    // For this single-file demo we don't have a manifest, so the MCP
+    // registry starts empty. We show the introspection surface:
+    let nses = mcp_namespaces()
+    print("registered namespaces: ")
+    print(list_len(nses))
+    let deferred = mcp_deferred_namespaces()
+    print("deferred-transport namespaces: ")
+    print(list_len(deferred))
+
+    print("---- §7.1 feature introspection ----")
+    let active = features_active()
+    print("active features (single-file demo - empty): ")
+    print(list_len(active))
+}

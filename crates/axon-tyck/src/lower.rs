@@ -227,7 +227,7 @@ impl<'a> Checker<'a> {
         params: &ParamEnv,
     ) -> Ty {
         let expected = match name {
-            "Map" | "Tool" => 2,
+            "Map" | "Tool" | "Result" => 2,
             _ => 1,
         };
         if args.len() != expected {
@@ -259,6 +259,15 @@ impl<'a> Checker<'a> {
             "Chan" => Ty::Chan(Box::new(self.lower_type(&args[0], params))),
             "Secret" => Ty::Secret(Box::new(self.lower_type(&args[0], params))),
             "Tainted" => Ty::Tainted(Box::new(self.lower_type(&args[0], params))),
+            // `Result<T, E>` is treated as `Dyn` at the type level (the
+            // runtime carries ok/err discriminator via `result_ok` /
+            // `result_err`); the type parameters are lowered for side
+            // effects (so type errors inside `T` / `E` surface).
+            "Result" => {
+                let _ = self.lower_type(&args[0], params);
+                let _ = self.lower_type(&args[1], params);
+                Ty::Dyn
+            }
             _ => unreachable!(),
         }
     }

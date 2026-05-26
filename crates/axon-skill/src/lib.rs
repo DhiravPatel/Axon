@@ -26,8 +26,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod errors;
+pub mod use_skill;
 
 pub use errors::SkillError;
+pub use use_skill::{bind_skill, explain_missing, narrow_effects, SkillBinding};
 
 pub const FORMAT_VERSION: u32 = 1;
 

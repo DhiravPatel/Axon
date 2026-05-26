@@ -17,12 +17,17 @@
 pub mod audio;
 pub mod document;
 pub mod errors;
+pub mod generate;
 pub mod image;
 pub mod sniff;
 
 pub use audio::Audio;
 pub use document::Document;
 pub use errors::MediaError;
+pub use generate::{
+    GenAudioFormat, GenImageFormat, GenerateAudioRequest, GenerateImageRequest, GeneratedAudio,
+    GeneratedImage, MediaGenError, MediaProvider, MockProvider,
+};
 pub use image::{Image, ImageFormat};
 pub use sniff::sniff;
 

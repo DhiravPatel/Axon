@@ -1,0 +1,67 @@
+//! examples/stage23_dlib_and_delegation.ax — Stage 23 end-to-end demo.
+//!
+//! Demonstrates three new capabilities:
+//!
+//!   1. §35 Dynamic-library FFI — call `cos(x)` directly from the system
+//!      math library through `ffi_dlib_call`.
+//!   2. §54 Delegated identity — sign an `on_behalf_of` delegation with an
+//!      Ed25519 key, then verify it through a trust store with audience
+//!      and expiry checks.
+//!   3. §36 `axon pkg` — see the companion `axon.toml` next to this file
+//!      (not used here directly; run `axon pkg list` against any project
+//!      to see deps).
+//!
+//! Run:
+//!   cargo run -q -p axon-cli -- run examples/stage23_dlib_and_delegation.ax
+
+fn main() uses { Console } {
+    // ---- (1) Dynamic-library FFI: cos(0.0) from libm ----
+    let arg = { ty: "f64", v: 0.0 }
+    let argv = list_new(arg)
+
+    // Pick a library that ships with the OS so the demo runs without
+    // any third-party dependencies.
+    let libm = "/usr/lib/libSystem.B.dylib"
+    let cos_result = ffi_dlib_call(libm, "cos", argv, false)
+    print("ffi_dlib_call(cos, 0.0) ok = ")
+    print(bool(cos_result.ok))
+    if cos_result.ok {
+        print("cos(0.0) = ")
+        print(cos_result.value)
+    } else {
+        print("error = ")
+        print(cos_result.error)
+    }
+
+    // ---- (2) Delegated identity ----
+    // Alice mints an Ed25519 keypair and signs a delegation authorizing
+    // a research agent to act on her behalf for two named scopes, with
+    // a far-future expiry.
+    let kp = a2a_keypair_generate()
+    let scopes = list_new("Research", "Summarize")
+    let signed = "/tmp/axon-stage23-deleg.json"
+    let pubkey = a2a_sign_delegation(
+        kp.seed_hex,
+        "user:alice",
+        "research-agent-1",
+        scopes,
+        9999999999,
+        "demo-nonce-001",
+        signed
+    )
+    print("signed delegation written to ")
+    print(signed)
+
+    // The research agent (or any verifier) installs Alice's pubkey in a
+    // trust store and verifies the signed delegation. The check is
+    // fail-closed: untrusted signer, wrong audience, or expiry all reject.
+    a2a_trust_store_new("alice-delegates", list_new(pubkey))
+    let d = a2a_verify_delegation(signed, "alice-delegates", "research-agent-1", 1700000000)
+    print("verified delegation:")
+    print("  principal = ")
+    print(d.principal)
+    print("  audience  = ")
+    print(d.audience)
+    print("  nonce     = ")
+    print(d.nonce)
+}

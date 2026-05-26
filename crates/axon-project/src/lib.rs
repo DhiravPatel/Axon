@@ -19,6 +19,12 @@ use axon_ast::{Item, Program};
 use axon_diag::{Diagnostic, SourceFile, SourceRegistry, Span};
 use serde::Deserialize;
 
+pub mod features;
+pub mod mcp;
+
+pub use features::{filter_program, resolve_features, ActiveFeatures};
+pub use mcp::{McpRegistry, McpTool};
+
 pub const MANIFEST_FILENAME: &str = "axon.toml";
 pub const DEFAULT_SRC_DIR: &str = "src";
 pub const SOURCE_EXTENSION: &str = "ax";
@@ -40,6 +46,42 @@ pub struct Manifest {
     /// Network / git deps land in a future stage; for now only local
     /// paths are honored.
     pub deps: HashMap<String, Dependency>,
+    /// `[features]` table (§7.1). Each entry is a feature name → list
+    /// of features it transitively enables (Cargo-compatible shape).
+    /// The special `default` key (if present) is enabled when the user
+    /// doesn't pass `--features` on the CLI.
+    pub features: HashMap<String, Vec<String>>,
+    /// `[tools.<name>]` declarations (§25.5). Each is a typed
+    /// [`ToolDeclaration`] carrying either an `mcp` URL or `mcp_command`
+    /// (subprocess). The host crate resolves them at project-load time
+    /// and registers the discovered tools.
+    pub tools: HashMap<String, ToolDeclaration>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ToolDeclaration {
+    /// Remote MCP endpoint URL (`https://...`). Mutually exclusive with
+    /// `mcp_command`.
+    #[serde(default)]
+    pub mcp: String,
+    /// Subprocess MCP server (e.g. `"node mcp-github/index.js"`). The
+    /// host launches the process and speaks JSON-RPC over stdio.
+    #[serde(default)]
+    pub mcp_command: String,
+    /// Static tool definitions, when the operator wants to declare
+    /// tools inline rather than discover them. Each entry is a
+    /// `{ name, description, input_schema }` record.
+    #[serde(default)]
+    pub tools: Vec<InlineTool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct InlineTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -138,16 +180,40 @@ impl LoadedProject {
     /// (anything containing `axon.toml` or a `src/` subdir, or any
     /// directory walked as src).
     pub fn load(path: &Path) -> Result<Self, String> {
-        if path.is_file() {
-            return Self::load_single_file(path);
-        }
-        if !path.is_dir() {
+        Self::load_with_features(path, &[], true)
+    }
+
+    /// Variant that honors the manifest's `[features]` table plus an
+    /// explicit CLI-supplied feature list. Items gated by
+    /// `#[cfg(feature = "X")]` where X isn't in the resolved active set
+    /// are stripped from `merged` before tyck sees them.
+    pub fn load_with_features(
+        path: &Path,
+        cli_features: &[String],
+        enable_default: bool,
+    ) -> Result<Self, String> {
+        let mut p = if path.is_file() {
+            Self::load_single_file(path)?
+        } else if path.is_dir() {
+            Self::load_directory(path)?
+        } else {
             return Err(format!(
                 "axon: `{}` is neither a file nor a directory",
                 path.display()
             ));
+        };
+        let active = features::resolve_features(
+            &p.manifest.features,
+            cli_features,
+            enable_default,
+        );
+        features::filter_program(&mut p.merged, &active);
+        // Also filter each module's program so re-running tyck against
+        // a single module's source preserves the same gating.
+        for m in p.modules.iter_mut() {
+            features::filter_program(&mut m.program, &active);
         }
-        Self::load_directory(path)
+        Ok(p)
     }
 
     fn load_single_file(path: &Path) -> Result<Self, String> {

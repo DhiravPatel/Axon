@@ -29,6 +29,7 @@ members = [
     "crates/axon-cost",
     "crates/axon-ffi",
     "crates/axon-deploy",
+    "crates/axon-vm-cabi",
     "crates/axon-cli",
 ]
 resolver = "2"
@@ -71,6 +72,7 @@ axon-eval    = { path = "crates/axon-eval" }
 axon-cost    = { path = "crates/axon-cost" }
 axon-ffi     = { path = "crates/axon-ffi" }
 axon-deploy  = { path = "crates/axon-deploy" }
+axon-vm-cabi = { path = "crates/axon-vm-cabi" }
 
 ureq         = { version = "2", default-features = false, features = ["tls", "json"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn \"let.*= \\\\`\" \"/Users/dhiravpatel/Documents/Project 2/Axon/examples/\" --include=\"*.ax\")",
+      "Bash(./target/debug/axon check *)",
+      "Bash(awk '/test result/{p+=$4; f+=$6} END {print \"TOTAL PASSED:\", p, \"  FAILED:\", f}')",
+      "Bash(awk '{p+=$4; f+=$6} END {print \"TOTAL PASSED:\", p, \"  FAILED:\", f}')",
+      "Read(//Users/dhiravpatel/Documents/Project\\\\ 2/Axon/**)",
+      "Bash(grep -E \"§[0-9]{1,2}\" PLAN.md)"
+    ]
+  }
+}

@@ -24,6 +24,7 @@ use crate::value::Value;
 
 /// Result of compiling a [`Program`]: every top-level function chunk plus a
 /// flat list of every global name the program touches.
+#[derive(Clone)]
 pub struct CompiledProgram {
     /// All compiled function chunks. Each named item is one entry.
     pub functions: Vec<std::rc::Rc<Function>>,
@@ -672,7 +673,11 @@ impl Compiler {
                 self.patch_jump_here(skip);
                 self.emit(Op::LoadUnit, expr.span);
             }
-            ExprKind::For { pat, iter, body } => {
+            ExprKind::For { pat, iter, body, .. } => {
+                // VM treats `for await` the same as `for` — async-stream
+                // dispatch lives in the tree-walking eval, where the
+                // Chan-vs-List distinction is observable. The bytecode
+                // path always iterates eagerly.
                 self.compile_for(pat, iter, body, expr.span)
             }
             ExprKind::While { cond, body } => self.compile_while(cond, body, expr.span),

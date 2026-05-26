@@ -8,3 +8,4 @@ description = "Axon secrets — Secret<T> redaction-aware type + filesystem-perm
 [dependencies]
 serde      = { workspace = true }
 serde_json = { workspace = true }
+ureq       = { workspace = true }

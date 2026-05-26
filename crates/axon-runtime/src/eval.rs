@@ -66,6 +66,15 @@ impl Default for Interpreter {
     }
 }
 
+/// Slot bag collected by `fill_request_from_slots` for `ask`/`plan`. The
+/// non-prompt slots — `tools`, `max_steps`, `output` — are surfaced here so
+/// the call site can drive loop bounds and result parsing.
+pub(crate) struct PlanSlotMeta {
+    pub tools: Vec<std::rc::Rc<crate::tool::ToolDef>>,
+    pub max_steps: Option<usize>,
+    pub output_schema: Option<String>,
+}
+
 impl Interpreter {
     pub fn new() -> Self {
         Self::with_caps(CapSet::standard_default())
@@ -134,6 +143,17 @@ impl Interpreter {
         self.tracer.borrow_mut().take()
     }
 
+    /// Snapshot the current trace spans without disturbing the tracer.
+    /// Used by `trace_export_otlp` to flush mid-run, and by `axon repl`
+    /// to surface effect summaries between expressions.
+    pub fn with_trace_spans<R>(
+        &self,
+        f: impl FnOnce(&[crate::trace::TraceSpan]) -> R,
+    ) -> Option<R> {
+        let g = self.tracer.borrow();
+        g.as_ref().map(|t| f(t.spans()))
+    }
+
     /// Begin a recording — every subsequent non-deterministic observation
     /// (model response, in v0) is appended.
     pub fn enable_recording(&self) {
@@ -149,6 +169,22 @@ impl Interpreter {
     /// without contacting any provider.
     pub fn enable_replay(&self, rec: crate::record::Recording) {
         *self.replay.borrow_mut() = Some(crate::record::Replay::new(rec));
+    }
+
+    /// Begin a replay in `--patch` mode (lenient). A program that diverges
+    /// from the original — for example, by adding extra model calls past
+    /// the end of the recording — gets a clean error instead of an
+    /// assertion-style halt. Used by `axon replay --patch`.
+    pub fn enable_replay_lenient(&self, rec: crate::record::Recording) {
+        *self.replay.borrow_mut() = Some(crate::record::Replay::new_lenient(rec));
+    }
+
+    /// Borrow the replay cursor info for end-of-run reporting.
+    pub fn replay_progress(&self) -> Option<(usize, usize, bool)> {
+        self.replay
+            .borrow()
+            .as_ref()
+            .map(|r| (r.cursor(), r.total(), r.is_lenient()))
     }
 
     /// Register top-level item bindings derived from a `Program`. Functions
@@ -222,13 +258,15 @@ impl Interpreter {
                         })
                         .unwrap_or_default(),
                 );
-                let closure = Closure::new(
+                let (policy, _attr_warnings) = crate::attrs::parse_attrs(&f.attrs);
+                let closure = Closure::with_policy(
                     Some(f.name.name.clone()),
                     f.params.clone(),
                     ClosureBody::Block(f.body.clone()),
                     self.globals.clone(),
                     f.span,
                     declared,
+                    policy,
                 );
                 self.globals
                     .define(&f.name.name, Value::Fn(Rc::new(closure)));
@@ -495,12 +533,14 @@ impl Interpreter {
                 }
                 Ok(Value::Unit)
             }
-            ExprKind::For { pat, iter, body } => self.eval_for(pat, iter, body, env, expr.span),
+            ExprKind::For {
+                pat,
+                iter,
+                body,
+                is_await,
+            } => self.eval_for(pat, iter, body, *is_await, env, expr.span),
             ExprKind::While { cond, body } => self.eval_while(cond, body, env),
-            ExprKind::Select(_) => Err(EvalSignal::error(
-                "`select` requires the actor runtime (stage 5)",
-                expr.span,
-            )),
+            ExprKind::Select(arms) => self.eval_select(arms, env, expr.span),
             ExprKind::Ask { target, slots } => self.eval_ask(target, slots, expr.span, env),
             ExprKind::Generate {
                 schema,
@@ -1013,6 +1053,21 @@ impl Interpreter {
         args: &[Value],
         call_site: Span,
     ) -> EvalResult<Value> {
+        // Fast path: no behaviour attributes → run the body once, untouched.
+        if closure.policy.is_default() {
+            return self.call_closure_raw(closure, args, call_site);
+        }
+        self.call_closure_with_policy(closure, args, call_site)
+    }
+
+    /// The original call-closure logic, factored out so the attribute
+    /// dispatcher can re-enter it cheaply for every retry attempt.
+    fn call_closure_raw(
+        &mut self,
+        closure: &Rc<Closure>,
+        args: &[Value],
+        call_site: Span,
+    ) -> EvalResult<Value> {
         let expected = closure.params.len();
         if args.len() != expected {
             return Err(EvalSignal::error(
@@ -1068,6 +1123,88 @@ impl Interpreter {
             }))),
             Err(other) => Err(other),
         }
+    }
+
+    /// Dispatcher for attributed functions: applies `@memoize`, `@retry`,
+    /// and `@deadline` around the raw body. `@idempotent` is metadata
+    /// consumed elsewhere (supervisor restart, replay).
+    fn call_closure_with_policy(
+        &mut self,
+        closure: &Rc<Closure>,
+        args: &[Value],
+        call_site: Span,
+    ) -> EvalResult<Value> {
+        let policy = closure.policy.clone();
+
+        // Memoization: look up first, run later, store on success.
+        let cache_key = policy.memoize.as_ref().map(|_| {
+            let parts: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
+            parts.join("\x1f")
+        });
+        if let (Some(mem), Some(key)) = (policy.memoize.as_ref(), cache_key.as_ref()) {
+            if let Some(hit) = lookup_memo(mem, key) {
+                return Ok(hit);
+            }
+        }
+
+        // Wall-clock deadline & retry budget.
+        let started = std::time::Instant::now();
+        let attempts = policy.retry.as_ref().map(|r| r.times).unwrap_or(1);
+        let backoff_ms = policy.retry.as_ref().map(|r| r.backoff_ms).unwrap_or(0);
+
+        let mut last_err: Option<EvalSignal> = None;
+        for attempt in 1..=attempts {
+            // Check the deadline *before* attempting; an early deadline
+            // surfaces as a clean error rather than burning another retry.
+            if let Some(ms) = policy.deadline_ms {
+                if started.elapsed().as_millis() as u64 >= ms {
+                    return Err(EvalSignal::error(
+                        format!(
+                            "`@deadline(ms = {ms})` exceeded for `{}` before attempt {attempt}",
+                            closure.display_name()
+                        ),
+                        call_site,
+                    ));
+                }
+            }
+            match self.call_closure_raw(closure, args, call_site) {
+                Ok(v) => {
+                    // Memo on success.
+                    if let (Some(mem), Some(key)) = (policy.memoize.as_ref(), cache_key.as_ref()) {
+                        store_memo(mem, key, v.clone());
+                    }
+                    // Final deadline check.
+                    if let Some(ms) = policy.deadline_ms {
+                        if started.elapsed().as_millis() as u64 > ms {
+                            return Err(EvalSignal::error(
+                                format!(
+                                    "`@deadline(ms = {ms})` exceeded for `{}` after success (took {}ms)",
+                                    closure.display_name(),
+                                    started.elapsed().as_millis()
+                                ),
+                                call_site,
+                            ));
+                        }
+                    }
+                    return Ok(v);
+                }
+                Err(sig @ EvalSignal::Error(_)) => {
+                    last_err = Some(sig);
+                    if attempt < attempts && backoff_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    }
+                }
+                // Non-error signals (Return / Break / Continue / Yield) are
+                // control flow, not failures — bubble them up unchanged.
+                Err(other) => return Err(other),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            EvalSignal::error(
+                format!("`{}` failed without a recorded error", closure.display_name()),
+                call_site,
+            )
+        }))
     }
 
     fn call_method(
@@ -1690,14 +1827,15 @@ impl Interpreter {
             )],
         );
         let mut req = axon_models::ChatRequest::default();
-        let tools = match self.fill_request_from_slots(&mut req, slots, env) {
-            Ok(t) => t,
+        let meta = match self.fill_request_from_slots(&mut req, slots, env) {
+            Ok(m) => m,
             Err(e) => {
                 self.close_span_with_result::<()>(sid, &Err(e.clone_signal_for_error()));
                 return Err(e);
             }
         };
-        let result = self.run_tool_use_loop(&provider, req, &tools, span);
+        let cap = meta.max_steps.unwrap_or(Self::MAX_TOOL_USE_ITERATIONS);
+        let result = self.run_tool_use_loop(&provider, req, &meta.tools, cap, span);
         self.close_span_with_result(sid, &result);
         result.map(|c| Value::String(Rc::new(c)))
     }
@@ -1709,10 +1847,9 @@ impl Interpreter {
         span: Span,
         env: &Env,
     ) -> EvalResult<Value> {
-        // `plan with model { ... }` is `ask` with the full prompt-slot
-        // vocabulary plus the tool-use loop wired in. Stage 6.5 honors
-        // `system`, `user`, `memory`, `tools`, `stop`, `budget`; `output`,
-        // `examples`, `max_steps`, `context` parse but are no-ops today.
+        // `plan with model { ... }` runs the full tool-use loop and now
+        // honors `max_steps:` (loop cap override) and `output:` (final
+        // result is parsed as JSON, returned as a structured record).
         self.require_caps(&["LLM", "Net"], span)?;
         let target_v = self.eval_expr(target, env)?;
         let provider = self.require_model(&target_v, span)?;
@@ -1725,33 +1862,57 @@ impl Interpreter {
             )],
         );
         let mut req = axon_models::ChatRequest::default();
-        let tools = match self.fill_request_from_slots(&mut req, slots, env) {
-            Ok(t) => t,
+        let meta = match self.fill_request_from_slots(&mut req, slots, env) {
+            Ok(m) => m,
             Err(e) => {
                 self.close_span_with_result::<()>(sid, &Err(e.clone_signal_for_error()));
                 return Err(e);
             }
         };
-        let result = self.run_tool_use_loop(&provider, req, &tools, span);
+        let cap = meta.max_steps.unwrap_or(Self::MAX_TOOL_USE_ITERATIONS);
+        let result = self.run_tool_use_loop(&provider, req, &meta.tools, cap, span);
         self.close_span_with_result(sid, &result);
-        result.map(|c| Value::String(Rc::new(c)))
+        match result {
+            Ok(text) => {
+                // If the user asked for a structured `output:`, parse the
+                // final assistant text as JSON and surface it as a Record.
+                // Plain `plan` (no output slot) still returns the raw String.
+                if meta.output_schema.is_some() {
+                    match serde_json::from_str::<serde_json::Value>(text.trim()) {
+                        Ok(v) => Ok(json_to_value(&v)),
+                        Err(e) => Err(EvalSignal::error(
+                            format!(
+                                "`plan` with `output:` expects valid JSON in the final \
+                                response; parse failed: {e}"
+                            ),
+                            span,
+                        )),
+                    }
+                } else {
+                    Ok(Value::String(Rc::new(text)))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Hard cap on the request → tool-call → result → request loop. A
+    /// Default cap on the request → tool-call → result → request loop. A
     /// busted model that asks for tool calls forever shouldn't burn
-    /// unbounded tokens — the user gets a clean error past this point.
-    const MAX_TOOL_USE_ITERATIONS: usize = 8;
+    /// unbounded tokens — `plan` overrides this via `max_steps:`.
+    pub(crate) const MAX_TOOL_USE_ITERATIONS: usize = 8;
 
     /// Drive the request/tool/response loop. Returns the final text once
-    /// the model produces a non-tool-use stop reason.
+    /// the model produces a non-tool-use stop reason. `iteration_cap` is
+    /// the absolute upper bound on request rounds.
     fn run_tool_use_loop(
         &mut self,
         provider: &Rc<dyn axon_models::ModelProvider>,
         mut req: axon_models::ChatRequest,
         tools: &[std::rc::Rc<crate::tool::ToolDef>],
+        iteration_cap: usize,
         span: Span,
     ) -> EvalResult<String> {
-        for _ in 0..Self::MAX_TOOL_USE_ITERATIONS {
+        for _ in 0..iteration_cap {
             let resp = self.call_provider(provider, &req, span)?;
             if resp.tool_calls.is_empty() {
                 return Ok(resp.content);
@@ -1963,9 +2124,11 @@ impl Interpreter {
         req: &mut axon_models::ChatRequest,
         slots: &[axon_ast::PromptSlot],
         env: &Env,
-    ) -> EvalResult<Vec<std::rc::Rc<crate::tool::ToolDef>>> {
+    ) -> EvalResult<PlanSlotMeta> {
         let mut user_buf = String::new();
         let mut tools: Vec<std::rc::Rc<crate::tool::ToolDef>> = Vec::new();
+        let mut max_steps: Option<usize> = None;
+        let mut output_schema: Option<String> = None;
         for slot in slots {
             let v = self.eval_expr(&slot.value, env)?;
             let label = slot.label.as_ref().map(|i| i.name.as_str()).unwrap_or("system");
@@ -2069,10 +2232,39 @@ impl Interpreter {
                         }
                     }
                 }
-                "max_steps" | "examples" | "output" | "context" => {
+                "max_steps" => match v {
+                    Value::Int(i) if i > 0 => max_steps = Some(i as usize),
+                    Value::Int(i) => {
+                        return Err(EvalSignal::error(
+                            format!("`max_steps:` must be > 0, got {i}"),
+                            slot.span,
+                        ));
+                    }
+                    _ => {
+                        return Err(EvalSignal::error(
+                            format!(
+                                "`max_steps:` expects an Int, got `{}`",
+                                v.type_name()
+                            ),
+                            slot.span,
+                        ));
+                    }
+                },
+                "output" => {
+                    // Capture the user's schema-name hint for post-loop parsing.
+                    // The value is typically a `Schema` declaration referenced
+                    // by name; we record the type name (or string lexeme) for
+                    // routing into `schema_parse`.
+                    let name = match &v {
+                        Value::String(s) => s.as_str().to_string(),
+                        other => other.to_string(),
+                    };
+                    if !name.is_empty() {
+                        output_schema = Some(name);
+                    }
+                }
+                "examples" | "context" => {
                     // Recognized but currently no-op at the request level.
-                    // `output` is handled by `generate<S>`; the other
-                    // slots are surface-only for now.
                 }
                 _ => {}
             }
@@ -2081,7 +2273,30 @@ impl Interpreter {
             req.messages
                 .push(axon_models::Message::user_text(user_buf));
         }
-        Ok(tools)
+        if let Some(name) = &output_schema {
+            // Steer the model toward emitting a JSON document matching the
+            // schema. Real schema-constrained decoding lives in §17.2 and
+            // arrives with the JSON-Schema bridge; for v0 we surface the
+            // shape via a tail system instruction.
+            let nudge = format!(
+                "Respond with a single JSON object that validates against the `{name}` schema. \
+                Do not include any prose outside the JSON."
+            );
+            match &mut req.system {
+                Some(existing) => {
+                    if !existing.is_empty() {
+                        existing.push('\n');
+                    }
+                    existing.push_str(&nudge);
+                }
+                None => req.system = Some(nudge),
+            }
+        }
+        Ok(PlanSlotMeta {
+            tools,
+            max_steps,
+            output_schema,
+        })
     }
 
     fn call_provider(
@@ -2340,10 +2555,39 @@ impl Interpreter {
         pat: &Pattern,
         iter: &Expr,
         body: &Block,
+        is_await: bool,
         env: &Env,
         span: Span,
     ) -> EvalResult<Value> {
         let iter_v = self.eval_expr(iter, env)?;
+        // `for await` accepts the regular iterable shapes AND drains a
+        // `Chan` as a stream: values are popped from the front in order
+        // until the channel is empty. Treating a Chan as a one-shot
+        // stream is the v0 synchronous proxy for §28 backpressured
+        // streams — the surface is correct; backpressure lands when the
+        // async scheduler does.
+        if is_await {
+            if let Value::Chan(q) = iter_v {
+                loop {
+                    let next = {
+                        let mut g = q.borrow_mut();
+                        g.pop_front()
+                    };
+                    let Some(item) = next else { break };
+                    let child = env.child();
+                    self.bind_pattern(pat, item, &child)?;
+                    match self.eval_block(body, &child) {
+                        Ok(_) => {}
+                        Err(EvalSignal::Break { .. }) => break,
+                        Err(EvalSignal::Continue { .. }) => continue,
+                        Err(other) => return Err(other),
+                    }
+                }
+                return Ok(Value::Unit);
+            }
+            // Else fall through: a list/set/etc. is a perfectly valid
+            // synchronous "stream" to iterate over.
+        }
         let items: Vec<Value> = match iter_v {
             Value::List(xs) => xs.borrow().clone(),
             Value::Set(xs) => xs.borrow().clone(),
@@ -2355,6 +2599,11 @@ impl Interpreter {
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k, v])))
                 .collect(),
             Value::String(s) => s.chars().map(Value::Char).collect(),
+            Value::Chan(q) => {
+                // Plain `for` over a Chan: snapshot + drain in one pass.
+                let mut g = q.borrow_mut();
+                std::mem::take(&mut *g).into_iter().collect()
+            }
             other => {
                 return Err(EvalSignal::error(
                     format!("value of type `{}` is not iterable", other.type_name()),
@@ -2373,6 +2622,68 @@ impl Interpreter {
             }
         }
         Ok(Value::Unit)
+    }
+
+    /// Evaluate a `select { ... }` block. Synchronous semantics:
+    ///
+    ///   1. Walk every `recv(chan)` arm in declaration order; the first
+    ///      one whose channel has a value pending wins.
+    ///   2. If no recv arm is ready: take the first `timeout(...)` arm
+    ///      (it fires immediately in the sync runtime — we can't actually
+    ///      wait), else the first `else` arm.
+    ///   3. If neither is present and no recv was ready, runtime error.
+    fn eval_select(
+        &mut self,
+        arms: &[axon_ast::SelectArm],
+        env: &Env,
+        span: Span,
+    ) -> EvalResult<Value> {
+        // First pass: find a ready Recv.
+        for arm in arms {
+            if let axon_ast::SelectArmKind::Recv { binding, channel } = &arm.kind {
+                let chan_v = self.eval_expr(channel, env)?;
+                let q = match chan_v {
+                    Value::Chan(q) => q,
+                    other => {
+                        return Err(EvalSignal::error(
+                            format!(
+                                "select: `recv(...)` expects a Chan, got `{}`",
+                                other.type_name()
+                            ),
+                            arm.span,
+                        ));
+                    }
+                };
+                let popped = q.borrow_mut().pop_front();
+                if let Some(v) = popped {
+                    let child = env.child();
+                    if binding.name != "_" {
+                        child.define(&binding.name, v);
+                    }
+                    return self.eval_block(&arm.body, &child);
+                }
+            }
+        }
+        // Second pass: take a Timeout or an Else (in declaration order).
+        for arm in arms {
+            match &arm.kind {
+                axon_ast::SelectArmKind::Timeout { duration } => {
+                    // Evaluate `duration` for side effects + trace, then
+                    // run the body. In the sync runtime the timeout fires
+                    // immediately when no channel is ready.
+                    let _ = self.eval_expr(duration, env)?;
+                    return self.eval_block(&arm.body, env);
+                }
+                axon_ast::SelectArmKind::Else => {
+                    return self.eval_block(&arm.body, env);
+                }
+                _ => {}
+            }
+        }
+        Err(EvalSignal::error(
+            "select: no channel was ready and no `timeout`/`else` arm present",
+            span,
+        ))
     }
 
     fn eval_while(&mut self, cond: &Expr, body: &Block, env: &Env) -> EvalResult<Value> {
@@ -3182,4 +3493,38 @@ fn stub_call_placeholder(_kind: &'static str) -> crate::value::NativeCall {
         )
     }
     stub_call
+}
+
+// ---------------------------------------------------------------------------
+// Memoization helpers — keep them free functions so they don't borrow
+// `Interpreter` (the call-site does, indirectly through `call_closure_raw`).
+// ---------------------------------------------------------------------------
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn lookup_memo(mem: &crate::attrs::MemoizePolicy, key: &str) -> Option<Value> {
+    let cache = mem.cache.borrow();
+    let entry = cache.get(key)?;
+    if let Some(ttl) = mem.ttl {
+        let age_ns = now_ns().saturating_sub(entry.stored_at_ns);
+        if age_ns as u128 > ttl.as_nanos() {
+            return None;
+        }
+    }
+    Some(entry.value.clone())
+}
+
+fn store_memo(mem: &crate::attrs::MemoizePolicy, key: &str, value: Value) {
+    mem.cache.borrow_mut().insert(
+        key.to_string(),
+        crate::attrs::CacheEntry {
+            value,
+            stored_at_ns: now_ns(),
+        },
+    );
 }
