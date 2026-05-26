@@ -145,6 +145,10 @@ fn check_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
         ExprKind::Await(inner) | ExprKind::Try(inner) | ExprKind::Force(inner) => {
             check_expr(inner, diags);
         }
+        ExprKind::TryRecover { .. } => diags.push(unsupported(
+            "`try/recover` is not available in the WASM target (needs the interpreter)",
+            e.span,
+        )),
         ExprKind::Spawn(_) => diags.push(unsupported(
             "`spawn` is not available in the WASM target (no actor runtime)",
             e.span,

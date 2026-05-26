@@ -648,6 +648,10 @@ impl Compiler {
             }
             ExprKind::Await(inner) => self.compile_expr(inner),
             ExprKind::Try(inner) => self.compile_expr(inner),
+            ExprKind::TryRecover { .. } => self.emit_unsupported(
+                "try/recover requires the tree-walking interpreter (run without --vm)",
+                expr.span,
+            ),
             ExprKind::Force(inner) => {
                 self.compile_expr(inner);
                 self.emit(Op::Force, expr.span);

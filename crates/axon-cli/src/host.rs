@@ -15,6 +15,7 @@ use axon_runtime::{Interpreter, NativeExtFn, NativeFn, Value};
 /// Install every host-provided native binding on `interp`.
 pub fn install(interp: &Interpreter) {
     axon_std::register_all(interp);
+    install_extern_bridge(interp);
     install_memory(interp);
     install_rag(interp);
     install_media(interp);
@@ -6041,6 +6042,40 @@ fn s28_render_grpc_proto(args: &[Value]) -> Result<Value, String> {
     let handlers = list_of_strings(&args[1], "serve_render_grpc_proto", "handlers")?;
     let body = proto::render_grpc_proto(service_name.as_str(), &handlers);
     Ok(Value::String(Rc::new(body)))
+}
+
+/// Wire `extern <lang> "path:fn"` tool bodies (§35.2) to the FFI bridge
+/// layer. The runtime calls this dispatcher with `(abi, symbol,
+/// args_json)`; we map the abi to a `BridgeKind`, split the symbol into
+/// `target:entrypoint`, run the subprocess bridge, and hand back the
+/// `value` JSON the bridge produced.
+fn install_extern_bridge(interp: &Interpreter) {
+    interp.set_bridge_dispatcher(Rc::new(
+        |abi: &str, symbol: &str, args_json: &str| -> Result<String, String> {
+            let kind = ffi_bridges::BridgeKind::from_str(abi).ok_or_else(|| {
+                format!("extern tool: unknown bridge `{abi}` (expected python|node|wasm|grpc)")
+            })?;
+            // `symbol` is `path:entrypoint` for python/node/wasm, or a
+            // bare `pkg.Svc/Method` for grpc. Split on the last colon so
+            // Windows-style paths with a drive letter still work.
+            let (target, entrypoint) = match symbol.rsplit_once(':') {
+                Some((t, e)) if !matches!(kind, ffi_bridges::BridgeKind::Grpc) => {
+                    (t.to_string(), e.to_string())
+                }
+                _ => (symbol.to_string(), String::new()),
+            };
+            let spec = ffi_bridges::BridgeSpec {
+                kind,
+                target,
+                entrypoint,
+                timeout_ms: 30_000,
+                launcher_override: String::new(),
+            };
+            let out =
+                ffi_bridges::call_bridge(&spec, args_json).map_err(|e| e.to_string())?;
+            Ok(out.value.to_string())
+        },
+    ));
 }
 
 // ===========================================================================

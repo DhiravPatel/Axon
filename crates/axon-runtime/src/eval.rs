@@ -58,7 +58,18 @@ pub struct Interpreter {
     /// Recording / replay state — at most one is `Some` at a time.
     pub(crate) recording: std::cell::RefCell<Option<crate::record::Recording>>,
     pub(crate) replay: std::cell::RefCell<Option<crate::record::Replay>>,
+    /// Host-installed dispatcher for `extern <lang> "..."` tools (§35.2).
+    /// The runtime has no FFI deps; the host (axon-cli) installs a
+    /// closure that routes `(abi, symbol, args_json) -> result_json`
+    /// through `axon-ffi` bridges. `None` until the host sets it. Held
+    /// behind an `Rc<RefCell<…>>` so per-tool `Native` closures captured
+    /// at load time can read the dispatcher installed later at run time.
+    pub(crate) bridge_dispatcher: std::rc::Rc<std::cell::RefCell<Option<BridgeDispatcher>>>,
 }
+
+/// `(abi, symbol, args_json) -> Result<result_json, error>`.
+pub type BridgeDispatcher =
+    std::rc::Rc<dyn Fn(&str, &str, &str) -> Result<String, String>>;
 
 impl Default for Interpreter {
     fn default() -> Self {
@@ -98,6 +109,7 @@ impl Interpreter {
             budget_stack: std::cell::RefCell::new(crate::budget::BudgetStack::default()),
             recording: std::cell::RefCell::new(None),
             replay: std::cell::RefCell::new(None),
+            bridge_dispatcher: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         let mut register = |name: &'static str, native: NativeFn| {
             interp
@@ -128,6 +140,13 @@ impl Interpreter {
     pub fn register_native_ext(&self, name: &'static str, native: crate::value::NativeExtFn) {
         self.globals
             .define(name, Value::NativeExt(Rc::new(native)));
+    }
+
+    /// Install the FFI-bridge dispatcher for `extern <lang> "..."` tools
+    /// (§35.2). The host (which owns the FFI deps) provides a closure
+    /// `(abi, symbol, args_json) -> Result<result_json, error>`.
+    pub fn set_bridge_dispatcher(&self, dispatcher: BridgeDispatcher) {
+        *self.bridge_dispatcher.borrow_mut() = Some(dispatcher);
     }
 
     /// Install a tracer. Subsequent ask/plan/generate/tool/handler steps
@@ -318,15 +337,42 @@ impl Interpreter {
                 // Axon code.
                 let body = match &t.body {
                     axon_ast::ToolBody::Block(b) => crate::tool::ToolBody::Block(b.clone()),
-                    axon_ast::ToolBody::Extern { .. } => {
-                        // FFI tools land in Stage 8. For now, register an
-                        // erroring stub so the program loads but call
-                        // sites fail with a clear message.
-                        self.globals.define(
-                            &t.name.name,
-                            make_stub("extern tool", t.name.name.clone()),
-                        );
-                        return;
+                    axon_ast::ToolBody::Extern { abi, symbol } => {
+                        // `extern <abi> "symbol"` (§35.2). Build a native
+                        // tool body that marshals args to a JSON object
+                        // keyed by parameter name, routes through the
+                        // host-installed bridge dispatcher, and parses
+                        // the JSON result back into a Value. The
+                        // dispatcher handle is read at *call* time so a
+                        // host that installs it after `load_program`
+                        // still works.
+                        let abi = abi.clone();
+                        let symbol = symbol.clone();
+                        let tool_name = t.name.name.clone();
+                        let params = t.params.clone();
+                        let disp = std::rc::Rc::clone(&self.bridge_dispatcher);
+                        let f = move |args: &[Value]| -> Result<Value, String> {
+                            let dispatcher = disp.borrow().clone().ok_or_else(|| {
+                                format!(
+                                    "extern tool `{tool_name}`: no FFI bridge dispatcher installed (run via the `axon` CLI)"
+                                )
+                            })?;
+                            let mut obj = serde_json::Map::new();
+                            for (p, v) in params.iter().zip(args.iter()) {
+                                obj.insert(p.name.name.clone(), value_to_json(v));
+                            }
+                            let args_json =
+                                serde_json::Value::Object(obj).to_string();
+                            let result_json = dispatcher(&abi, &symbol, &args_json)?;
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&result_json).map_err(|e| {
+                                    format!(
+                                        "extern tool `{tool_name}`: bad result JSON: {e}"
+                                    )
+                                })?;
+                            Ok(json_to_value(&parsed))
+                        };
+                        crate::tool::ToolBody::Native(std::rc::Rc::new(f))
                     }
                 };
                 let declared = Some(
@@ -493,6 +539,9 @@ impl Interpreter {
             }
             ExprKind::Await(inner) => self.eval_expr(inner, env),
             ExprKind::Try(inner) => self.eval_expr(inner, env),
+            ExprKind::TryRecover { body, recover } => {
+                self.eval_try_recover(body, recover, env, expr.span)
+            }
             ExprKind::Force(inner) => {
                 let v = self.eval_expr(inner, env)?;
                 match v {
@@ -2550,6 +2599,37 @@ fn ensure_arity(method: &str, expected: usize, got: usize, span: Span) -> EvalRe
 // ===========================================================================
 
 impl Interpreter {
+    /// `try { body } recover |e| { ... }`. Evaluate `body`; on a
+    /// runtime error (only `EvalSignal::Error` — control-flow signals
+    /// like return/break propagate), bind the error message string to
+    /// the recover lambda's first parameter and evaluate the recover
+    /// branch. The recover branch runs in a child scope of the *current*
+    /// environment, not the body's, so it can't see the body's locals.
+    fn eval_try_recover(
+        &mut self,
+        body: &Block,
+        recover: &axon_ast::LambdaExpr,
+        env: &Env,
+        _span: Span,
+    ) -> EvalResult<Value> {
+        match self.eval_block(body, &env.child()) {
+            Ok(v) => Ok(v),
+            Err(EvalSignal::Error(err)) => {
+                let child = env.child();
+                if let Some(p) = recover.params.first() {
+                    child.define(
+                        p.name.clone(),
+                        Value::String(Rc::new(err.message.clone())),
+                    );
+                }
+                self.eval_expr(&recover.body, &child)
+            }
+            // Return / break / continue must propagate unchanged so
+            // `try` inside a loop or function behaves transparently.
+            Err(other) => Err(other),
+        }
+    }
+
     fn eval_for(
         &mut self,
         pat: &Pattern,

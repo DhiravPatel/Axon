@@ -439,6 +439,26 @@ impl<'a> Checker<'a> {
                 // treat `?` as the identity at the type level.
                 t
             }
+            ExprKind::TryRecover { body, recover } => {
+                // The body and the recover branch must agree on a type;
+                // the whole expression has the joined type. The recover
+                // lambda receives the error message as a single `String`
+                // parameter.
+                let body_ty = self.check_block(body, &Ty::Dyn, scope, params, used);
+                let mut scope2 = Scope::new();
+                for fr in &scope.frames {
+                    scope2.frames.push(fr.clone());
+                }
+                scope2.push();
+                if let Some(p) = recover.params.first() {
+                    scope2.bind(p.name.clone(), Ty::String);
+                }
+                for p in recover.params.iter().skip(1) {
+                    scope2.bind(p.name.clone(), Ty::Dyn);
+                }
+                let recover_ty = self.infer(&recover.body, &mut scope2, params, used);
+                join_types(&body_ty, &recover_ty)
+            }
             ExprKind::Force(inner) => {
                 let t = self.infer(inner, scope, params, used);
                 if let Ty::Nullable(inner) | Ty::Option(inner) = t {

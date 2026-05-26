@@ -257,6 +257,9 @@ impl<'a> Parser<'a> {
             // as a name in user code.
             TokenKind::Ident(s) if s == "test" => Some(Item::Test(self.parse_test_decl(false))),
             TokenKind::Ident(s) if s == "eval" => Some(Item::Eval(self.parse_eval_decl())),
+            TokenKind::Ident(s) if s == "policy" => {
+                Some(Item::Policy(self.parse_policy_decl()))
+            }
             _ => None,
         }
     }
@@ -284,6 +287,210 @@ impl<'a> Parser<'a> {
             name,
             body,
             span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+        }
+    }
+
+    /// `policy NAME { allow tool …; deny net …; budget …; rate …; audit … }`
+    /// (§30). Parsed into structured [`PolicyClause`]s; the runtime
+    /// compiles them into an enforceable policy block.
+    fn parse_policy_decl(&mut self) -> axon_ast::PolicyDecl {
+        use axon_ast::{PolicyAction, PolicyClause};
+        let start = self.peek_span();
+        self.bump(); // consume `policy`
+        let name = self.parse_ident();
+        self.expect(&TokenKind::LBrace, "`{` to start policy body");
+        self.eat_newlines();
+        let mut clauses = Vec::new();
+        while !matches!(self.peek(), TokenKind::RBrace) && !self.at_eof() {
+            // Each clause is keyword-led by a contextual identifier.
+            let lead = match self.peek().clone() {
+                TokenKind::Ident(s) => s,
+                _ => {
+                    let sp = self.peek_span();
+                    self.error("expected a policy clause (allow/deny/budget/rate/audit)", sp);
+                    // Skip to next line to recover.
+                    let _ = self.consume_raw_until_newline();
+                    self.eat_newlines();
+                    continue;
+                }
+            };
+            match lead.as_str() {
+                "allow" | "deny" => {
+                    self.bump(); // action
+                    let action = if lead == "allow" {
+                        PolicyAction::Allow
+                    } else {
+                        PolicyAction::Deny
+                    };
+                    let effect = self.parse_ident().name;
+                    let mut patterns = vec![self.parse_policy_pattern()];
+                    while matches!(self.peek(), TokenKind::Comma) {
+                        self.bump();
+                        patterns.push(self.parse_policy_pattern());
+                    }
+                    let when = if self.bump_if_ident("when") {
+                        Some(self.consume_raw_until_newline())
+                    } else {
+                        None
+                    };
+                    clauses.push(PolicyClause::Rule {
+                        action,
+                        effect,
+                        patterns,
+                        when,
+                    });
+                }
+                "budget" => {
+                    self.bump();
+                    let scope = self.parse_ident().name;
+                    let (usd_cents, tokens) = self.parse_policy_budget_body();
+                    clauses.push(PolicyClause::Budget {
+                        scope,
+                        usd_cents,
+                        tokens,
+                    });
+                }
+                "rate" => {
+                    self.bump();
+                    let scope = self.parse_ident().name;
+                    let (max_calls, window_secs) = self.parse_policy_rate_body();
+                    clauses.push(PolicyClause::Rate {
+                        scope,
+                        max_calls,
+                        window_secs,
+                    });
+                }
+                "audit" => {
+                    self.bump();
+                    let mut kinds = vec![self.parse_ident().name];
+                    while matches!(self.peek(), TokenKind::Comma) {
+                        self.bump();
+                        kinds.push(self.parse_ident().name);
+                    }
+                    clauses.push(PolicyClause::Audit(kinds));
+                }
+                other => {
+                    let sp = self.peek_span();
+                    self.error(
+                        &format!("unknown policy clause `{other}` (expected allow/deny/budget/rate/audit)"),
+                        sp,
+                    );
+                    let _ = self.consume_raw_until_newline();
+                }
+            }
+            self.eat_newlines();
+        }
+        self.expect(&TokenKind::RBrace, "`}` to close policy");
+        axon_ast::PolicyDecl {
+            name,
+            clauses,
+            span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+        }
+    }
+
+    /// A policy target pattern: a dotted ident (`kb.search`), a string
+    /// glob (`"kb.internal"`, `"*"`), or a bare `*`.
+    fn parse_policy_pattern(&mut self) -> String {
+        match self.peek().clone() {
+            TokenKind::Ident(_) => {
+                let path = self.parse_path();
+                path.segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            }
+            TokenKind::Star => {
+                self.bump();
+                "*".to_string()
+            }
+            _ => self.expect_string_literal(),
+        }
+    }
+
+    /// `{ usd = 0.50, tokens = 60_000 }` → (usd_cents, tokens).
+    fn parse_policy_budget_body(&mut self) -> (Option<i64>, Option<i64>) {
+        let mut usd_cents = None;
+        let mut tokens = None;
+        self.expect(&TokenKind::LBrace, "`{` to start budget body");
+        self.eat_newlines();
+        while !matches!(self.peek(), TokenKind::RBrace) && !self.at_eof() {
+            let key = self.parse_ident().name;
+            self.expect(&TokenKind::Eq, "`=` in budget entry");
+            match key.as_str() {
+                "usd" => usd_cents = Some(self.parse_money_or_number_as_cents()),
+                "tokens" => tokens = Some(self.parse_int_value()),
+                _ => {
+                    // Unknown budget key — skip its value.
+                    let _ = self.consume_raw_until_newline();
+                }
+            }
+            if matches!(self.peek(), TokenKind::Comma) {
+                self.bump();
+            }
+            self.eat_newlines();
+        }
+        self.expect(&TokenKind::RBrace, "`}` to close budget body");
+        (usd_cents, tokens)
+    }
+
+    /// `{ 30 per 1m }` → (max_calls, window_secs).
+    fn parse_policy_rate_body(&mut self) -> (u32, u64) {
+        self.expect(&TokenKind::LBrace, "`{` to start rate body");
+        self.eat_newlines();
+        let max_calls = self.parse_int_value().max(0) as u32;
+        let _ = self.bump_if_ident("per");
+        let window_secs = match self.peek().clone() {
+            TokenKind::Duration { nanos, .. } => {
+                self.bump();
+                (nanos / 1_000_000_000) as u64
+            }
+            _ => {
+                let v = self.parse_int_value().max(0) as u64;
+                v
+            }
+        };
+        self.eat_newlines();
+        self.expect(&TokenKind::RBrace, "`}` to close rate body");
+        (max_calls, window_secs.max(1))
+    }
+
+    fn parse_int_value(&mut self) -> i64 {
+        match self.peek().clone() {
+            TokenKind::Int { value, .. } => {
+                self.bump();
+                value as i64
+            }
+            _ => {
+                let sp = self.peek_span();
+                self.error("expected an integer", sp);
+                0
+            }
+        }
+    }
+
+    /// Read a money literal (`0.50usd`) or a plain number and return the
+    /// value in cents.
+    fn parse_money_or_number_as_cents(&mut self) -> i64 {
+        match self.peek().clone() {
+            TokenKind::Money { amount, .. } => {
+                self.bump();
+                money_str_to_cents(&amount)
+            }
+            TokenKind::Float { lexeme } => {
+                self.bump();
+                let f: f64 = lexeme.parse().unwrap_or(0.0);
+                (f * 100.0).round() as i64
+            }
+            TokenKind::Int { value, .. } => {
+                self.bump();
+                (value as i64) * 100
+            }
+            _ => {
+                let sp = self.peek_span();
+                self.error("expected a money or numeric budget value", sp);
+                0
+            }
         }
     }
 
@@ -1514,7 +1721,14 @@ impl<'a> Parser<'a> {
         };
         let attrs = self.parse_attributes();
         let body = if self.eat_kw(Kw::Extern) {
-            let abi = self.expect_string_literal();
+            // Two accepted forms:
+            //   extern "abi" "symbol"        (quoted ABI — original)
+            //   extern python "path:fn"      (bare-ident ABI — §35.2 bridges)
+            let abi = if let TokenKind::Ident(_) = self.peek() {
+                self.parse_ident().name
+            } else {
+                self.expect_string_literal()
+            };
             let symbol = self.expect_string_literal();
             ToolBody::Extern { abi, symbol }
         } else {
@@ -2251,6 +2465,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::Plan) => self.parse_plan_expr(),
             TokenKind::Keyword(Kw::Stream) => self.parse_stream_expr(),
             TokenKind::Keyword(Kw::With) => self.parse_with_expr(),
+            TokenKind::Keyword(Kw::Try) => self.parse_try_recover_expr(),
             TokenKind::Keyword(Kw::Spawn) => {
                 self.bump();
                 // Bind tight enough to absorb postfix call/index/field but
@@ -2665,6 +2880,48 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `try { ... } recover |e| { ... }`. The `recover` clause is
+    /// required — a bare `try { ... }` has no meaning distinct from a
+    /// plain block, so we require the handler and error otherwise.
+    fn parse_try_recover_expr(&mut self) -> Expr {
+        let start = self.peek_span();
+        self.bump(); // consume `try`
+        let body = self.parse_block();
+        let recover = if self.eat_kw(Kw::Recover) {
+            let lambda_e = self.parse_lambda();
+            match *lambda_e.kind {
+                ExprKind::Lambda(l) => l,
+                _ => {
+                    let span = self.peek_span();
+                    self.error("expected a `|e| { ... }` lambda after `recover`", span);
+                    LambdaExpr {
+                        params: Vec::new(),
+                        body: Expr {
+                            span: lambda_e.span,
+                            kind: Box::new(ExprKind::UnitLit),
+                        },
+                        span: lambda_e.span,
+                    }
+                }
+            }
+        } else {
+            let span = self.peek_span();
+            self.error("`try { ... }` must be followed by `recover |e| { ... }`", span);
+            LambdaExpr {
+                params: Vec::new(),
+                body: Expr {
+                    span,
+                    kind: Box::new(ExprKind::UnitLit),
+                },
+                span,
+            }
+        };
+        Expr {
+            span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+            kind: Box::new(ExprKind::TryRecover { body, recover }),
+        }
+    }
+
     fn parse_with_expr(&mut self) -> Expr {
         let start = self.peek_span();
         self.bump();
@@ -2747,7 +3004,19 @@ impl<'a> Parser<'a> {
                 kind: Box::new(ExprKind::Lambda(lambda)),
             };
         };
-        let body = self.parse_expr_bp(1);
+        // A `{` immediately after `|params|` is a *block* body (like the
+        // `fn (params) { ... }` form above), not a set/record literal.
+        // To return a brace literal from a lambda, parenthesize it:
+        // `|x| ({ a: 1 })`.
+        let body = if matches!(self.peek(), TokenKind::LBrace) {
+            let blk = self.parse_block();
+            Expr {
+                span: blk.span,
+                kind: Box::new(ExprKind::Block(blk)),
+            }
+        } else {
+            self.parse_expr_bp(1)
+        };
         let lambda = LambdaExpr {
             params,
             body,
@@ -3087,3 +3356,13 @@ impl<'a> Parser<'a> {
 // our minimum public surface for downstream consumers.
 #[allow(dead_code)]
 fn _assert_token_used(_t: Token) {}
+
+/// Convert a money amount lexeme (e.g. `"0.50"`, `"20"`, `"1.5"`) into
+/// integer cents, rounding to the nearest cent. The lexer stores the
+/// digit/decimal text without the currency, so this never has to parse
+/// a currency symbol.
+fn money_str_to_cents(amount: &str) -> i64 {
+    let cleaned = amount.replace('_', "");
+    let f: f64 = cleaned.parse().unwrap_or(0.0);
+    (f * 100.0).round() as i64
+}
