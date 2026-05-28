@@ -654,6 +654,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
         host::install(&interp);
         interp.load_program(&project.merged);
         host::register_policies(&project.merged);
+        host::register_schemas(&project.merged);
         let closure = axon_runtime::Closure::new(
             Some(format!("test:{}", t.name)),
             Vec::new(),
@@ -953,6 +954,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
         interp.load_program(&program);
         host::register_policies(&program);
+        host::register_schemas(&program);
+        let start = std::time::Instant::now();
         let exit = match interp.run_main() {
             Ok(_) => ExitCode::SUCCESS,
             Err(err) => {
@@ -961,12 +964,28 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 ExitCode::from(1)
             }
         };
+        let elapsed = start.elapsed();
         if let (Some(tp), Some(tracer)) = (trace_path.as_ref(), interp.take_tracer()) {
             let _ = std::fs::write(tp, tracer.to_jsonl());
         }
         if let (Some(rp), Some(rec)) = (record_path.as_ref(), interp.take_recording()) {
             let json = rec.to_json();
             let _ = std::fs::write(rp, serde_json::to_string_pretty(&json).unwrap_or_default());
+        }
+        // §64.3 footer: wall time, tokens, cost — so you cannot
+        // accidentally run an expensive thing twice without noticing.
+        // Suppressed when stderr isn't a terminal (CI / piped output)
+        // or when explicitly silenced via $AXON_NO_FOOTER.
+        if std::io::IsTerminal::is_terminal(&std::io::stderr())
+            && std::env::var("AXON_NO_FOOTER").is_err()
+        {
+            let (tokens, cents) = host::footer_totals();
+            eprintln!(
+                "─── axon run: {:.2?}  ·  {} tokens  ·  ${:.4}",
+                elapsed,
+                tokens,
+                cents as f64 / 100.0,
+            );
         }
         exit
     }

@@ -49,6 +49,10 @@ struct Parser<'a> {
     /// Depth of `(` and `[`. Inside these, newlines are non-significant.
     paren_depth: usize,
     diagnostics: Vec<Diagnostic>,
+    /// `pos` at the last call to `error()`. Used to suppress cascade
+    /// errors: when the parser keeps reporting from the same position
+    /// without advancing, only the first message is kept.
+    last_error_pos: Option<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -60,6 +64,7 @@ impl<'a> Parser<'a> {
             file_id,
             paren_depth: 0,
             diagnostics: Vec::new(),
+            last_error_pos: None,
         }
     }
 
@@ -189,8 +194,73 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Record a parse error. Suppresses cascade duplicates two ways:
+    ///
+    ///   * Exact-message + exact-span repeats are dropped (same as
+    ///     before).
+    ///   * Any error that fires while the parser is *still at the
+    ///     same token position* as the previous error is dropped —
+    ///     this is the classic "one bad token, ten cascade lines"
+    ///     pattern. The first error fires; the rest are silenced
+    ///     until the parser advances at least one token.
     fn error(&mut self, message: impl Into<String>, span: Span) {
-        self.diagnostics.push(Diagnostic::error(message, span));
+        let msg = message.into();
+        if let Some(last) = self.diagnostics.last() {
+            if last.primary.span == span && last.message == msg {
+                return;
+            }
+        }
+        if let Some(last_pos) = self.last_error_pos {
+            if last_pos == self.pos {
+                return;
+            }
+        }
+        self.last_error_pos = Some(self.pos);
+        self.diagnostics.push(Diagnostic::error(msg, span));
+    }
+
+    /// Whole-program error recovery: advance to the start of the next
+    /// top-level item. We scan for one of the keyword starts (`fn`,
+    /// `agent`, `tool`, …) or contextual idents (`test`, `eval`,
+    /// `policy`). Brace depth is deliberately *not* tracked — when
+    /// the body that broke had unbalanced braces, depth-tracking would
+    /// walk to EOF; the rule "any subsequent item-start keyword wins"
+    /// is the right recovery heuristic for real code.
+    fn recover_to_next_item(&mut self) {
+        // Advance at least one token so we don't immediately re-match
+        // the same broken position on the next loop iteration.
+        if !self.at_eof() {
+            self.bump();
+        }
+        while !self.at_eof() && !self.at_item_start_token() {
+            self.bump();
+        }
+    }
+
+    fn at_item_start_token(&self) -> bool {
+        match self.peek() {
+            TokenKind::Keyword(k) => matches!(
+                k,
+                Kw::Use
+                    | Kw::Fn
+                    | Kw::Type
+                    | Kw::Schema
+                    | Kw::Agent
+                    | Kw::Actor
+                    | Kw::Supervisor
+                    | Kw::Graph
+                    | Kw::Model
+                    | Kw::Tool
+                    | Kw::Memory
+                    | Kw::Prompt
+                    | Kw::Const
+                    | Kw::Trait
+                    | Kw::Impl
+                    | Kw::Pub
+            ),
+            TokenKind::Ident(s) => matches!(s.as_str(), "test" | "eval" | "policy"),
+            _ => false,
+        }
     }
 
     fn at_eof(&self) -> bool {
@@ -205,10 +275,20 @@ impl<'a> Parser<'a> {
         self.eat_newlines();
         while !self.at_eof() {
             let item_start = self.pos;
+            let diag_count_before = self.diagnostics.len();
             match self.parse_item() {
-                Some(item) => items.push(item),
+                Some(item) => {
+                    // The item parsed (possibly with internal errors).
+                    // If new diagnostics fired, resync to the next
+                    // item boundary so a half-consumed body doesn't
+                    // cascade into the next item's parse.
+                    if self.diagnostics.len() > diag_count_before {
+                        self.recover_to_next_item();
+                    }
+                    items.push(item);
+                }
                 None => {
-                    // Failed to recognize an item; advance to recover.
+                    // Couldn't recognize an item header.
                     if self.pos == item_start {
                         let span = self.peek_span();
                         self.error("expected a top-level item", span);
@@ -216,6 +296,11 @@ impl<'a> Parser<'a> {
                             self.bump();
                         }
                     }
+                    // After failing to parse one, walk forward to the
+                    // next plausible item start so we don't crawl
+                    // token-by-token through a syntactically broken
+                    // region.
+                    self.recover_to_next_item();
                 }
             }
             self.eat_newlines();

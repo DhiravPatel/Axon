@@ -38,5 +38,6 @@ axon-eval = { workspace = true }
 axon-cost = { workspace = true }
 axon-ffi = { workspace = true }
 axon-deploy = { workspace = true }
+axon-computer = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

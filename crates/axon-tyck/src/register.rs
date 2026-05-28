@@ -23,7 +23,7 @@ impl<'a> Checker<'a> {
         // is the whole point of effect rows.
         const PURE: &[&str] = &[
             "len", "str", "int", "float", "bool", "abs", "min", "max", "chan", "assert",
-            "assert_eq", "panic", "anthropic", "mock_model", "local_memory",
+            "assert_eq", "panic", "anthropic", "mock_model", "default_model", "local_memory",
             // ---- Stage 11 stdlib: std.string ----
             "str_upper", "str_lower", "str_trim", "str_trim_start", "str_trim_end",
             "str_split", "str_join", "str_contains", "str_starts_with", "str_ends_with",
@@ -183,6 +183,13 @@ impl<'a> Checker<'a> {
             "stream_is_done", "stream_stats", "for_await",
             // ---- Stage 29 §29.7 @restart variants ----
             "restart_policy_parse", "restart_policy_should_restart",
+            // ---- Stage 31 computer-use primitives ----
+            "computer_screenshot", "computer_click", "computer_double_click",
+            "computer_mouse_move", "computer_drag", "computer_scroll",
+            "computer_type", "computer_key", "computer_wait",
+            "computer_action_log",
+            // ---- Stage 31 GBNF schema emitter ----
+            "schema_to_gbnf",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),

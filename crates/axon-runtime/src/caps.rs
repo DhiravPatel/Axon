@@ -54,6 +54,8 @@ impl CapSet {
             "Db",
             "Db.Read",
             "Db.Write",
+            // §35 computer-use: click/type/screenshot tools.
+            "Computer",
         ])
     }
 

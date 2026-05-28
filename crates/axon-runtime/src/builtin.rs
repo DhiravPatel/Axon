@@ -238,6 +238,21 @@ pub fn register_builtins(register: &mut dyn FnMut(&'static str, NativeFn)) {
             call: builtin_mock_model,
         },
     );
+    // Zero-config default: programs with no `model` declaration can
+    // still call `default_model()` and get a working stub. Honors the
+    // `ANTHROPIC_API_KEY` env var so the same source switches to a
+    // real provider when one is configured (the provider routing
+    // itself happens at `ask` time).
+    register(
+        "default_model",
+        NativeFn {
+            name: "default_model",
+            min_arity: 0,
+            max_arity: Some(0),
+            required_caps: &[],
+            call: builtin_default_model,
+        },
+    );
     register(
         "local_memory",
         NativeFn {
@@ -613,6 +628,28 @@ fn builtin_anthropic(args: &[Value]) -> Result<Value, String> {
     let provider = axon_models::AnthropicProvider::from_env(model)
         .map_err(|e| e.to_string())?;
     Ok(Value::Model(Rc::new(provider)))
+}
+
+/// Zero-config default model. If `ANTHROPIC_API_KEY` is set, return
+/// an Anthropic provider bound to `claude-opus-4-7`. Otherwise return
+/// a mock model whose fixed response is the canonical placeholder so
+/// the program still runs end-to-end with no setup.
+fn builtin_default_model(_args: &[Value]) -> Result<Value, String> {
+    if std::env::var("ANTHROPIC_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        let provider = axon_models::AnthropicProvider::from_env("claude-opus-4-7")
+            .map_err(|e| e.to_string())?;
+        return Ok(Value::Model(Rc::new(provider)));
+    }
+    Ok(Value::Model(Rc::new(axon_models::MockProvider::new(
+        axon_models::MockBehavior::Fixed(
+            "(default_model: no API key set; this is a placeholder response. \
+             Run `axon login anthropic` for a real model.)"
+                .to_string(),
+        ),
+    ))))
 }
 
 fn builtin_mock_model(args: &[Value]) -> Result<Value, String> {

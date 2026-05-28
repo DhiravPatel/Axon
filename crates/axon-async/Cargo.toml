@@ -1,0 +1,11 @@
+[package]
+name = "axon-async"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scaffolding for the async AxVM runtime — tokio executor, task handles, async mailbox primitives."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

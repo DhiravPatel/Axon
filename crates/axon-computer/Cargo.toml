@@ -1,0 +1,10 @@
+[package]
+name = "axon-computer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axon computer-use primitives — typed click/type/screenshot tools with a sandbox-friendly mock backend."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

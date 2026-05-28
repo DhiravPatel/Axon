@@ -40,6 +40,7 @@ pub fn install(interp: &Interpreter) {
     install_stage27(interp);
     install_stage28(interp);
     install_stage29(interp);
+    install_stage31(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1940,6 +1941,25 @@ use axon_cost::{CostEntry, Ledger, ProviderProfile, Report};
 thread_local! {
     static COST_LEDGER: RefCell<Ledger> = RefCell::new(Ledger::new());
     static COST_PROFILES: RefCell<Vec<ProviderProfile>> = RefCell::new(Vec::new());
+}
+
+/// Sum the ledger for the post-run footer (§64.3): total tokens
+/// (input + output) and total cost in cents, summed over every entry
+/// against any registered profile. Returns `(0, 0)` when no model
+/// calls were recorded.
+pub fn footer_totals() -> (u64, u64) {
+    let ledger = COST_LEDGER.with(|l| l.borrow().clone());
+    if ledger.entries.is_empty() {
+        return (0, 0);
+    }
+    let profiles = COST_PROFILES.with(|p| p.borrow().clone());
+    let report = Report::build(&ledger, &profiles, 0);
+    let tokens: u64 = report
+        .providers
+        .iter()
+        .map(|p| p.input_tokens + p.output_tokens)
+        .sum();
+    (tokens, report.total_cents)
 }
 
 fn install_cost(interp: &Interpreter) {
@@ -6446,5 +6466,239 @@ fn s29_restart_policy_should_restart(args: &[Value]) -> Result<Value, String> {
         }
     };
     Ok(Value::Bool(p.should_restart(exit_kind)))
+}
+
+// ===========================================================================
+// Stage 31 — computer-use primitives (§new) + GBNF schema emitter
+// (§56.3 / native constrained decoding).
+// ===========================================================================
+
+use axon_computer as cu;
+
+thread_local! {
+    /// Process-wide computer-use driver. Tests + the CLI install a
+    /// `MockDriver` by default; real browser/desktop drivers plug in
+    /// via `set_computer_driver`.
+    static COMPUTER_DRIVER: RefCell<Box<dyn cu::ComputerDriver + Send>> =
+        RefCell::new(Box::new(cu::MockDriver::new(1280, 720)));
+}
+
+/// Swap the active computer-use driver. Called by tests + by future
+/// host crates that ship Playwright / CDP / desktop drivers.
+pub fn set_computer_driver(d: Box<dyn cu::ComputerDriver + Send>) {
+    COMPUTER_DRIVER.with(|c| *c.borrow_mut() = d);
+}
+
+fn install_stage31(interp: &Interpreter) {
+    // §35 — computer-use primitives. All gated by the `Computer`
+    // capability; the runtime grants it via the default cap set so
+    // `axon run` without flags can drive the mock driver.
+    interp.register_native(
+        "computer_screenshot",
+        n("computer_screenshot", 0, Some(0), s31_screenshot),
+    );
+    interp.register_native(
+        "computer_click",
+        n("computer_click", 3, Some(3), s31_click),
+    );
+    interp.register_native(
+        "computer_double_click",
+        n("computer_double_click", 2, Some(2), s31_double_click),
+    );
+    interp.register_native(
+        "computer_mouse_move",
+        n("computer_mouse_move", 2, Some(2), s31_mouse_move),
+    );
+    interp.register_native(
+        "computer_drag",
+        n("computer_drag", 5, Some(5), s31_drag),
+    );
+    interp.register_native(
+        "computer_scroll",
+        n("computer_scroll", 2, Some(2), s31_scroll),
+    );
+    interp.register_native(
+        "computer_type",
+        n("computer_type", 1, Some(1), s31_type),
+    );
+    interp.register_native(
+        "computer_key",
+        n("computer_key", 1, Some(1), s31_key),
+    );
+    interp.register_native(
+        "computer_wait",
+        n("computer_wait", 1, Some(1), s31_wait),
+    );
+    interp.register_native(
+        "computer_action_log",
+        n("computer_action_log", 0, Some(0), s31_action_log),
+    );
+
+    // §56.3 — schema → GBNF grammar.
+    interp.register_native_ext(
+        "schema_to_gbnf",
+        ext("schema_to_gbnf", 1, Some(1), s31_schema_to_gbnf),
+    );
+}
+
+fn parse_button(s: &str) -> cu::MouseButton {
+    match s {
+        "right" => cu::MouseButton::Right,
+        "middle" => cu::MouseButton::Middle,
+        _ => cu::MouseButton::Left,
+    }
+}
+
+fn s31_screenshot(_args: &[Value]) -> Result<Value, String> {
+    let shot = COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().screenshot())
+        .map_err(|e| e.to_string())?;
+    Ok(record_to_vec(vec![
+        ("width", Value::Int(shot.width as i64)),
+        ("height", Value::Int(shot.height as i64)),
+        ("format", Value::String(Rc::new(shot.format))),
+        ("bytes_len", Value::Int(shot.bytes.len() as i64)),
+        ("tainted", Value::Bool(shot.tainted)),
+    ]))
+}
+
+fn s31_click(args: &[Value]) -> Result<Value, String> {
+    let x = i_arg(args, 0, "computer_click")? as i32;
+    let y = i_arg(args, 1, "computer_click")? as i32;
+    let button = s_arg(args, 2, "computer_click")?;
+    let b = parse_button(button.as_str());
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().click(x, y, b))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_double_click(args: &[Value]) -> Result<Value, String> {
+    let x = i_arg(args, 0, "computer_double_click")? as i32;
+    let y = i_arg(args, 1, "computer_double_click")? as i32;
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().double_click(x, y))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_mouse_move(args: &[Value]) -> Result<Value, String> {
+    let x = i_arg(args, 0, "computer_mouse_move")? as i32;
+    let y = i_arg(args, 1, "computer_mouse_move")? as i32;
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().mouse_move(x, y))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_drag(args: &[Value]) -> Result<Value, String> {
+    let fx = i_arg(args, 0, "computer_drag")? as i32;
+    let fy = i_arg(args, 1, "computer_drag")? as i32;
+    let tx = i_arg(args, 2, "computer_drag")? as i32;
+    let ty = i_arg(args, 3, "computer_drag")? as i32;
+    let button = s_arg(args, 4, "computer_drag")?;
+    let b = parse_button(button.as_str());
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().drag((fx, fy), (tx, ty), b))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_scroll(args: &[Value]) -> Result<Value, String> {
+    let dx = i_arg(args, 0, "computer_scroll")? as i32;
+    let dy = i_arg(args, 1, "computer_scroll")? as i32;
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().scroll(dx, dy))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_type(args: &[Value]) -> Result<Value, String> {
+    let text = s_arg(args, 0, "computer_type")?;
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().type_text(text.as_str()))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_key(args: &[Value]) -> Result<Value, String> {
+    let name = s_arg(args, 0, "computer_key")?;
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().key(name.as_str()))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_wait(args: &[Value]) -> Result<Value, String> {
+    let ms = i_arg(args, 0, "computer_wait")?.max(0) as u64;
+    COMPUTER_DRIVER
+        .with(|c| c.borrow_mut().wait(ms))
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Unit)
+}
+
+fn s31_action_log(_args: &[Value]) -> Result<Value, String> {
+    let log = COMPUTER_DRIVER.with(|c| {
+        c.borrow()
+            .action_log()
+            .iter()
+            .map(|a| serde_json::to_string(a).unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    Ok(list_value(
+        log.into_iter().map(|s| Value::String(Rc::new(s))).collect(),
+    ))
+}
+
+fn s31_schema_to_gbnf(
+    interp: &mut Interpreter,
+    args: &[Value],
+    _span: axon_diag::Span,
+) -> Result<Value, String> {
+    // The host doesn't carry the parsed Program; the runtime stores
+    // schemas in `schemas` (a name → fields map). The GBNF emitter
+    // needs a `SchemaDecl`, so we reconstruct one from the runtime's
+    // schema table.
+    let _ = interp;
+    let name = s_arg(args, 0, "schema_to_gbnf")?;
+    let body = schema_to_gbnf_string(name.as_str())
+        .ok_or_else(|| format!("schema_to_gbnf: no schema named `{}`", name.as_str()))?;
+    Ok(Value::String(Rc::new(body)))
+}
+
+/// Look up a schema by name in the interpreter's schema table and
+/// emit the GBNF grammar. The table holds `(field_name, ast_type)`
+/// pairs — enough for the emitter.
+fn schema_to_gbnf_string(name: &str) -> Option<String> {
+    // We don't have direct access to the interpreter's schema table
+    // from a `NativeExtFn` without plumbing — store schemas on a
+    // process-wide thread-local mirror at program load time. For v0
+    // the program registers schemas via `schema_register` (below).
+    SCHEMA_MIRROR.with(|m| {
+        let decl = m.borrow().get(name).cloned()?;
+        Some(axon_tyck::gbnf::emit_for_schema(&decl))
+    })
+}
+
+thread_local! {
+    /// At program load the host registers every `schema` AST node
+    /// here so `schema_to_gbnf` can find them at runtime. Kept in
+    /// sync via `register_schemas`.
+    static SCHEMA_MIRROR: RefCell<std::collections::HashMap<String, axon_ast::SchemaDecl>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Mirror every `Item::Schema` in `program` into the SCHEMA_MIRROR.
+/// Called by the CLI after `load_program`.
+pub fn register_schemas(program: &axon_ast::Program) {
+    SCHEMA_MIRROR.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for item in &program.items {
+            if let axon_ast::Item::Schema(s) = item {
+                map.insert(s.name.name.clone(), s.clone());
+            }
+        }
+    });
 }
 
