@@ -627,7 +627,7 @@ fn builtin_anthropic(args: &[Value]) -> Result<Value, String> {
     };
     let provider = axon_models::AnthropicProvider::from_env(model)
         .map_err(|e| e.to_string())?;
-    Ok(Value::Model(Rc::new(provider)))
+    Ok(Value::Model(std::sync::Arc::new(provider)))
 }
 
 /// Zero-config default model. If `ANTHROPIC_API_KEY` is set, return
@@ -641,15 +641,15 @@ fn builtin_default_model(_args: &[Value]) -> Result<Value, String> {
     {
         let provider = axon_models::AnthropicProvider::from_env("claude-opus-4-7")
             .map_err(|e| e.to_string())?;
-        return Ok(Value::Model(Rc::new(provider)));
+        return Ok(Value::Model(std::sync::Arc::new(provider)));
     }
-    Ok(Value::Model(Rc::new(axon_models::MockProvider::new(
-        axon_models::MockBehavior::Fixed(
+    Ok(Value::Model(std::sync::Arc::new(
+        axon_models::MockProvider::new(axon_models::MockBehavior::Fixed(
             "(default_model: no API key set; this is a placeholder response. \
              Run `axon login anthropic` for a real model.)"
                 .to_string(),
-        ),
-    ))))
+        )),
+    )))
 }
 
 fn builtin_mock_model(args: &[Value]) -> Result<Value, String> {
@@ -689,9 +689,9 @@ fn builtin_mock_model(args: &[Value]) -> Result<Value, String> {
             }
         }
     };
-    Ok(Value::Model(Rc::new(axon_models::MockProvider::new(
-        behavior,
-    ))))
+    Ok(Value::Model(std::sync::Arc::new(
+        axon_models::MockProvider::new(behavior),
+    )))
 }
 
 fn builtin_local_memory(_args: &[Value]) -> Result<Value, String> {

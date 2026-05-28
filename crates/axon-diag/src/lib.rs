@@ -248,6 +248,30 @@ pub struct Diagnostic {
     pub primary: Label,
     pub secondary: Vec<Label>,
     pub notes: Vec<String>,
+    /// Concrete, applicable rewrites the user could accept. Each fix is
+    /// labeled (`"replace `foo` with `bar`"`) and carries one or more
+    /// span-keyed text edits — `axon fix` applies them as a unified-diff
+    /// dry-run or rewrites the file in place. Empty for diagnostics that
+    /// can't be mechanically resolved.
+    pub fixes: Vec<Fix>,
+}
+
+/// One mechanically applicable rewrite suggested by a diagnostic.
+#[derive(Clone, Debug)]
+pub struct Fix {
+    /// Short human description: `"insert `Net` into the `uses` row"`,
+    /// `"replace `foo` with `food`"`.
+    pub description: String,
+    /// Concrete edits — all applied atomically when the user accepts.
+    pub edits: Vec<FixEdit>,
+}
+
+/// One span-keyed text replacement. `replacement.is_empty()` is a delete;
+/// `span.is_empty()` is an insertion at that offset.
+#[derive(Clone, Debug)]
+pub struct FixEdit {
+    pub span: Span,
+    pub replacement: String,
 }
 
 impl Diagnostic {
@@ -262,6 +286,7 @@ impl Diagnostic {
             },
             secondary: Vec::new(),
             notes: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -277,6 +302,52 @@ impl Diagnostic {
 
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
+        self
+    }
+
+    /// Attach one mechanically applicable rewrite. Multiple fixes can be
+    /// attached — `axon fix` lets the user pick (or `--only CODE`
+    /// auto-applies the first when the code matches).
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fixes.push(fix);
+        self
+    }
+}
+
+impl Fix {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            edits: Vec::new(),
+        }
+    }
+
+    pub fn replace(span: Span, replacement: impl Into<String>) -> Self {
+        let replacement = replacement.into();
+        Self {
+            description: format!("replace with `{replacement}`"),
+            edits: vec![FixEdit { span, replacement }],
+        }
+    }
+
+    pub fn insert(at: usize, file: u16, text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            description: format!("insert `{text}`"),
+            edits: vec![FixEdit {
+                span: Span::in_file(at, at, file),
+                replacement: text,
+            }],
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn with_edit(mut self, edit: FixEdit) -> Self {
+        self.edits.push(edit);
         self
     }
 }

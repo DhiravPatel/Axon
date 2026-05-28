@@ -109,7 +109,11 @@ pub enum Value {
 
     /// A handle to a model provider. `ask` / `generate<S>` / `plan` consume
     /// this; the runtime calls `provider.complete(...)` under the hood.
-    Model(Rc<dyn axon_models::ModelProvider>),
+    ///
+    /// `Arc` (rather than `Rc`) so the host scheduler can ship the provider
+    /// across `tokio::spawn_blocking` boundaries when `flow_parallel_asks`
+    /// overlaps N model calls. The trait is `Send + Sync` so this is sound.
+    Model(std::sync::Arc<dyn axon_models::ModelProvider>),
 
     /// An in-process key-value memory: append-only log of stored strings;
     /// `.recall(query)` returns substring matches. A real vector backend
@@ -365,7 +369,7 @@ impl PartialEq for Value {
             (NativeExt(a), NativeExt(b)) => Rc::ptr_eq(a, b),
             (Spawned(a), Spawned(b)) => Rc::ptr_eq(a, b) || a.id == b.id,
             (Chan(a), Chan(b)) => Rc::ptr_eq(a, b),
-            (Model(a), Model(b)) => Rc::ptr_eq(a, b),
+            (Model(a), Model(b)) => std::sync::Arc::ptr_eq(a, b),
             (Memory(a), Memory(b)) => Rc::ptr_eq(a, b),
             (Tool(a), Tool(b)) => Rc::ptr_eq(a, b),
             (Error(a), Error(b)) => a == b,

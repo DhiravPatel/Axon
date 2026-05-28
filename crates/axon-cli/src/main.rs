@@ -122,6 +122,10 @@ fn main() -> ExitCode {
             let remaining: Vec<String> = args.collect();
             cmd_explain(&remaining)
         }
+        "fix" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_fix(&remaining)
+        }
         "new" => {
             let remaining: Vec<String> = args.collect();
             scaffold::cmd_new(&remaining)
@@ -258,6 +262,13 @@ fn print_help() {
                                                        items are dropped when X isn't active.\n\
                             --no-default-features      Don't seed the `default` feature.\n\
                             (no flag)                  Grant the standard default set.\n\
+           fix    [--apply] [--only CODE] <file>\n\
+                          Apply mechanically applicable fixes attached to\n\
+                          diagnostics (did-you-mean replacements, missing\n\
+                          `uses` effects, ...). Without --apply, prints a\n\
+                          unified diff so you can review the changes; with\n\
+                          --apply, rewrites the file in place. --only\n\
+                          restricts to one diagnostic code.\n\
            version         Print the compiler version\n\
            help            Show this message\n",
         env!("CARGO_PKG_VERSION")
@@ -1104,6 +1115,348 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
     println!("type-checked {item_count} item(s) successfully");
     ExitCode::SUCCESS
+}
+
+// ===========================================================================
+// §32 — `axon fix`: apply diagnostic-attached rewrites.
+//
+// Diagnostics carry `fixes: Vec<Fix>` (each fix is a description + a list
+// of span-keyed text edits). `axon fix` runs the same parse + type-check
+// pipeline as `axon check`, collects fixes from the resulting diagnostics,
+// and either:
+//
+//   default      → prints a unified diff so the user can read what *would*
+//                  change without touching the file (dry run).
+//   --apply      → rewrites the file in place.
+//   --only CODE  → restricts to fixes attached to diagnostics with code
+//                  `CODE` (e.g. `--only E0202` for did-you-mean only).
+//
+// Conflict handling: edits to overlapping spans are folded one-fix-at-a-
+// time, deferring the rest with a clear note. The user runs `axon fix`
+// again to pick up the next round — same idea as `cargo fix`.
+// ===========================================================================
+
+fn cmd_fix(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut apply = false;
+    let mut only: Option<&str> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--apply" => apply = true,
+            "--only" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon fix: `--only` expects an error code (e.g. E0202)");
+                    return ExitCode::from(2);
+                }
+                only = Some(&args[i]);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: axon fix [--apply] [--only CODE] <file>\n\
+                     \n\
+                     Without --apply, prints a unified diff (dry run).\n\
+                     With --apply, rewrites the file in place.\n\
+                     --only CODE restricts to fixes attached to that diagnostic code."
+                );
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon fix: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("axon fix: only one file is supported");
+                    return ExitCode::from(2);
+                }
+                path = Some(other);
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = path else {
+        eprintln!("usage: axon fix [--apply] [--only CODE] <file>");
+        return ExitCode::from(2);
+    };
+    let Some(file) = read_or_die(path) else {
+        return ExitCode::from(1);
+    };
+
+    let (program, parse_diags) = axon_parser::parse(&file);
+    let diags: Vec<axon_diag::Diagnostic> = if parse_diags.is_empty() {
+        let (_ctx, type_diags) = axon_tyck::check(&file, &program);
+        type_diags
+    } else {
+        parse_diags
+    };
+
+    // Gather every Fix from every diagnostic, filtered by --only when set.
+    // Each fix may contribute multiple edits; we keep the originating code
+    // around so the diff/apply path can label the change.
+    struct Hunk<'a> {
+        code: Option<&'a str>,
+        description: &'a str,
+        edits: &'a [axon_diag::FixEdit],
+    }
+    let hunks: Vec<Hunk> = diags
+        .iter()
+        .filter(|d| match only {
+            Some(want) => d.code.map(|c| c == want).unwrap_or(false),
+            None => true,
+        })
+        .flat_map(|d| {
+            d.fixes.iter().map(move |f| Hunk {
+                code: d.code,
+                description: &f.description,
+                edits: &f.edits,
+            })
+        })
+        .collect();
+
+    if hunks.is_empty() {
+        // Distinguish "no fixable diagnostics" (success-shaped) from
+        // "diagnostics exist, none with fixes" (still success-shaped but
+        // worth noting). Either way: nothing to do, exit clean.
+        if diags.is_empty() {
+            println!("axon fix: no diagnostics — nothing to fix");
+        } else {
+            let total = diags.len();
+            let filtered = match only {
+                Some(c) => format!(" (filtered by --only {c})"),
+                None => String::new(),
+            };
+            println!(
+                "axon fix: {total} diagnostic(s){filtered} but none carry a mechanically applicable fix"
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Two-pass apply:
+    //   1. select hunks: keep each in input order if none of its edits
+    //      touch a span already taken by an earlier-accepted hunk. Conflicts
+    //      get deferred — the user reruns `axon fix` to pick them up.
+    //   2. apply every accepted edit across every accepted hunk in one
+    //      reverse pass over the byte buffer, so earlier offsets stay
+    //      valid as we splice. (Applying hunks one at a time without a
+    //      global sort is wrong: an early hunk that grows the file
+    //      invalidates the offsets recorded by every later hunk.)
+    let mut applied: Vec<&Hunk> = Vec::new();
+    let mut deferred: Vec<&Hunk> = Vec::new();
+    let mut covered: Vec<(usize, usize)> = Vec::new();
+    for h in &hunks {
+        let overlaps = h.edits.iter().any(|e| {
+            let s = e.span.start as usize;
+            let t = e.span.end as usize;
+            covered.iter().any(|(cs, ce)| !(t <= *cs || *ce <= s))
+        });
+        if overlaps {
+            deferred.push(h);
+            continue;
+        }
+        for e in h.edits {
+            covered.push((e.span.start as usize, e.span.end as usize));
+        }
+        applied.push(h);
+    }
+    // Collect every accepted edit, then splice in descending order of
+    // start offset so each splice leaves earlier byte indices untouched.
+    let mut bytes = file.text().as_bytes().to_vec();
+    let mut all_edits: Vec<&axon_diag::FixEdit> =
+        applied.iter().flat_map(|h| h.edits.iter()).collect();
+    all_edits.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+    for e in all_edits {
+        let s = (e.span.start as usize).min(bytes.len());
+        let t = (e.span.end as usize).min(bytes.len()).max(s);
+        bytes.splice(s..t, e.replacement.bytes());
+    }
+
+    let after = String::from_utf8_lossy(&bytes).into_owned();
+    let before = file.text().to_owned();
+
+    if apply {
+        if before == after {
+            println!("axon fix: no edits to apply");
+            return ExitCode::SUCCESS;
+        }
+        if let Err(e) = std::fs::write(path, &after) {
+            eprintln!("axon fix: cannot write `{path}`: {e}");
+            return ExitCode::from(1);
+        }
+        println!(
+            "axon fix: applied {} fix(es) to {path}{}",
+            applied.len(),
+            if deferred.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} deferred — rerun `axon fix` to pick them up)",
+                    deferred.len()
+                )
+            }
+        );
+        ExitCode::SUCCESS
+    } else {
+        // Dry-run: print a unified diff. We use a simple line-based diff —
+        // good enough for human review of small mechanical edits.
+        let diff = unified_diff(path, &before, &after);
+        if diff.trim().is_empty() {
+            println!("axon fix: no edits to apply");
+            return ExitCode::SUCCESS;
+        }
+        for h in &applied {
+            println!(
+                "fix [{}]: {}",
+                h.code.unwrap_or("uncoded"),
+                h.description
+            );
+        }
+        if !deferred.is_empty() {
+            println!(
+                "(deferred {} fix(es) due to overlap; rerun `axon fix` to pick them up)",
+                deferred.len()
+            );
+        }
+        print!("{diff}");
+        println!(
+            "\n(dry run — pass --apply to rewrite {} in place)",
+            path
+        );
+        ExitCode::SUCCESS
+    }
+}
+
+/// Minimal unified diff against `path`. Line-based: precision-aware
+/// enough for small mechanical edits. Hand-rolled because we don't want
+/// to take a `similar`/`difflib` dependency just for this.
+fn unified_diff(path: &str, before: &str, after: &str) -> String {
+    use std::fmt::Write;
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    // LCS via classic DP — fine for source files; we typically diff a few
+    // hundred lines at most.
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in 0..n {
+        for j in 0..m {
+            dp[i + 1][j + 1] = if a[i] == b[j] {
+                dp[i][j] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    // Walk back to build the edit script as (kind, line) pairs.
+    let mut ops: Vec<(char, &str)> = Vec::new();
+    let (mut i, mut j) = (n, m);
+    while i > 0 && j > 0 {
+        if a[i - 1] == b[j - 1] {
+            ops.push((' ', a[i - 1]));
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            ops.push(('-', a[i - 1]));
+            i -= 1;
+        } else {
+            ops.push(('+', b[j - 1]));
+            j -= 1;
+        }
+    }
+    while i > 0 {
+        ops.push(('-', a[i - 1]));
+        i -= 1;
+    }
+    while j > 0 {
+        ops.push(('+', b[j - 1]));
+        j -= 1;
+    }
+    ops.reverse();
+    if ops.iter().all(|(k, _)| *k == ' ') {
+        return String::new();
+    }
+    let mut out = String::new();
+    writeln!(out, "--- {path}").unwrap();
+    writeln!(out, "+++ {path} (after fix)").unwrap();
+    // Compress runs of unchanged context to ±2 lines, like `diff -U2`.
+    let context: usize = 2;
+    let mut k = 0;
+    while k < ops.len() {
+        if ops[k].0 == ' ' {
+            k += 1;
+            continue;
+        }
+        // Find the extent of this hunk: include `context` lines around.
+        let start = k.saturating_sub(context);
+        let mut end = k;
+        while end < ops.len() {
+            // Look ahead — if we're within `context * 2` of the next non-
+            // context op, swallow it into the same hunk.
+            if ops[end].0 != ' ' {
+                end += 1;
+                continue;
+            }
+            let mut look = end;
+            let mut gap = 0;
+            while look < ops.len() && ops[look].0 == ' ' {
+                gap += 1;
+                look += 1;
+                if gap > context * 2 {
+                    break;
+                }
+            }
+            if look < ops.len() && ops[look].0 != ' ' && gap <= context * 2 {
+                end = look;
+            } else {
+                end += context.min(ops.len() - end);
+                break;
+            }
+        }
+        // Header.
+        let mut a_start = 0u32;
+        let mut a_lines = 0u32;
+        let mut b_start = 0u32;
+        let mut b_lines = 0u32;
+        for h in 0..start {
+            match ops[h].0 {
+                ' ' => {
+                    a_start += 1;
+                    b_start += 1;
+                }
+                '-' => a_start += 1,
+                '+' => b_start += 1,
+                _ => {}
+            }
+        }
+        for h in start..end {
+            match ops[h].0 {
+                ' ' => {
+                    a_lines += 1;
+                    b_lines += 1;
+                }
+                '-' => a_lines += 1,
+                '+' => b_lines += 1,
+                _ => {}
+            }
+        }
+        writeln!(
+            out,
+            "@@ -{},{} +{},{} @@",
+            a_start + 1,
+            a_lines,
+            b_start + 1,
+            b_lines
+        )
+        .unwrap();
+        for h in start..end {
+            writeln!(out, "{}{}", ops[h].0, ops[h].1).unwrap();
+        }
+        k = end;
+    }
+    out
 }
 
 /// Append a plain-English explanation block after the rendered

@@ -41,6 +41,7 @@ pub fn install(interp: &Interpreter) {
     install_stage28(interp);
     install_stage29(interp);
     install_stage31(interp);
+    install_stage32(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -6700,5 +6701,329 @@ pub fn register_schemas(program: &axon_ast::Program) {
             }
         }
     });
+}
+
+// ===========================================================================
+// §32 — async I/O slice: `flow_parallel_asks`
+//
+// The first real piece of the async-runtime migration. Each ask in a batch
+// is dispatched on `tokio::spawn_blocking` so the *waits* — which is where
+// model-call latency lives — overlap on a thread pool. The interpreter
+// itself stays single-threaded; only the work behind `provider.complete`
+// (sync `ureq`, sync mock) crosses thread boundaries.
+//
+// Determinism is preserved by joining and recording in **input order**, not
+// completion order. Replaying a recording produces byte-identical output
+// regardless of which task finished first during the original run.
+//
+// Acceptance: 3 mock asks each sleeping 200 ms run in < 400 ms wall time
+// (vs ~600 ms for the serial `flow_parallel` from Stage 28).
+// ===========================================================================
+
+/// Singleton tokio runtime used to dispatch parallel model I/O. Held for
+/// the lifetime of the process. `OnceLock` (not `thread_local`) because
+/// the runtime must outlive `block_on` and its workers run on detached
+/// threads — a thread-local would tear the runtime down at first thread
+/// exit and leak the workers.
+fn parallel_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("axon-parallel")
+            // Bounded worker pool — large enough to make 8-way parallelism
+            // free, small enough that a runaway `flow_parallel_asks` can't
+            // exhaust file descriptors / RAM.
+            .worker_threads(num_workers())
+            .build()
+            .expect("tokio runtime")
+    })
+}
+
+fn num_workers() -> usize {
+    // The model I/O is blocking — `spawn_blocking` runs on a separate
+    // blocking pool whose default is 512 threads. Four worker threads on
+    // the core executor are plenty to drive coordination tasks.
+    4
+}
+
+fn install_stage32(interp: &Interpreter) {
+    interp.register_native_ext(
+        "flow_parallel_asks",
+        ext("flow_parallel_asks", 1, Some(1), flow_parallel_asks_impl),
+    );
+    // Testing-only: a mock model whose `complete` sleeps `ms` before
+    // returning `text`. Used by the wall-time acceptance test to prove
+    // that `flow_parallel_asks` actually overlaps the *waits* (which is
+    // where real-world model latency lives). Not registered with the
+    // type checker as a typed function — it's a builtin, callable but
+    // not exposed in the language docs.
+    interp.register_native(
+        "mock_model_slow",
+        n("mock_model_slow", 2, Some(2), s32_mock_model_slow),
+    );
+}
+
+fn s32_mock_model_slow(args: &[Value]) -> Result<Value, String> {
+    let text = s_arg(args, 0, "mock_model_slow")?;
+    let ms = i_arg(args, 1, "mock_model_slow")?.max(0) as u64;
+    let provider = SleepingProvider {
+        text: text.as_str().to_owned(),
+        delay_ms: ms,
+        name: format!("mock-slow({ms}ms)"),
+    };
+    Ok(Value::Model(std::sync::Arc::new(provider)))
+}
+
+/// Deterministic mock that sleeps `delay_ms` before returning `text`. We
+/// keep it inside the CLI crate (not `axon-models`) so the public mock
+/// surface stays small — this exists only to make the acceptance test
+/// honest about overlapping waits.
+struct SleepingProvider {
+    text: String,
+    delay_ms: u64,
+    name: String,
+}
+
+impl axon_models::ModelProvider for SleepingProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn complete(
+        &self,
+        _req: &axon_models::ChatRequest,
+    ) -> Result<axon_models::ChatResponse, axon_models::ProviderError> {
+        std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        Ok(axon_models::ChatResponse {
+            content: self.text.clone(),
+            blocks: vec![axon_models::ContentBlock::Text(self.text.clone())],
+            structured: None,
+            tool_calls: Vec::new(),
+            usage: axon_models::TokenUsage::default(),
+            stop_reason: axon_models::StopReason::EndTurn,
+        })
+    }
+}
+
+/// `flow_parallel_asks(asks: List<{ target, user, system?, max_tokens? }>) -> List<String>`
+///
+/// `target` is the model handle (we can't call the field `model` because
+/// `model` is a reserved keyword at the language level). Runs every ask
+/// concurrently on the tokio thread pool, then returns the response texts
+/// in **input order** — so a caller writing
+///
+///     let [a, b, c] = flow_parallel_asks([{target: m, user: q1}, ...])
+///
+/// can pattern-match by position the same way they would after three
+/// serial `ask`s.
+///
+/// Errors:
+///   - Top-level error if `LLM` (and `Net` for real providers) isn't in scope.
+///   - Top-level error if a budget was already breached.
+///   - Per-slot errors are surfaced as the string `"<error: ...>"` in the
+///     output list rather than aborting the whole batch — this matches the
+///     existing `flow_parallel` semantics for branch failures.
+fn flow_parallel_asks_impl(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let items = match &args[0] {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "flow_parallel_asks: expected a List of ask records, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    if items.is_empty() {
+        return Ok(list_value(Vec::new()));
+    }
+    if items.len() > 64 {
+        return Err(format!(
+            "flow_parallel_asks: batch size {} exceeds the safety ceiling (64). \
+             Split the batch or raise the ceiling explicitly.",
+            items.len()
+        ));
+    }
+
+    // Capability gate: LLM is always required. Net is only required if any
+    // provider is going to actually hit the network — but we don't know
+    // that without inspecting providers, so require it like a normal ask.
+    if !interp.caps_have("LLM") {
+        return Err(
+            "flow_parallel_asks: capability `LLM` is not in scope (caller's `uses {{...}}` row)"
+                .into(),
+        );
+    }
+    if !interp.caps_have("Net") {
+        return Err(
+            "flow_parallel_asks: capability `Net` is not in scope (caller's `uses {{...}}` row)"
+                .into(),
+        );
+    }
+
+    // Parse each item into (provider, request) — fail fast on shape errors
+    // before doing any I/O.
+    let mut batch: Vec<(std::sync::Arc<dyn axon_models::ModelProvider>, axon_models::ChatRequest)> =
+        Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let (provider, request) = parse_parallel_ask(item, i)?;
+        batch.push((provider, request));
+    }
+
+    // Replay short-circuit: pop N events from the recording in input order.
+    // The providers are NOT touched — same as how `ask` behaves under
+    // replay.
+    if interp.replay_active() {
+        let mut out: Vec<Value> = Vec::with_capacity(batch.len());
+        for _ in 0..batch.len() {
+            let resp = interp
+                .pop_replay_model_call(span)
+                .map_err(|e| eval_signal_msg(&e))?;
+            out.push(Value::String(Rc::new(resp.content)));
+        }
+        return Ok(list_value(out));
+    }
+
+    // Budget precheck: refuse the batch if a previous call already put us
+    // over. Mirrors the precheck inside `call_provider`.
+    interp.precheck_budget(span).map_err(|e| eval_signal_msg(&e))?;
+
+    // Dispatch: `spawn_blocking` each provider.complete on the tokio
+    // blocking pool. The interpreter is NOT shared with those tasks —
+    // only the Arc<dyn ModelProvider> and an owned ChatRequest move
+    // across the thread boundary. Sound because the trait is Send+Sync.
+    let rt = parallel_runtime();
+    let mut handles: Vec<tokio::task::JoinHandle<Result<axon_models::ChatResponse, axon_models::ProviderError>>> =
+        Vec::with_capacity(batch.len());
+    for (provider, request) in &batch {
+        let p = provider.clone();
+        let r = request.clone();
+        handles.push(rt.spawn_blocking(move || p.complete(&r)));
+    }
+    // Join in input order — NOT completion order. This is what makes
+    // replay byte-identical to a serial run.
+    let results: Vec<Result<axon_models::ChatResponse, String>> = rt.block_on(async move {
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            let r = match h.await {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => Err(format!("task panicked: {join_err}")),
+            };
+            out.push(r);
+        }
+        out
+    });
+
+    // Now that we have all responses in input order, walk them once:
+    //   1. record (in order) — replay sees the same sequence a serial run would
+    //   2. debit budgets (in order) — same as serial
+    //   3. project to the user-facing String list
+    let mut out: Vec<Value> = Vec::with_capacity(results.len());
+    for ((provider, _req), res) in batch.iter().zip(results.into_iter()) {
+        match res {
+            Ok(resp) => {
+                interp.record_model_call(provider.name(), resp.clone());
+                interp.debit_budget_for(&resp);
+                out.push(Value::String(Rc::new(resp.content)));
+            }
+            Err(msg) => {
+                out.push(Value::String(Rc::new(format!(
+                    "<error: model `{}`: {msg}>",
+                    provider.name()
+                ))));
+            }
+        }
+    }
+    Ok(list_value(out))
+}
+
+/// Pull `(model, ChatRequest)` out of one record entry. The record shape
+/// mirrors `ask`'s message form: `{ model, user, system?, max_tokens? }`.
+fn parse_parallel_ask(
+    v: &Value,
+    idx: usize,
+) -> Result<(std::sync::Arc<dyn axon_models::ModelProvider>, axon_models::ChatRequest), String> {
+    let fields = match v {
+        Value::Record(r) => r.borrow().clone(),
+        other => {
+            return Err(format!(
+                "flow_parallel_asks: item {idx} must be a Record, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut provider: Option<std::sync::Arc<dyn axon_models::ModelProvider>> = None;
+    let mut user: Option<String> = None;
+    let mut system: Option<String> = None;
+    let mut max_tokens: u32 = 1024;
+    for (k, val) in &fields {
+        match k.as_str() {
+            "target" => match val {
+                Value::Model(p) => provider = Some(p.clone()),
+                other => {
+                    return Err(format!(
+                        "flow_parallel_asks: item {idx}.target must be a Model, got `{}`",
+                        other.type_name()
+                    ));
+                }
+            },
+            "user" => match val {
+                Value::String(s) => user = Some(s.as_str().to_owned()),
+                other => {
+                    return Err(format!(
+                        "flow_parallel_asks: item {idx}.user must be a String, got `{}`",
+                        other.type_name()
+                    ));
+                }
+            },
+            "system" => match val {
+                Value::String(s) => system = Some(s.as_str().to_owned()),
+                Value::Nil => {}
+                other => {
+                    return Err(format!(
+                        "flow_parallel_asks: item {idx}.system must be a String, got `{}`",
+                        other.type_name()
+                    ));
+                }
+            },
+            "max_tokens" => match val {
+                Value::Int(n) if *n > 0 => max_tokens = *n as u32,
+                Value::Nil => {}
+                other => {
+                    return Err(format!(
+                        "flow_parallel_asks: item {idx}.max_tokens must be a positive Int, got `{}`",
+                        other.type_name()
+                    ));
+                }
+            },
+            _ => {
+                // Unknown fields are ignored — keeps the record forward-
+                // compatible with future ask options without breaking the
+                // current parser.
+            }
+        }
+    }
+    let provider = provider.ok_or_else(|| {
+        format!("flow_parallel_asks: item {idx} missing required field `target`")
+    })?;
+    let user = user.ok_or_else(|| {
+        format!("flow_parallel_asks: item {idx} missing required field `user`")
+    })?;
+    let req = axon_models::ChatRequest {
+        model: String::new(),
+        system,
+        messages: vec![axon_models::Message::user_text(user)],
+        max_tokens,
+        temperature: None,
+        stop_sequences: Vec::new(),
+        output_schema: None,
+        output_schema_name: None,
+        tools: Vec::new(),
+    };
+    Ok((provider, req))
 }
 

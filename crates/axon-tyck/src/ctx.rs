@@ -82,6 +82,12 @@ impl Ctx {
             .map(|(i, s)| (ItemId(i as u32), s))
     }
 
+    /// Every top-level item name. Used by did-you-mean fixes when a
+    /// reference can't be resolved.
+    pub fn item_names(&self) -> Vec<String> {
+        self.by_name.keys().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }

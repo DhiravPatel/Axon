@@ -39,5 +39,8 @@ axon-cost = { workspace = true }
 axon-ffi = { workspace = true }
 axon-deploy = { workspace = true }
 axon-computer = { workspace = true }
+axon-models = { workspace = true }
+axon-async = { workspace = true }
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde_json = { workspace = true }
 toml = { workspace = true }

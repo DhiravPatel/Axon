@@ -14,6 +14,8 @@ use axon_runtime::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 fn load(src: &str) -> (axon_diag::SourceFile, axon_ast::Program) {
     let file = SourceFile::new("t.ax", src);
@@ -137,7 +139,7 @@ fn install_fixed_provider(
     tokens: u32,
     response: &str,
 ) {
-    let provider = Rc::new(FixedUsageProvider {
+    let provider = Arc::new(FixedUsageProvider {
         usd_per_call: usd,
         tokens_per_call: tokens,
         response: response.to_owned(),
@@ -266,9 +268,10 @@ fn main() -> String uses { LLM, Net } {
 // ===========================================================================
 
 /// A provider that fails after N successful calls — used to prove replay
-/// doesn't actually hit it.
+/// doesn't actually hit it. Uses `AtomicU32` so it satisfies the
+/// `Send + Sync` bound on `ModelProvider`.
 struct CountingProvider {
-    counter: Cell<u32>,
+    counter: AtomicU32,
     limit: u32,
 }
 
@@ -277,8 +280,7 @@ impl ModelProvider for CountingProvider {
         "counting"
     }
     fn complete(&self, _req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
-        let n = self.counter.get();
-        self.counter.set(n + 1);
+        let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
         if n >= self.limit {
             return Err(ProviderError::Network(
                 "should not have been called (replay leaked)".into(),
@@ -308,8 +310,8 @@ fn main() -> String uses { LLM, Net } {
 
     // Record run.
     let mut interp = Interpreter::with_caps(CapSet::standard_default());
-    let provider = Rc::new(CountingProvider {
-        counter: Cell::new(0),
+    let provider = Arc::new(CountingProvider {
+        counter: AtomicU32::new(0),
         limit: 100,
     });
     interp.globals.define("my_model", Value::Model(provider));
@@ -321,8 +323,8 @@ fn main() -> String uses { LLM, Net } {
 
     // Replay run — provider that *panics* if called.
     let mut interp2 = Interpreter::with_caps(CapSet::standard_default());
-    let leaky = Rc::new(CountingProvider {
-        counter: Cell::new(0),
+    let leaky = Arc::new(CountingProvider {
+        counter: AtomicU32::new(0),
         limit: 0, // any call errors out
     });
     interp2.globals.define("my_model", Value::Model(leaky));
@@ -343,8 +345,8 @@ fn main() -> String uses { LLM, Net } {
     let mut interp = Interpreter::with_caps(CapSet::standard_default());
     interp.globals.define(
         "my_model",
-        Value::Model(Rc::new(CountingProvider {
-            counter: Cell::new(0),
+        Value::Model(Arc::new(CountingProvider {
+            counter: AtomicU32::new(0),
             limit: 100,
         })),
     );
@@ -391,8 +393,8 @@ fn main() -> String uses { LLM, Net } {
     let mut interp = Interpreter::with_caps(CapSet::standard_default());
     interp.globals.define(
         "my_model",
-        Value::Model(Rc::new(CountingProvider {
-            counter: Cell::new(0),
+        Value::Model(Arc::new(CountingProvider {
+            counter: AtomicU32::new(0),
             limit: 0,
         })),
     );

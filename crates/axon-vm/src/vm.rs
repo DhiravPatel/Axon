@@ -127,6 +127,7 @@ impl VmError {
             },
             secondary: Vec::new(),
             notes: Vec::new(),
+            fixes: Vec::new(),
         };
         for frame in self.trace.iter().rev() {
             diag.notes.push(format!("called from {frame}"));

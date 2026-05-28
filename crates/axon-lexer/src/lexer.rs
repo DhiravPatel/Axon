@@ -102,6 +102,7 @@ impl<'a> Lexer<'a> {
             },
             secondary: Vec::new(),
             notes: Vec::new(),
+            fixes: Vec::new(),
         });
     }
 

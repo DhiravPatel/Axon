@@ -190,6 +190,8 @@ impl<'a> Checker<'a> {
             "computer_action_log",
             // ---- Stage 31 GBNF schema emitter ----
             "schema_to_gbnf",
+            // ---- Stage 32 async I/O acceptance: sleepy mock model ----
+            "mock_model_slow",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),
@@ -202,6 +204,9 @@ impl<'a> Checker<'a> {
             ("random_int", &["Random"]),
             ("random_float", &["Random"]),
             ("http_fetch", &["Net"]),
+            // §32 — async I/O slice: parallel model calls. Same effect row
+            // as a plain `ask`: needs LLM and (for real providers) Net.
+            ("flow_parallel_asks", &["LLM", "Net"]),
         ];
         for name in PURE {
             self.ctx.register(ItemSig {
