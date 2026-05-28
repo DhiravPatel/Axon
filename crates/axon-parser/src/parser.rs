@@ -328,7 +328,8 @@ impl<'a> Parser<'a> {
                         self.bump();
                         patterns.push(self.parse_policy_pattern());
                     }
-                    let when = if self.bump_if_ident("when") {
+                    // `when` is a reserved keyword (Kw::When), not an ident.
+                    let when = if self.eat_kw(Kw::When) {
                         Some(self.consume_raw_until_newline())
                     } else {
                         None
@@ -2245,6 +2246,9 @@ impl<'a> Parser<'a> {
                 TokenKind::SlashEq => (BinOp::DivAssign, 1, 2),
                 TokenKind::PercentEq => (BinOp::RemAssign, 1, 2),
                 TokenKind::Pipeline => (BinOp::Or /* placeholder */, 3, 4),
+                // `??` binds looser than `||` so `a || b ?? c` groups as
+                // `(a || b) ?? c` — the coalesce wraps the whole boolean.
+                TokenKind::QuestionQuestion => (BinOp::Coalesce, 4, 5),
                 TokenKind::Keyword(Kw::Or) | TokenKind::PipePipe => (BinOp::Or, 5, 6),
                 TokenKind::Keyword(Kw::And) | TokenKind::AmpAmp => (BinOp::And, 7, 8),
                 TokenKind::EqEq => (BinOp::Eq, 9, 10),
@@ -2374,6 +2378,22 @@ impl<'a> Parser<'a> {
                             }),
                         };
                     }
+                }
+                TokenKind::QuestionDot => {
+                    // `receiver?.name` — nil-safe field access. (Method
+                    // form `?.m(...)` falls back to a plain method call on
+                    // the non-nil branch; v0 supports the field form
+                    // natively and lets `?.m()` parse as safe-field then
+                    // call.)
+                    self.bump();
+                    let name = self.parse_ident_or_kw();
+                    lhs = Expr {
+                        span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+                        kind: Box::new(ExprKind::SafeField {
+                            receiver: lhs,
+                            name,
+                        }),
+                    };
                 }
                 TokenKind::Question => {
                     self.bump();
@@ -2553,7 +2573,11 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            TokenKind::Keyword(Kw::Fn) | TokenKind::Pipe => self.parse_lambda(),
+            // `|x| …` and `fn (…) …` lambdas, plus the zero-param `|| …`
+            // form (the lexer emits `||` as a single PipePipe token).
+            TokenKind::Keyword(Kw::Fn) | TokenKind::Pipe | TokenKind::PipePipe => {
+                self.parse_lambda()
+            }
             TokenKind::LBrace => self.parse_brace_literal_or_block_as_expr(),
             TokenKind::LBracket => self.parse_list_literal(),
             TokenKind::LParen => self.parse_paren_or_tuple(),
@@ -2970,7 +2994,32 @@ impl<'a> Parser<'a> {
 
     fn parse_lambda(&mut self) -> Expr {
         let start = self.peek_span();
-        let params = if matches!(self.peek(), TokenKind::Pipe) {
+        // The zero-param form `|| …` lexes as a single `||` token.
+        if matches!(self.peek(), TokenKind::PipePipe) {
+            self.bump();
+            let body = if matches!(self.peek(), TokenKind::LBrace) {
+                let blk = self.parse_block();
+                Expr {
+                    span: blk.span,
+                    kind: Box::new(ExprKind::Block(blk)),
+                }
+            } else {
+                self.parse_expr_bp(1)
+            };
+            let mut params: Vec<axon_ast::Ident> = Vec::new();
+            if expr_uses_it(&body) {
+                params.push(axon_ast::Ident {
+                    name: "it".to_string(),
+                    span: body.span,
+                });
+            }
+            let span = Span::in_file(start.start as usize, self.prev_end(), self.file_id);
+            return Expr {
+                span,
+                kind: Box::new(ExprKind::Lambda(LambdaExpr { params, body, span })),
+            };
+        }
+        let mut params = if matches!(self.peek(), TokenKind::Pipe) {
             self.bump();
             let mut params = Vec::new();
             if !matches!(self.peek(), TokenKind::Pipe) {
@@ -3017,6 +3066,18 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_expr_bp(1)
         };
+        // §64.1: `it` in a single-arg closure. A zero-param `|| …` whose
+        // body references `it` gets an implicit parameter named `it`, so
+        // `xs.map(|| it * 2)` works. A zero-param body that doesn't
+        // mention `it` stays a true thunk (`|| expensive()`), preserving
+        // the flow-combinator usage where closures are called with no
+        // args.
+        if params.is_empty() && expr_uses_it(&body) {
+            params.push(axon_ast::Ident {
+                name: "it".to_string(),
+                span: body.span,
+            });
+        }
         let lambda = LambdaExpr {
             params,
             body,
@@ -3356,6 +3417,63 @@ impl<'a> Parser<'a> {
 // our minimum public surface for downstream consumers.
 #[allow(dead_code)]
 fn _assert_token_used(_t: Token) {}
+
+/// Does `e` reference the bare identifier `it`? Used to decide whether
+/// a zero-param `|| …` closure gets an implicit `it` parameter (§64.1).
+/// Covers the expression forms `it` realistically appears in; unknown
+/// forms default to `false` (treated as a thunk).
+fn expr_uses_it(e: &Expr) -> bool {
+    use axon_ast::ExprKind as K;
+    fn is_it_path(p: &axon_ast::Path) -> bool {
+        p.segments.len() == 1 && p.segments[0].name == "it"
+    }
+    match &*e.kind {
+        K::Path(p) => is_it_path(p),
+        K::Binary { lhs, rhs, .. } => expr_uses_it(lhs) || expr_uses_it(rhs),
+        K::Unary { operand, .. } => expr_uses_it(operand),
+        K::Pipeline { lhs, rhs } => expr_uses_it(lhs) || expr_uses_it(rhs),
+        K::Field { receiver, .. } | K::SafeField { receiver, .. } => expr_uses_it(receiver),
+        K::Index { receiver, index } => expr_uses_it(receiver) || expr_uses_it(index),
+        K::Await(x) | K::Try(x) | K::Force(x) | K::Spawn(x) => expr_uses_it(x),
+        K::Cast { expr, .. } => expr_uses_it(expr),
+        K::Is { expr, .. } => expr_uses_it(expr),
+        K::Call { callee, args } => {
+            expr_uses_it(callee) || args.iter().any(call_arg_uses_it)
+        }
+        K::MethodCall { receiver, args, .. } => {
+            expr_uses_it(receiver) || args.iter().any(call_arg_uses_it)
+        }
+        K::ListLit(xs) | K::Tuple(xs) => xs.iter().any(expr_uses_it),
+        K::Block(b) => block_uses_it(b),
+        K::If { cond, then_branch, else_branch } => {
+            expr_uses_it(cond)
+                || block_uses_it(then_branch)
+                || else_branch.as_ref().map(|eb| match &**eb {
+                    axon_ast::ExprOrBlock::Block(b) => block_uses_it(b),
+                    axon_ast::ExprOrBlock::Expr(x) => expr_uses_it(x),
+                }).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn call_arg_uses_it(a: &axon_ast::CallArg) -> bool {
+    match a {
+        axon_ast::CallArg::Positional(e) => expr_uses_it(e),
+        axon_ast::CallArg::Named { value, .. } => expr_uses_it(value),
+    }
+}
+
+fn block_uses_it(b: &axon_ast::Block) -> bool {
+    b.tail.as_ref().map(expr_uses_it).unwrap_or(false)
+        || b.stmts.iter().any(|s| match s {
+            axon_ast::Stmt::Expr(e) => expr_uses_it(e),
+            axon_ast::Stmt::Let { value, .. } | axon_ast::Stmt::Var { value, .. } => {
+                expr_uses_it(value)
+            }
+            _ => false,
+        })
+}
 
 /// Convert a money amount lexeme (e.g. `"0.50"`, `"20"`, `"1.5"`) into
 /// integer cents, rounding to the nearest cent. The lexer stores the

@@ -138,6 +138,10 @@ fn check_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
             "field access requires records (need heap)",
             e.span,
         )),
+        ExprKind::SafeField { .. } => diags.push(unsupported(
+            "`?.` safe access requires records (need heap)",
+            e.span,
+        )),
         ExprKind::Index { .. } => diags.push(unsupported(
             "index expressions require list/map (need heap)",
             e.span,
@@ -250,6 +254,10 @@ fn check_binary_op(op: BinOp, span: Span, diags: &mut Vec<Diagnostic>) {
         | DivAssign | RemAssign => {}
         Range | RangeInclusive => diags.push(unsupported(
             "range expressions need a list-producing heap",
+            span,
+        )),
+        Coalesce => diags.push(unsupported(
+            "`??` needs nullable values (not in the WASM integer subset)",
             span,
         )),
     }

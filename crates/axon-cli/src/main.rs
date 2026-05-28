@@ -16,13 +16,19 @@ use std::process::ExitCode;
 use axon_diag::SourceFile;
 
 mod host;
+mod qol;
+mod scaffold;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let cmd = match args.next() {
         Some(c) => c,
         None => {
-            print_help();
+            // §64.2: a bare `axon` suggests the most likely next command
+            // based on project state, then points at help.
+            println!("axon {}\n", env!("CARGO_PKG_VERSION"));
+            println!("hint: {}", qol::next_command_hint());
+            println!("\nRun `axon help` for all commands.");
             return ExitCode::from(2);
         }
     };
@@ -41,13 +47,10 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        "check" => match args.next() {
-            Some(path) => cmd_check(&path),
-            None => {
-                eprintln!("usage: axon check <file>");
-                ExitCode::from(2)
-            }
-        },
+        "check" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_check(&remaining)
+        }
         "run" => {
             let remaining: Vec<String> = args.collect();
             cmd_run(&remaining)
@@ -114,6 +117,34 @@ fn main() -> ExitCode {
         "schema" => {
             let remaining: Vec<String> = args.collect();
             cmd_schema(&remaining)
+        }
+        "explain" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_explain(&remaining)
+        }
+        "new" => {
+            let remaining: Vec<String> = args.collect();
+            scaffold::cmd_new(&remaining)
+        }
+        "tour" => {
+            let remaining: Vec<String> = args.collect();
+            scaffold::cmd_tour(&remaining)
+        }
+        "stats" => {
+            let remaining: Vec<String> = args.collect();
+            qol::cmd_stats(&remaining)
+        }
+        "clean" => {
+            let remaining: Vec<String> = args.collect();
+            qol::cmd_clean(&remaining)
+        }
+        "completions" => {
+            let remaining: Vec<String> = args.collect();
+            qol::cmd_completions(&remaining)
+        }
+        "doctor" => {
+            let remaining: Vec<String> = args.collect();
+            qol::cmd_doctor(&remaining)
         }
         "prof" => {
             let remaining: Vec<String> = args.collect();
@@ -622,6 +653,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
         let mut interp = axon_runtime::Interpreter::with_caps(caps.clone());
         host::install(&interp);
         interp.load_program(&project.merged);
+        host::register_policies(&project.merged);
         let closure = axon_runtime::Closure::new(
             Some(format!("test:{}", t.name)),
             Vec::new(),
@@ -694,6 +726,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut cap_names: Option<Vec<String>> = None;
     let mut isolated = false;
     let mut use_vm = false;
+    let mut dry_run = false;
     let mut trace_path: Option<String> = None;
     let mut record_path: Option<String> = None;
     let mut replay_path: Option<String> = None;
@@ -705,6 +738,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         match a {
             "--isolated" => {
                 isolated = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
                 i += 1;
             }
             "--vm" => {
@@ -811,13 +848,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let path = match path {
-        Some(p) => p,
-        None => {
-            eprintln!("usage: axon run [--with E,...] [--isolated] [--vm] <file|dir>");
-            return ExitCode::from(2);
-        }
-    };
+    // No path → run the project in the current directory (§58.1: `axon
+    // run` inside a scaffolded project just works).
+    let path = path.unwrap_or(".");
     let path_buf = std::path::Path::new(path);
     let project = match axon_project::LoadedProject::load_with_features(
         path_buf,
@@ -854,6 +887,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if !type_diags.is_empty() {
         emit_diagnostics(&type_diags, &file);
         return ExitCode::from(1);
+    }
+    if dry_run {
+        return dry_run_report(&program, cap_names.as_deref(), isolated);
     }
     if use_vm {
         let vm_caps = if isolated {
@@ -916,6 +952,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             interp.enable_replay(rec);
         }
         interp.load_program(&program);
+        host::register_policies(&program);
         let exit = match interp.run_main() {
             Ok(_) => ExitCode::SUCCESS,
             Err(err) => {
@@ -935,6 +972,56 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 }
 
+/// `axon run --dry-run` (§64.3): type-check, then print what *would*
+/// run — declared models, agents, tools, and handlers, plus the active
+/// capability set — without executing anything or spending money.
+fn dry_run_report(
+    program: &axon_ast::Program,
+    cap_names: Option<&[String]>,
+    isolated: bool,
+) -> ExitCode {
+    use axon_ast::Item;
+    let mut models = Vec::new();
+    let mut agents = Vec::new();
+    let mut tools = Vec::new();
+    let mut has_main = false;
+    for item in &program.items {
+        match item {
+            Item::Model(m) => models.push(m.name.name.clone()),
+            Item::Agent(a) => agents.push(a.name.name.clone()),
+            Item::Tool(t) => tools.push(t.name.name.clone()),
+            Item::Fn(f) if f.name.name == "main" => has_main = true,
+            _ => {}
+        }
+    }
+    println!("axon run --dry-run — nothing was executed\n");
+    let caps = if isolated {
+        "(isolated: none)".to_string()
+    } else {
+        match cap_names {
+            Some(c) if !c.is_empty() => c.join(", "),
+            _ => "(standard default set)".to_string(),
+        }
+    };
+    println!("  entrypoint   {}", if has_main { "main()" } else { "(no main)" });
+    println!("  capabilities {caps}");
+    println!("  models       {}", fmt_list(&models));
+    println!("  agents       {}", fmt_list(&agents));
+    println!("  tools        {}", fmt_list(&tools));
+    println!(
+        "\n  note: model calls, tool calls, and effects were NOT performed."
+    );
+    ExitCode::SUCCESS
+}
+
+fn fmt_list(xs: &[String]) -> String {
+    if xs.is_empty() {
+        "(none)".to_string()
+    } else {
+        xs.join(", ")
+    }
+}
+
 fn parse_caps_to_vec(input: &str) -> Vec<String> {
     input
         .split(',')
@@ -944,22 +1031,111 @@ fn parse_caps_to_vec(input: &str) -> Vec<String> {
         .collect()
 }
 
-fn cmd_check(path: &str) -> ExitCode {
+fn cmd_check(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut json = false;
+    let mut explain_errors = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            "--explain-errors" => explain_errors = true,
+            other if other.starts_with("--") => {
+                eprintln!("axon check: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("axon check: only one file is supported");
+                    return ExitCode::from(2);
+                }
+                path = Some(other);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: axon check [--json] [--explain-errors] <file>");
+        return ExitCode::from(2);
+    };
     let Some(file) = read_or_die(path) else {
         return ExitCode::from(1);
     };
     let (program, parse_diags) = axon_parser::parse(&file);
-    if !parse_diags.is_empty() {
-        emit_diagnostics(&parse_diags, &file);
+    // Parse errors short-circuit: don't run tyck on a broken tree.
+    let (item_count, all): (usize, Vec<axon_diag::Diagnostic>) = if parse_diags.is_empty() {
+        let (ctx, type_diags) = axon_tyck::check(&file, &program);
+        (ctx.len(), type_diags)
+    } else {
+        (0, parse_diags)
+    };
+
+    if json {
+        println!("{}", diagnostics_to_json(&all, path));
+        return if all.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+    }
+    if !all.is_empty() {
+        emit_diagnostics(&all, &file);
+        if explain_errors {
+            print_explanations(&all);
+        }
         return ExitCode::from(1);
     }
-    let (ctx, type_diags) = axon_tyck::check(&file, &program);
-    if !type_diags.is_empty() {
-        emit_diagnostics(&type_diags, &file);
-        return ExitCode::from(1);
-    }
-    println!("type-checked {} item(s) successfully", ctx.len());
+    println!("type-checked {item_count} item(s) successfully");
     ExitCode::SUCCESS
+}
+
+/// Append a plain-English explanation block after the rendered
+/// diagnostics, one per distinct code (`--explain-errors`, §58.4).
+fn print_explanations(diags: &[axon_diag::Diagnostic]) {
+    let mut seen: Vec<&str> = Vec::new();
+    for d in diags {
+        let Some(code) = d.code else { continue };
+        if seen.contains(&code) {
+            continue;
+        }
+        seen.push(code);
+        if let Some(e) = axon_diag::explain::explain(code) {
+            eprintln!("\n\u{2500}\u{2500} explain {code} \u{2500}\u{2500}");
+            eprintln!("{}", e.render());
+        }
+    }
+}
+
+/// Serialize diagnostics to the machine-readable `--json` shape (§57.2):
+/// `{ "file", "ok", "diagnostics": [{ code, severity, message, line,
+/// col, notes }] }`. Editors/CI consume this.
+fn diagnostics_to_json(diags: &[axon_diag::Diagnostic], path: &str) -> String {
+    let items: Vec<serde_json::Value> = diags
+        .iter()
+        .map(|d| {
+            let sev = match d.severity {
+                axon_diag::Severity::Error => "error",
+                axon_diag::Severity::Warning => "warning",
+                axon_diag::Severity::Note => "note",
+                axon_diag::Severity::Help => "help",
+            };
+            serde_json::json!({
+                "code": d.code,
+                "severity": sev,
+                "message": d.message,
+                "span": {
+                    "start": d.primary.span.start,
+                    "end": d.primary.span.end,
+                    "file": d.primary.span.file,
+                },
+                "notes": d.notes,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "file": path,
+        "ok": diags.is_empty(),
+        "diagnostics": items,
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 fn cmd_parse(path: &str) -> ExitCode {
@@ -2777,5 +2953,50 @@ fn parse_profile_spec(s: &str) -> Result<axon_cost::ProviderProfile, String> {
             0
         },
     })
+}
+
+// ---------------------------------------------------------------------------
+// §57 / §64.2 — `axon explain <CODE | effect:X | capability:X>`
+// ---------------------------------------------------------------------------
+
+fn cmd_explain(args: &[String]) -> ExitCode {
+    let topic = match args.first() {
+        Some(t) => t.as_str(),
+        None => {
+            // No argument: list the catalogued codes.
+            println!(
+                "axon explain — offline diagnostic & concept reference\n\nUsage:\n  axon explain <CODE>            e.g. axon explain E0202\n  axon explain effect:<NAME>     e.g. axon explain effect:LLM\n  axon explain capability:<NAME> e.g. axon explain capability:Tool\n"
+            );
+            let codes = axon_diag::explain::catalogue_codes();
+            println!("Catalogued codes ({}):", codes.len());
+            println!("  {}", codes.join("  "));
+            return ExitCode::SUCCESS;
+        }
+    };
+    // Concept form: `effect:LLM`, `capability:Tool`.
+    if let Some((kind, name)) = topic.split_once(':') {
+        match axon_diag::explain::explain_concept(kind, name) {
+            Some(doc) => {
+                println!("{doc}");
+                return ExitCode::SUCCESS;
+            }
+            None => {
+                eprintln!("axon explain: unknown concept kind `{kind}` (try effect: or capability:)");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // Code form.
+    match axon_diag::explain::explain(topic) {
+        Some(e) => {
+            println!("{}", e.render());
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("axon explain: no explanation for `{topic}`");
+            eprintln!("  (codes look like E0202, E0712, W1203, P0010)");
+            ExitCode::from(1)
+        }
+    }
 }
 

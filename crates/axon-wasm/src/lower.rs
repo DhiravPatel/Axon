@@ -879,6 +879,7 @@ fn discriminant_name(k: &ExprKind) -> &'static str {
         ExprKind::Await(_) => "Await",
         ExprKind::Try(_) => "Try",
         ExprKind::TryRecover { .. } => "TryRecover",
+        ExprKind::SafeField { .. } => "SafeField",
         ExprKind::Force(_) => "Force",
         ExprKind::Spawn(_) => "Spawn",
         ExprKind::Block(_) => "Block",

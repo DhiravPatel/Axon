@@ -6044,6 +6044,93 @@ fn s28_render_grpc_proto(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(Rc::new(body)))
 }
 
+/// Compile every `policy NAME { ... }` declaration (§30) in a loaded
+/// program into an `axon-guard` `PolicyBlock` and register it in the
+/// `POLICY_BLOCKS` thread-local. After this runs, `policy_block_check`
+/// / `policy_block_charge` / `policy_block_audit_summary` work against
+/// natively-declared policies, and `agent X { policy: NAME }` handlers
+/// can consult them.
+pub fn register_policies(program: &axon_ast::Program) {
+    use axon_ast::{Item, PolicyAction, PolicyClause};
+    for item in &program.items {
+        let Item::Policy(decl) = item else { continue };
+        let mut block = pb::PolicyBlock::new(decl.name.name.clone());
+        // Policies are default-deny per §30 ("deny by default").
+        block.default_action = pb::ActionKind::Deny;
+        for clause in &decl.clauses {
+            match clause {
+                PolicyClause::Rule {
+                    action,
+                    effect,
+                    patterns,
+                    when,
+                } => {
+                    let Some(kind) = effect_str_to_kind(effect) else {
+                        continue;
+                    };
+                    for pat in patterns {
+                        match action {
+                            PolicyAction::Allow => block.allow(
+                                kind,
+                                pat.clone(),
+                                when.clone().unwrap_or_default(),
+                            ),
+                            PolicyAction::Deny => block.deny(kind, pat.clone()),
+                        }
+                    }
+                }
+                PolicyClause::Budget {
+                    scope,
+                    usd_cents,
+                    tokens,
+                } => {
+                    block.add_budget(pb::BudgetClause {
+                        scope: scope.clone(),
+                        max_usd: usd_cents.map(|c| c as f64 / 100.0),
+                        max_tokens: tokens.map(|t| t.max(0) as u64),
+                        max_wall_secs: None,
+                        window_secs: None,
+                        spent_usd: 0.0,
+                        spent_tokens: 0,
+                    });
+                }
+                PolicyClause::Rate {
+                    scope,
+                    max_calls,
+                    window_secs,
+                } => {
+                    block.add_rate(pb::RateClause {
+                        scope: scope.clone(),
+                        max_calls: *max_calls,
+                        window_secs: *window_secs,
+                        recent_call_ns: Vec::new(),
+                    });
+                }
+                PolicyClause::Audit(kinds) => {
+                    for k in kinds {
+                        block.audit(k.clone());
+                    }
+                }
+            }
+        }
+        POLICY_BLOCKS.with(|c| {
+            c.borrow_mut().insert(decl.name.name.clone(), block);
+        });
+    }
+}
+
+fn effect_str_to_kind(s: &str) -> Option<pb::EffectKind> {
+    match s {
+        "tool" => Some(pb::EffectKind::Tool),
+        "net" => Some(pb::EffectKind::Net),
+        // `io` and `fs` both map to the filesystem effect kind.
+        "fs" | "io" => Some(pb::EffectKind::Fs),
+        "llm" => Some(pb::EffectKind::Llm),
+        "memory" => Some(pb::EffectKind::Memory),
+        _ => None,
+    }
+}
+
 /// Wire `extern <lang> "path:fn"` tool bodies (§35.2) to the FFI bridge
 /// layer. The runtime calls this dispatcher with `(abi, symbol,
 /// args_json)`; we map the abi to a `BridgeKind`, split the symbol into

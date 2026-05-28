@@ -214,6 +214,8 @@ fn emit_token(out: &mut String, kind: &TokenKind) {
         DotDot => out.push_str(".."),
         DotDotEq => out.push_str("..="),
         Question => out.push('?'),
+        QuestionQuestion => out.push_str("??"),
+        QuestionDot => out.push_str("?."),
         Bang => out.push('!'),
         At => out.push('@'),
         HashLBracket => out.push_str("#["),

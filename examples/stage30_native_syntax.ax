@@ -1,0 +1,70 @@
+//! examples/stage30_native_syntax.ax — Stage 30 demo.
+//!
+//! The spec's own idioms, now as real native syntax (no host-binding
+//! workarounds):
+//!
+//!   §19   — `try { … } recover |e| { … }`
+//!   §64.1 — `??` null-coalescing, `?.` safe access, `it` closures
+//!   §30   — `policy NAME { allow/deny/budget/rate/audit }` blocks
+//!   §35.2 — `extern <lang> "path:fn"` tool bridges (see the python demo
+//!           in crates/axon-cli/tests/stage30_devex.rs)
+//!
+//! Run:
+//!   axon run examples/stage30_native_syntax.ax
+//!
+//! Developer-experience commands shipped alongside (try them):
+//!   axon explain E0202        axon explain effect:LLM
+//!   axon check --json <file>  axon check --explain-errors <file>
+//!   axon new my-bot -t support
+//!   axon stats                axon doctor      axon run --dry-run
+//!   axon completions zsh      axon tour
+
+policy support {
+    allow tool kb.search, tickets.get
+    allow tool issue_refund when amount <= 50
+    deny tool payments.charge
+    deny net "*"
+    budget per_request { usd = 0.50, tokens = 60000 }
+    rate per_user { 30 per 1m }
+    audit all_tool_calls, all_policy_denials
+}
+
+fn risky(n: Int) -> Int {
+    if n == 0 { panic("cannot divide by zero") } else { 100 / n }
+}
+
+fn apply(f: dyn, x: Int) -> Int { f(x) }
+
+fn main() uses { Console } {
+    print("---- §19 try / recover ----")
+    print_int(try { risky(4) } recover |e| { -1 })   // 25
+    print_int(try { risky(0) } recover |e| { -1 })   // -1 (recovered)
+    let msg = try { risky(0) } recover |e| { e }
+    print("recover message: ")
+    print(msg)
+
+    print("---- §64.1 ?? and ?. ----")
+    print_int(opt_none() ?? 42)                        // 42
+    print_int(opt_some(7) ?? 99)                       // 7
+    let rec = { name: "Sam", city: "Paris" }
+    print("city: " + rec?.city)                        // Paris
+    print("nil-safe missing? ")
+    print(bool(opt_is_none(opt_none()?.city)))         // true
+
+    print("---- §64.1 it closures ----")
+    print_int(apply(|| it * 2, 21))                    // 42
+    let thunk = || 7
+    print_int(thunk())                                 // 7 (thunk still works)
+
+    print("---- §30 policy block (enforced) ----")
+    print("kb.search allowed? ")
+    print(bool(policy_block_check("support", "tool", "kb.search", true).allow))
+    print("payments.charge allowed? ")
+    print(bool(policy_block_check("support", "tool", "payments.charge", true).allow))
+    print("refund when amount<=50 fails the guard? ")
+    print(bool(policy_block_check("support", "tool", "issue_refund", false).allow))
+    let s = policy_block_audit_summary("support")
+    print("audit allow/deny: ")
+    print_int(s.allow)
+    print_int(s.deny)
+}

@@ -532,6 +532,15 @@ impl Interpreter {
                 let recv = self.eval_expr(receiver, env)?;
                 self.field_get(&recv, &name.name, expr.span)
             }
+            ExprKind::SafeField { receiver, name } => {
+                // `a?.b` short-circuits to `nil` when `a` is `nil`.
+                let recv = self.eval_expr(receiver, env)?;
+                if matches!(recv, Value::Nil) {
+                    Ok(Value::Nil)
+                } else {
+                    self.field_get(&recv, &name.name, expr.span)
+                }
+            }
             ExprKind::Index { receiver, index } => {
                 let recv = self.eval_expr(receiver, env)?;
                 let idx = self.eval_expr(index, env)?;
@@ -2957,6 +2966,17 @@ impl Interpreter {
                 let r = self.eval_expr(rhs, env)?;
                 return Ok(Value::Bool(r.is_truthy()));
             }
+            Coalesce => {
+                // `a ?? b`: `a` unless it's `nil`, then `b`. `b` is only
+                // evaluated when needed (short-circuit). Unlike `||`,
+                // this preserves the *value* of `a` rather than its
+                // truthiness — `0 ?? 5` is `0`.
+                let l = self.eval_expr(lhs, env)?;
+                if matches!(l, Value::Nil) {
+                    return self.eval_expr(rhs, env);
+                }
+                return Ok(l);
+            }
             Assign => return self.eval_assign(lhs, rhs, env, span),
             AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
                 return self.eval_compound_assign(op, lhs, rhs, env, span);
@@ -3070,7 +3090,8 @@ impl Interpreter {
                 }
                 _ => return Err(bad()),
             },
-            And | Or | Assign | AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
+            And | Or | Coalesce | Assign | AddAssign | SubAssign | MulAssign | DivAssign
+            | RemAssign => {
                 unreachable!("handled above")
             }
         })
@@ -3323,6 +3344,7 @@ fn op_str(op: axon_ast::BinOp) -> &'static str {
         RemAssign => "%=",
         Range => "..",
         RangeInclusive => "..=",
+        Coalesce => "??",
     }
 }
 

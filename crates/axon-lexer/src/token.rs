@@ -109,6 +109,10 @@ pub enum TokenKind {
     DotDot,
     DotDotEq,
     Question,
+    /// `??` — null-coalescing operator.
+    QuestionQuestion,
+    /// `?.` — nil-safe field/method access.
+    QuestionDot,
     Bang,
     /// `@` standalone (e.g. before an attribute name like `@retry`). Note
     /// that `@alice` and `@{...}` are recognized as `AddrLit` instead.

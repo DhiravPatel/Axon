@@ -419,6 +419,17 @@ impl<'a> Checker<'a> {
                 let recv_ty = self.infer(receiver, scope, params, used);
                 self.field_ty(expr.span, &recv_ty, name)
             }
+            ExprKind::SafeField { receiver, name } => {
+                // `a?.b` has the same field type as `a.b`, but the whole
+                // expression is nullable since it yields `nil` when the
+                // receiver is `nil`.
+                let recv_ty = self.infer(receiver, scope, params, used);
+                let field_ty = self.field_ty(expr.span, &recv_ty, name);
+                match field_ty {
+                    Ty::Nullable(_) | Ty::Option(_) | Ty::Dyn | Ty::Error => field_ty,
+                    other => Ty::Nullable(Box::new(other)),
+                }
+            }
             ExprKind::Index { receiver, index } => {
                 let recv_ty = self.infer(receiver, scope, params, used);
                 let _idx_ty = self.infer(index, scope, params, used);
@@ -1276,6 +1287,15 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Unit
             }
+            Coalesce => {
+                // `a ?? b`: result is the non-nil type. Use the rhs type
+                // (the fallback) joined with the lhs's unwrapped type.
+                let unwrapped = match &lt {
+                    Ty::Nullable(t) | Ty::Option(t) => (**t).clone(),
+                    other => other.clone(),
+                };
+                join_types(&unwrapped, &rt)
+            }
         }
     }
 
@@ -1367,6 +1387,7 @@ fn op_str(op: BinOp) -> &'static str {
         RemAssign => "%=",
         Range => "..",
         RangeInclusive => "..=",
+        Coalesce => "??",
     }
 }
 

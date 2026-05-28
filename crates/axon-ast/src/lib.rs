@@ -673,6 +673,12 @@ pub enum ExprKind {
         receiver: Expr,
         name: Ident,
     },
+    /// `receiver?.name` — nil-safe field access. Evaluates to `nil` when
+    /// `receiver` is `nil`, otherwise behaves like `Field`.
+    SafeField {
+        receiver: Expr,
+        name: Ident,
+    },
     Index {
         receiver: Expr,
         index: Expr,
@@ -882,6 +888,8 @@ pub enum BinOp {
     RemAssign,
     Range,
     RangeInclusive,
+    /// `??` — null-coalescing: `a ?? b` is `a` if `a` is non-nil, else `b`.
+    Coalesce,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
