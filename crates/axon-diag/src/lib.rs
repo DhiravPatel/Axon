@@ -9,6 +9,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub mod explain;
+
 /// A loaded source file. Cheaply cloneable; the contents live behind `Arc`.
 /// Each instance carries a stable `file_id` so spans can be attributed
 /// back to the right file in a multi-file project — the [`SourceRegistry`]

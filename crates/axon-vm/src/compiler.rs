@@ -641,6 +641,10 @@ impl Compiler {
                     .add_constant(Value::String(std::rc::Rc::new(name.name.clone())));
                 self.emit(Op::GetField(name_idx), expr.span);
             }
+            ExprKind::SafeField { .. } => self.emit_unsupported(
+                "`?.` safe access requires the tree-walking interpreter (run without --vm)",
+                expr.span,
+            ),
             ExprKind::Index { receiver, index } => {
                 self.compile_expr(receiver);
                 self.compile_expr(index);
@@ -648,6 +652,10 @@ impl Compiler {
             }
             ExprKind::Await(inner) => self.compile_expr(inner),
             ExprKind::Try(inner) => self.compile_expr(inner),
+            ExprKind::TryRecover { .. } => self.emit_unsupported(
+                "try/recover requires the tree-walking interpreter (run without --vm)",
+                expr.span,
+            ),
             ExprKind::Force(inner) => {
                 self.compile_expr(inner);
                 self.emit(Op::Force, expr.span);
@@ -1282,6 +1290,10 @@ impl Compiler {
             AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
                 self.compile_compound_assign(op, lhs, rhs, span);
             }
+            Coalesce => self.emit_unsupported(
+                "`??` requires the tree-walking interpreter (run without --vm)",
+                span,
+            ),
             _ => {
                 self.compile_expr(lhs);
                 self.compile_expr(rhs);
@@ -1369,7 +1381,8 @@ fn binary_op_simple(op: BinOp) -> Op {
         Shl => Op::Shl,
         Shr => Op::Shr,
         Range | RangeInclusive => Op::Add, // see TODO below
-        And | Or | Assign | AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
+        And | Or | Coalesce | Assign | AddAssign | SubAssign | MulAssign | DivAssign
+        | RemAssign => {
             unreachable!("handled in compile_binary")
         }
     }

@@ -1088,7 +1088,15 @@ impl<'a> Lexer<'a> {
             b'\\' => Backslash,
             b'~' => Tilde,
             b'^' => Caret,
-            b'?' => Question,
+            b'?' => {
+                if self.bump_if(b'?') {
+                    QuestionQuestion
+                } else if self.bump_if(b'.') {
+                    QuestionDot
+                } else {
+                    Question
+                }
+            }
             b'.' => {
                 if self.bump_if(b'.') {
                     if self.bump_if(b'=') {

@@ -462,9 +462,46 @@ pub struct OrchestrateDecl {
 #[derive(Clone, Debug)]
 pub struct PolicyDecl {
     pub name: Ident,
-    /// Raw rules; sub-grammar deferred.
-    pub rules: Vec<RawRule>,
+    /// Structured policy clauses (§30). The sub-grammar covers
+    /// allow/deny rules, budgets, rate limits, and audit declarations.
+    pub clauses: Vec<PolicyClause>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum PolicyClause {
+    /// `allow tool kb.search, tickets.get [when <cond>]`
+    /// `deny  net  "*"`
+    Rule {
+        action: PolicyAction,
+        /// Effect kind: `tool` | `net` | `fs` | `llm` | `memory` | `io`.
+        effect: String,
+        /// One or more target patterns (dotted idents or string globs).
+        patterns: Vec<String>,
+        /// Raw text of an optional `when <cond>` guard. Evaluated by the
+        /// host at the call site; `None` means "always applies".
+        when: Option<String>,
+    },
+    /// `budget per_request { usd = 0.50, tokens = 60_000 }`
+    Budget {
+        scope: String,
+        usd_cents: Option<i64>,
+        tokens: Option<i64>,
+    },
+    /// `rate per_user { 30 per 1m }`
+    Rate {
+        scope: String,
+        max_calls: u32,
+        window_secs: u64,
+    },
+    /// `audit all_tool_calls, all_policy_denials`
+    Audit(Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyAction {
+    Allow,
+    Deny,
 }
 
 #[derive(Clone, Debug)]
@@ -636,6 +673,12 @@ pub enum ExprKind {
         receiver: Expr,
         name: Ident,
     },
+    /// `receiver?.name` — nil-safe field access. Evaluates to `nil` when
+    /// `receiver` is `nil`, otherwise behaves like `Field`.
+    SafeField {
+        receiver: Expr,
+        name: Ident,
+    },
     Index {
         receiver: Expr,
         index: Expr,
@@ -644,6 +687,15 @@ pub enum ExprKind {
     Await(Expr),
     /// `expr?`.
     Try(Expr),
+    /// `try { ... } recover |e| { ... }` — run `body`; if it raises a
+    /// runtime error, bind the error message to the recover lambda's
+    /// single parameter and evaluate the recover branch. The value of
+    /// the whole expression is the body's value on success, or the
+    /// recover branch's value on failure.
+    TryRecover {
+        body: Block,
+        recover: LambdaExpr,
+    },
     /// `expr!`.
     Force(Expr),
     /// `spawn call`.
@@ -836,6 +888,8 @@ pub enum BinOp {
     RemAssign,
     Range,
     RangeInclusive,
+    /// `??` — null-coalescing: `a ?? b` is `a` if `a` is non-nil, else `b`.
+    Coalesce,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

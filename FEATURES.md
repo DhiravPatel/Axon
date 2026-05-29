@@ -1,6 +1,87 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**859 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**890 tests passing** across 30+ crates).
+
+---
+
+## Stage 30 — Native Syntax + Developer Experience
+
+Move the spec's own idioms onto real parser syntax (no host-binding workarounds), and ship the developer-experience surface §57–§64 promises.
+
+### Native syntax (§19, §30, §35.2, §64.1)
+- **`try { … } recover |e| { … }`** (§19) — new `ExprKind::TryRecover` (distinct from the `?` Try postfix). Runs the body in a child scope; on any runtime error binds the message string to the recover lambda's first parameter and evaluates the recover branch. `return`/`break`/`continue` propagate unchanged. Tyck joins body + recover-branch types. VM + WASM emit a clean "interpreter only" diagnostic. Wired through every match site.
+- **`policy NAME { allow/deny/budget/rate/audit }`** (§30) — `parse_item` now dispatches the contextual `policy` keyword into a structured `PolicyDecl { clauses: Vec<PolicyClause> }` (Rule with optional `when`, Budget with money/token caps, Rate with `N per <duration>`, Audit). At load time the CLI compiles each decl into an `axon-guard::PolicyBlock` and registers it in the policy registry, so `policy_block_check` / `…_charge` / `…_audit_summary` work against natively-declared policies. Default-deny per §30.
+- **`extern <lang> "path:fn"`** tool bodies (§35.2) — `parse_tool_decl` accepts a bare-ident ABI (`extern python "tools/s.py:run"`) in addition to the original quoted form. Runtime gains a `BridgeDispatcher` hook (held behind `Rc<RefCell<…>>` so load-time tool closures read the dispatcher installed later at run time); axon-cli wires it to `axon-ffi::bridges`, marshaling args to a JSON object keyed by param name and parsing the JSON result back into a Value. Verified end-to-end against a real `python3` subprocess.
+- **`??` null-coalescing** (§64.1) — new `BinOp::Coalesce` with lexer support (`QuestionQuestion` token), parser entry at `(4, 5)` precedence (binds looser than `||`, tighter than assignment), short-circuit eval (lhs if non-nil, else rhs), tyck joins the unwrapped lhs with rhs.
+- **`?.` safe field access** (§64.1) — new `QuestionDot` token, `ExprKind::SafeField`, postfix parser case mirroring `.`, eval shorts to `nil` on a `nil` receiver, tyck wraps the field type in `Nullable` (collapsing if already nullable).
+- **`it` in zero-param closures** (§64.1) — `||` lexes as `PipePipe` and dispatches to `parse_lambda`, which scans the body via `expr_uses_it` (a focused walker over the common forms). A `||` whose body references `it` gets an implicit `it` parameter so `xs.map(|| it * 2)` works; a thunk `|| 7` stays zero-param so flow-combinator usage isn't broken.
+- **Lambda block bodies** — `|e| { ... }` now parses the braces as a block (not a set literal), matching the `fn (params) { ... }` form.
+
+### §57 Diagnostics & error UX
+- [crates/axon-diag/src/explain.rs](crates/axon-diag/src/explain.rs) — stable offline catalogue. Each `Explanation { code, family, title, why, fix, learn }` covers a bespoke entry for every code the compiler actually emits (E0201–E0214, E0220–E0224, E0230, E0240–E0241, E0250–E0252, E0301, E0421, E0712, P0001/P0010/P0011) plus a family-level fallback so even uncatalogued codes get a useful page.
+- **`axon explain <CODE | effect:X | capability:X>`** — prints the full explanation; with no arg lists all catalogued codes.
+- **`axon check --json`** — machine-readable diagnostic envelope `{ "file", "ok", "diagnostics": [{ code, severity, message, span, notes }] }` for CI/editors.
+- **`axon check --explain-errors`** — appends the catalogue's `Explanation::render()` block after each emitted diagnostic, keyed by code, deduplicated.
+
+### §58 Onboarding & scaffolding
+- [crates/axon-cli/src/scaffold.rs](crates/axon-cli/src/scaffold.rs) — `axon new <name> [--template <t>]` materializes a working project from one of **8 embedded templates**: `agent`, `support`, `research`, `assistant`, `pipeline`, `webhook`, `lambda`, `skill`. Each ships an `axon.toml`, `src/main.ax`, `README.md`, and (where it makes sense) a test. **All 8 templates type-check and run cleanly** with `axon run` (integration-tested).
+- **`axon tour`** — 8 embedded lessons (bindings → effects → models → tools → agents → try/recover → policies → testing/replay), each printed in-terminal with a next-lesson pointer.
+- **`axon run` with no path** defaults to `.` so a scaffolded project's "next: axon run" instruction just works.
+
+### §64.2 QoL commands
+- [crates/axon-cli/src/qol.rs](crates/axon-cli/src/qol.rs):
+  - **`axon stats [path]`** — counts files, lines (total + code), functions (with effect-row %), agents, actors, tools, models, memories, prompts, schemas, types, policies, tests, evals. Skips `target/` / `node_modules/` / `.git/`.
+  - **`axon clean`** — removes `target/` / `doc/` / `dist/` / `out/` / `.axon-cache/`, reports MB reclaimed.
+  - **`axon completions {bash|zsh|fish|pwsh}`** — emits shell-specific completion scripts covering every subcommand (including the new ones).
+  - **`axon doctor`** — environment check: toolchain version, project presence, axon.toml validity, vault mode (0600 on Unix), optional bridge runtimes (`python3`, `node`).
+  - **`axon run --dry-run`** — type-checks, prints what *would* run (entrypoint, active capabilities, declared models/agents/tools), exits without executing or spending money.
+  - **Bare `axon`** — prints a contextual hint based on project state ("no project here — try `axon new`", "you have tests — try `axon test`", etc.) instead of a wall of help.
+
+### Test coverage
+- `crates/axon-diag::explain` — 7 unit tests (known/unknown codes, family map, concept docs, one-liner format).
+- `crates/axon-cli::scaffold` — 6 unit tests (every template has axon.toml + .ax file, 8 templates present, lessons sequential, name validation, substitution token used).
+- `crates/axon-cli::qol` — 4 unit tests (completion shells, dir-size missing-path, which-finds-sh, stats tally).
+- `crates/axon-cli/tests/stage30_devex.rs` — 14 end-to-end tests through the `axon` binary: try/recover round-trip, `??`+`?.` semantics, `it` closure + thunk coexistence, `policy { … }` enforcement, extern Python tool bridge, `axon explain`, `check --json`, `check --explain-errors`, `axon new` for all 8 templates (each scaffolds and runs), `axon tour`, `axon stats`, `run --dry-run` doesn't execute, `axon completions` for all 4 shells, `axon doctor`.
+- Workspace total: **890 passed, 0 failed** (up from 859).
+
+### CLI demo (real run)
+```
+$ axon run examples/stage30_native_syntax.ax
+---- §19 try / recover ----
+25
+-1
+recover message:
+panic: cannot divide by zero
+---- §64.1 ?? and ?. ----
+42
+7
+city: Paris
+nil-safe missing? true
+---- §64.1 it closures ----
+42
+7
+---- §30 policy block (enforced) ----
+kb.search allowed? true
+payments.charge allowed? false
+refund when amount<=50 fails the guard? false
+audit allow/deny: 1 2
+
+$ axon explain E0712
+E0712 — effect not granted by policy
+  family: Capabilities, policies, taint
+  why:  A policy-bound agent attempted an effect its policy doesn't allow.
+        Policies are runtime-enforced guardrails that application code cannot bypass.
+  fix:  Add an `allow` rule to the policy (optionally with a `when` clause),
+        or route the effect through an agent that holds the grant.
+
+$ axon new my-bot --template support
+created `my-bot` from template `support`
+  Tools + policy + tests — a guarded support bot.
+next:
+  cd my-bot
+  axon run            # type-checks + runs (mock model, no keys needed)
+  axon test           # runs the included test
+```
 
 ---
 

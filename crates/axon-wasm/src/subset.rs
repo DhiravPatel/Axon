@@ -138,6 +138,10 @@ fn check_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
             "field access requires records (need heap)",
             e.span,
         )),
+        ExprKind::SafeField { .. } => diags.push(unsupported(
+            "`?.` safe access requires records (need heap)",
+            e.span,
+        )),
         ExprKind::Index { .. } => diags.push(unsupported(
             "index expressions require list/map (need heap)",
             e.span,
@@ -145,6 +149,10 @@ fn check_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
         ExprKind::Await(inner) | ExprKind::Try(inner) | ExprKind::Force(inner) => {
             check_expr(inner, diags);
         }
+        ExprKind::TryRecover { .. } => diags.push(unsupported(
+            "`try/recover` is not available in the WASM target (needs the interpreter)",
+            e.span,
+        )),
         ExprKind::Spawn(_) => diags.push(unsupported(
             "`spawn` is not available in the WASM target (no actor runtime)",
             e.span,
@@ -246,6 +254,10 @@ fn check_binary_op(op: BinOp, span: Span, diags: &mut Vec<Diagnostic>) {
         | DivAssign | RemAssign => {}
         Range | RangeInclusive => diags.push(unsupported(
             "range expressions need a list-producing heap",
+            span,
+        )),
+        Coalesce => diags.push(unsupported(
+            "`??` needs nullable values (not in the WASM integer subset)",
             span,
         )),
     }
