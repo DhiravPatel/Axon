@@ -1,0 +1,347 @@
+{
+  "events": [
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "refund"
+          }
+        ],
+        "content": "refund",
+        "cost_usd": 0.0,
+        "input_tokens": 244,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "refund"
+          }
+        ],
+        "content": "refund",
+        "cost_usd": 0.0,
+        "input_tokens": 244,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "refund"
+          }
+        ],
+        "content": "refund",
+        "cost_usd": 0.0,
+        "input_tokens": 244,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "Thanks Alice — we've spotted the duplicate charge and queued a refund for one of the $42.50 lines. You'll see it back on your card within 3-5 business days."
+          }
+        ],
+        "content": "Thanks Alice — we've spotted the duplicate charge and queued a refund for one of the $42.50 lines. You'll see it back on your card within 3-5 business days.",
+        "cost_usd": 0.0,
+        "input_tokens": 24,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "bug_report"
+          }
+        ],
+        "content": "bug_report",
+        "cost_usd": 0.0,
+        "input_tokens": 266,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "bug_report"
+          }
+        ],
+        "content": "bug_report",
+        "cost_usd": 0.0,
+        "input_tokens": 266,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "question"
+          }
+        ],
+        "content": "question",
+        "cost_usd": 0.0,
+        "input_tokens": 266,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "Sorry about the iOS crash, Bob. Could you send a screenshot of the splash screen and your iOS build number (Settings > General > About)? In the meantime, try a clean install via TestFlight build 217."
+          }
+        ],
+        "content": "Sorry about the iOS crash, Bob. Could you send a screenshot of the splash screen and your iOS build number (Settings > General > About)? In the meantime, try a clean install via TestFlight build 217.",
+        "cost_usd": 0.0,
+        "input_tokens": 21,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "bug_report"
+          }
+        ],
+        "content": "bug_report",
+        "cost_usd": 0.0,
+        "input_tokens": 275,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "question"
+          }
+        ],
+        "content": "question",
+        "cost_usd": 0.0,
+        "input_tokens": 275,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "bug_report"
+          }
+        ],
+        "content": "bug_report",
+        "cost_usd": 0.0,
+        "input_tokens": 275,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "question"
+          }
+        ],
+        "content": "question",
+        "cost_usd": 0.0,
+        "input_tokens": 254,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "question"
+          }
+        ],
+        "content": "question",
+        "cost_usd": 0.0,
+        "input_tokens": 254,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "question"
+          }
+        ],
+        "content": "question",
+        "cost_usd": 0.0,
+        "input_tokens": 254,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "Hi Dave — Settings > Account > Data Export gives you a one-click CSV bundle. The job emails you when it's ready (usually under 5 minutes)."
+          }
+        ],
+        "content": "Hi Dave — Settings > Account > Data Export gives you a one-click CSV bundle. The job emails you when it's ready (usually under 5 minutes).",
+        "cost_usd": 0.0,
+        "input_tokens": 24,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "refund"
+          }
+        ],
+        "content": "refund",
+        "cost_usd": 0.0,
+        "input_tokens": 241,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "refund"
+          }
+        ],
+        "content": "refund",
+        "cost_usd": 0.0,
+        "input_tokens": 241,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    },
+    {
+      "kind": "model_call",
+      "provider": "mock",
+      "response": {
+        "blocks": [
+          {
+            "kind": "text",
+            "text": "refund"
+          }
+        ],
+        "content": "refund",
+        "cost_usd": 0.0,
+        "input_tokens": 241,
+        "output_tokens": 0,
+        "stop_reason": "end_turn",
+        "structured": null,
+        "tool_calls": []
+      }
+    }
+  ],
+  "version": 1
+}

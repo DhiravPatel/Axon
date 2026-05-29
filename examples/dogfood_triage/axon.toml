@@ -1,0 +1,14 @@
+[package]
+name = "triage"
+version = "0.1.0"
+
+[run]
+entry = "main"
+src = "src"
+
+# A real triage agent needs: console for logs, the LLM, network for the
+# model, memory for customer history, and the approval/human capability
+# for the policy gates. No Fs because the fixtures are inlined; no
+# Computer because there's no browser.
+[caps]
+default = ["Console", "LLM", "Net", "Memory", "Tool", "Audit"]

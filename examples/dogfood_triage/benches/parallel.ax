@@ -1,0 +1,28 @@
+//! Parallel-mode workload — paired with [serial.ax]. Same total work
+//! (BATCH_SIZE × REPEATS asks at SLEEP_MS each); the wall-time delta
+//! between this and serial.ax is the sum→max drop from §32.1.
+
+const SLEEP_MS = 200
+const BATCH_SIZE = 4
+const REPEATS = 5
+
+fn build_asks(target: Model) -> List<dyn> {
+    let asks: List<dyn> = []
+    var i = 0
+    while i < BATCH_SIZE {
+        list_push(asks, { target: target, user: "q" + str(i) })
+        i = i + 1
+    }
+    asks
+}
+
+fn main() uses { Console, LLM, Net } {
+    let m = mock_model_slow("ok", SLEEP_MS)
+    var r = 0
+    while r < REPEATS {
+        let asks = build_asks(m)
+        flow_parallel_asks(asks)
+        r = r + 1
+    }
+    print("done")
+}

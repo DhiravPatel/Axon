@@ -1,0 +1,5 @@
+c_alice|Alice Chen|pro|false|3
+c_bob|Bob Diaz|free|false|1
+c_carol|Carol Wright|enterprise|true|2
+c_dave|Dave Ortega|pro|false|0
+c_eve|Eve Park|pro|false|1

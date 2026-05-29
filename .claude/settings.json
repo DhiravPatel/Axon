@@ -26,7 +26,11 @@
       "Bash(cp /tmp/axon-fix-demo/typos-backup.ax examples/stage32_typos.ax)",
       "Bash(awk '-F[:;]' ' *)",
       "Bash(./target/debug/axon help *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Read(//tmp/**)",
+      "Bash(./target/debug/axon replay *)",
+      "Bash(cd \"/Users/dhiravpatel/Documents/Project 2/Axon\" && cat /tmp/triage-replay.txt 2>&1 | head -30)",
+      "Read(//private/tmp/**)"
     ],
     "additionalDirectories": [
       "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec"

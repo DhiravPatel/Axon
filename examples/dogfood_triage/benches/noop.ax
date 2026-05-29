@@ -1,0 +1,8 @@
+//! Baseline — measures `axon run` process overhead (build cache hit,
+//! parse, type-check, interpreter startup). The Rust runner subtracts
+//! this from serial/parallel wall times so the published numbers
+//! reflect work, not setup.
+
+fn main() uses { Console } {
+    print("done")
+}

@@ -1,0 +1,56 @@
+//! Fixture loading and parsing.
+//!
+//! Real production agents would pull tickets off a queue and customers
+//! out of a service. We hardcode pipe-delimited lines because (a) it
+//! keeps the dogfood project independent of any specific JSON parser
+//! that ships with the stdlib today, and (b) it makes the fixtures
+//! human-editable in two seconds.
+//!
+//! PAPERCUTS hit while writing this:
+//!   - There is no `String.split` in scope today. We roll our own.
+//!   - Mutable locals use `var x = ...`, not `let mut x: T = ...` (the
+//!     Rust idiom doesn't carry over). The latter is what I tried first.
+//!   - List literals work but type ascription on an empty list literal
+//!     (`let xs: List<String> = []`) is the syntax — the bare `[]` alone
+//!     in `let xs = []` would also work in inference, but for a
+//!     top-of-function declaration the ascription is clearer.
+
+/// Split a string on `|` into a List<String>.
+pub fn split_pipe(s: String) -> List<String> {
+    let parts: List<String> = []
+    let len = str_len(s)
+    var start = 0
+    var i = 0
+    while i < len {
+        let ch = str_substring(s, i, i + 1)
+        if ch == "|" {
+            list_push(parts, str_substring(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    list_push(parts, str_substring(s, start, len))
+    parts
+}
+
+/// Split a string on `\n` into a List<String>, dropping empty lines.
+pub fn split_lines(s: String) -> List<String> {
+    let out: List<String> = []
+    let len = str_len(s)
+    var start = 0
+    var i = 0
+    while i < len {
+        let ch = str_substring(s, i, i + 1)
+        if ch == "\n" {
+            if i > start {
+                list_push(out, str_substring(s, start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < len {
+        list_push(out, str_substring(s, start, len))
+    }
+    out
+}
