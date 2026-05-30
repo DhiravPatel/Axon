@@ -1,0 +1,60 @@
+//! Routing policy for triage decisions.
+//!
+//! This is the "what should the agent actually DO?" layer. The classifier
+//! says what kind of ticket it is; this module says what action to take.
+//!
+//! The rules, in order:
+//!   1. VIP customers ALWAYS go to human review, regardless of intent.
+//!   2. Abuse intent → escalate.
+//!   3. Refund > $50 → human review (the refund threshold is per the
+//!      `support` policy block; we don't bake it in here).
+//!   4. Refund <= $50 → auto_reply (the model drafts a refund-pending
+//!      message; finance posts the actual money).
+//!   5. Question / bug_report → auto_reply.
+//!   6. Other → human review (default-deny on unknown intents).
+//!
+//! Returns a (action, reason) pair. The reason field is what shows up
+//! in the audit trail — it should always explain *which rule fired*,
+//! never just "policy denied".
+
+pub fn decide(
+    intent: String,
+    refund_usd: Int,
+    customer_is_vip: Bool,
+    refund_threshold_usd: Int,
+) -> List<String> {
+    let out: List<String> = []
+    if customer_is_vip {
+        list_push(out, "human_review")
+        list_push(out, "VIP customer — all tickets go to human review")
+        return out
+    }
+    if intent == "abuse" {
+        list_push(out, "escalate")
+        list_push(out, "intent classified as abuse — escalate to trust & safety")
+        return out
+    }
+    if intent == "refund" {
+        if refund_usd > refund_threshold_usd {
+            list_push(out, "human_review")
+            list_push(out, "refund amount exceeds the $" + str(refund_threshold_usd) + " auto-approval threshold")
+            return out
+        }
+        list_push(out, "auto_reply")
+        list_push(out, "refund within auto-approval threshold")
+        return out
+    }
+    if intent == "question" {
+        list_push(out, "auto_reply")
+        list_push(out, "question — draft response")
+        return out
+    }
+    if intent == "bug_report" {
+        list_push(out, "auto_reply")
+        list_push(out, "bug_report — draft acknowledgement + create issue")
+        return out
+    }
+    list_push(out, "human_review")
+    list_push(out, "intent `" + intent + "` not in the auto-reply allowlist")
+    out
+}

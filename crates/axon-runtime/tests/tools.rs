@@ -86,7 +86,7 @@ mod model_tool_use {
         assert!(diags.is_empty(), "parser: {diags:#?}");
         let mut interp = axon_runtime::Interpreter::with_caps(caps);
         let provider =
-            std::rc::Rc::new(axon_models::MockProvider::new(MockBehavior::Turns(turns)));
+            std::sync::Arc::new(axon_models::MockProvider::new(MockBehavior::Turns(turns)));
         // Inject the model as a global so the program can reference it as
         // `scripted` without going through `mock_model(...)` first.
         interp.globals.define("scripted", Value::Model(provider));

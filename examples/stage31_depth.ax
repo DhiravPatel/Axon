@@ -1,0 +1,57 @@
+//! examples/stage31_depth.ax — Stage 31 demo.
+//!
+//! Depth-over-breadth slice: the flagship new capability (computer
+//! use) + four foundational depth investments.
+//!
+//!   §35  computer-use primitives — typed click/type/screenshot tools
+//!         under a `Computer` capability, with a Tainted<Image>-shaped
+//!         payload + a deterministic mock driver.
+//!   §56.3 GBNF schema emitter — schemas compile to grammars a local
+//!         inference backend can enforce token-by-token.
+//!   §58.1 zero-config defaults — `default_model()` works with no API
+//!         key (mock); `axon run` shows a wall-time/tokens/cost footer.
+//!   §57.* whole-program error recovery — parser keeps going past one
+//!         bad item, cascade suppression collapses noise.
+//!   async-runtime scaffolding — tokio dep + Task/Mailbox primitives
+//!         in `axon-async` (not yet wired into eval.rs; foundation
+//!         only).
+//!
+//! Run:  axon run examples/stage31_depth.ax
+
+schema Profile {
+    name: String,
+    age: Int,
+    active: Bool,
+}
+
+fn main() uses { Console, Computer, LLM, Net } {
+    print("---- §35 computer-use ----")
+    let shot = computer_screenshot()
+    print("screen: ")
+    print_int(shot.width)
+    print("tainted? ")
+    print(bool(shot.tainted))
+
+    computer_mouse_move(50, 50)
+    computer_click(50, 50, "left")
+    computer_type("hello axon")
+    computer_key("enter")
+    computer_scroll(0, -120)
+    print("actions recorded: ")
+    print_int(list_len(computer_action_log()))
+
+    print("---- §56.3 schema → GBNF ----")
+    let g = schema_to_gbnf("Profile")
+    print(str_contains(g, "# schema: Profile"))
+    // First line of the emitted grammar.
+    print(str_substring(g, 0, 30))
+
+    print("---- §58.1 zero-config default model ----")
+    print(ask default_model() { user: "hi" })
+
+    print("---- §57.* error recovery ----")
+    print("(see crates/axon-cli/tests/stage31_depth.rs for the multi-error file)")
+
+    print("---- async-runtime scaffolding ----")
+    print("(axon-async crate ships tokio + Task/Mailbox; eval.rs migration is the next stage)")
+}

@@ -1,0 +1,22 @@
+//! Serial-mode workload — paired with [parallel.ax]. The Rust runner
+//! times each end-to-end and subtracts a baseline (a `noop.ax` that
+//! runs `axon` with no model calls) so we report the wall time of the
+//! work itself, not process startup.
+
+const SLEEP_MS = 200
+const BATCH_SIZE = 4
+const REPEATS = 5
+
+fn main() uses { Console, LLM, Net } {
+    let m = mock_model_slow("ok", SLEEP_MS)
+    var r = 0
+    while r < REPEATS {
+        var i = 0
+        while i < BATCH_SIZE {
+            ask m { user: "q" }
+            i = i + 1
+        }
+        r = r + 1
+    }
+    print("done")
+}

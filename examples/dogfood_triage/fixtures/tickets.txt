@@ -1,0 +1,5 @@
+T-1001|c_alice|Refund for double charge|I was charged $42.50 twice on Tuesday. Please refund one of them.|2026-05-27T10:14:00Z
+T-1002|c_bob|App crashes on iOS 17|Every time I open the app it crashes immediately after the splash. I've reinstalled twice.|2026-05-27T10:31:00Z
+T-1003|c_carol|VIP: Critical outage in prod|We can't push any deploys; the dashboard returns 503. We have a customer demo in 90 minutes.|2026-05-27T11:02:00Z
+T-1004|c_dave|How do I export my data?|I'd like to export everything I have in CSV. Where is that in the settings?|2026-05-27T11:45:00Z
+T-1005|c_eve|Refund $128 for unused year|I never used the annual plan. Please refund the whole $128.|2026-05-27T12:10:00Z

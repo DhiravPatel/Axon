@@ -23,6 +23,7 @@ use axon_types::TyVarId;
 mod builtins;
 mod ctx;
 mod errors;
+pub mod gbnf;
 mod infer;
 mod lower;
 mod register;

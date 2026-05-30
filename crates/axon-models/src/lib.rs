@@ -202,11 +202,16 @@ impl std::error::Error for ProviderError {}
 // Trait
 // ---------------------------------------------------------------------------
 
-/// One provider can serve many calls. Implementations are expected to be
-/// thread-safe (`Send + Sync`) so the host can share a single provider
-/// across actors when the future scheduler arrives — but Stage 6 only uses
-/// it from the single-threaded interpreter, so `Sync` isn't enforced yet.
-pub trait ModelProvider: Send {
+/// One provider can serve many calls. Implementations must be thread-safe
+/// (`Send + Sync`) so the host scheduler can run multiple `complete` calls
+/// concurrently on `tokio::spawn_blocking` workers — this is the §32 "model
+/// I/O is where the latency lives" first slice of the async migration.
+///
+/// `complete` itself stays synchronous: every existing transport (`ureq`,
+/// the mock counter) is sync, and forcing them through `async` would buy
+/// nothing. The overlap is produced by the host scheduler dispatching N
+/// calls across a thread pool, not by making each call itself async.
+pub trait ModelProvider: Send + Sync {
     /// Human-readable name for diagnostics (`"anthropic:claude-..."`,
     /// `"mock"`).
     fn name(&self) -> &str;

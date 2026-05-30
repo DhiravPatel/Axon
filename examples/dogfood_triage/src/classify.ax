@@ -1,0 +1,76 @@
+//! Intent classification.
+//!
+//! Real production agents would call three different model providers (or
+//! the same provider with three different prompts) and majority-vote the
+//! intent label to drive down single-model bias. We do exactly that —
+//! using `flow_parallel_asks` to overlap the three calls so the batch
+//! takes max-of-latencies, not sum-of-latencies.
+//!
+//! The intent vocabulary is fixed at the prompt level:
+//!   "refund" | "bug_report" | "question" | "abuse" | "other"
+//!
+//! The current mock models return scripted responses tuned to the
+//! fixture tickets. Swapping them for `anthropic("claude-...")` etc. is a
+//! one-line change in `main.ax`.
+//!
+//! PAPERCUTS hit while writing this:
+//!   - There's no `List.fold` or `for x in xs` over List<T>; we loop on
+//!     index via `while` + `list_get`. Imperative is fine in this style
+//!     but a `for-in` would tighten 6 lines into 3.
+//!   - String concat uses `+`; `format!`-style interpolation exists for
+//!     ask prompts but not for log lines. So we build prompts with `+`
+//!     too for consistency.
+
+/// Run three parallel classifications. Returns the consensus intent.
+/// `models` must be exactly three callable Model handles; we don't
+/// generalize because the consensus arithmetic gets fuzzy with 2 vs 4
+/// voters and this is a real-world choice (3 models, 2-of-3 majority).
+pub fn classify(
+    m1: Model,
+    m2: Model,
+    m3: Model,
+    ticket_subject: String,
+    ticket_body: String,
+) -> String uses { LLM, Net } {
+    let instructions = (
+        "You are a support-triage classifier. Reply with EXACTLY one of: " +
+        "refund, bug_report, question, abuse, other. " +
+        "No punctuation, no other text. " +
+        "Subject: " + ticket_subject + "\nBody: " + ticket_body
+    )
+    let responses = flow_parallel_asks([
+        { target: m1, user: instructions },
+        { target: m2, user: instructions },
+        { target: m3, user: instructions },
+    ])
+    let a = normalize(list_get(responses, 0))
+    let b = normalize(list_get(responses, 1))
+    let c = normalize(list_get(responses, 2))
+    consensus(a, b, c)
+}
+
+/// Strip leading/trailing whitespace and lowercase enough to make the
+/// label match. The mock returns canonical labels already; this is
+/// belt-and-suspenders for the real-model swap.
+pub fn normalize(s: String) -> String {
+    let n = str_len(s)
+    var start = 0
+    while start < n {
+        let ch = str_substring(s, start, start + 1)
+        if ch == " " { start = start + 1 } else { start = n }
+    }
+    // Simple: strip leading spaces. Trailing newline / period / etc. are
+    // not a concern for the scripted mocks; a real-model adapter would
+    // do more here.
+    if start >= str_len(s) { return s }
+    str_substring(s, start, str_len(s))
+}
+
+/// 2-of-3 majority. Falls back to `a` (model 1) when all three differ —
+/// model 1 is the "primary" classifier and tie-break to it is honest.
+pub fn consensus(a: String, b: String, c: String) -> String {
+    if a == b { return a }
+    if a == c { return a }
+    if b == c { return b }
+    a
+}

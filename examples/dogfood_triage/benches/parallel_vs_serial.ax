@@ -1,0 +1,74 @@
+//! Parallel-vs-serial workload generator.
+//!
+//! The wall-time measurement lives in the Rust runner ([bench_runner.rs]).
+//! From the language side we just run identical workloads:
+//!   - `serial` mode dispatches BATCH_SIZE asks in a `while` loop;
+//!   - `parallel` mode dispatches the same BATCH_SIZE via flow_parallel_asks.
+//!
+//! Run with `axon run examples/dogfood_triage/benches/parallel_vs_serial.ax -- <mode>`
+//! where <mode> is `serial` or `parallel`. Each mode does REPEATS batches
+//! so the runner's wall-clock measurement isn't dominated by one outlier.
+//!
+//! PAPERCUTS hit here:
+//!   - There is no `Duration → Int` exposed in user code, so timing
+//!     happens entirely on the Rust side via `std::time::Instant`. A
+//!     `duration.as_millis()` (or implicit Int coercion on subtraction)
+//!     would let Axon programs time themselves honestly.
+//!   - `axon run` does not pass CLI tail args through to the program
+//!     (no `args()` in scope). We work around it by reading an env var
+//!     via the host-level wrapper instead — but env_var also isn't in
+//!     the std builtins. Net result: the runner has to write the mode
+//!     into a temp file. We compromise: this script always runs BOTH
+//!     modes back-to-back; the runner times the *whole* `axon run` and
+//!     subtracts a separately-measured baseline. Less elegant but works.
+
+const SLEEP_MS = 200
+const BATCH_SIZE = 4
+const REPEATS = 5
+
+fn make_sleeper() -> Model {
+    mock_model_slow("ok", SLEEP_MS)
+}
+
+fn build_asks(target: Model) -> List<dyn> {
+    let asks: List<dyn> = []
+    var i = 0
+    while i < BATCH_SIZE {
+        list_push(asks, { target: target, user: "q" + str(i) })
+        i = i + 1
+    }
+    asks
+}
+
+fn run_serial(m: Model) uses { LLM, Net } {
+    var r = 0
+    while r < REPEATS {
+        var i = 0
+        while i < BATCH_SIZE {
+            ask m { user: "q" }
+            i = i + 1
+        }
+        r = r + 1
+    }
+}
+
+fn run_parallel(m: Model) uses { LLM, Net } {
+    var r = 0
+    while r < REPEATS {
+        let asks = build_asks(m)
+        flow_parallel_asks(asks)
+        r = r + 1
+    }
+}
+
+fn main() uses { Console, LLM, Net } {
+    let m = make_sleeper()
+    print("BENCH_BEGIN " + str(BATCH_SIZE) + " " + str(SLEEP_MS) + " " + str(REPEATS))
+    print("MODE_SERIAL_BEGIN")
+    run_serial(m)
+    print("MODE_SERIAL_END")
+    print("MODE_PARALLEL_BEGIN")
+    run_parallel(m)
+    print("MODE_PARALLEL_END")
+    print("BENCH_END")
+}

@@ -1,0 +1,57 @@
+//! Shared schemas. Used at the language boundary (schemas the model can
+//! return via structured output) and as in-process records.
+
+/// A ticket as it arrives from the support inbox.
+schema Ticket {
+    id: String,
+    customer_id: String,
+    subject: String,
+    body: String,
+    /// ISO-8601 timestamp. We don't try to parse it — it's only echoed
+    /// into the audit trail and the model's prompt.
+    received_at: String,
+}
+
+/// A customer record we look up via Memory.
+schema Customer {
+    id: String,
+    name: String,
+    plan: String,        // "free" | "pro" | "enterprise"
+    /// True iff this customer is on a high-touch SLA. VIP tickets always
+    /// go to human review, regardless of what the models say.
+    vip: Bool,
+    /// Number of tickets in the last 30 days. Drives our "spam-y vs
+    /// high-signal" heuristic in the routing policy.
+    recent_ticket_count: Int,
+}
+
+/// One model's classification of a ticket. We collect three of these in
+/// parallel and consensus-vote. The score field is the model's
+/// self-reported confidence (0-100) — not calibrated, but useful for
+/// breaking ties.
+schema Classification {
+    intent: String,      // "refund" | "bug_report" | "question" | "abuse" | "other"
+    urgency: String,     // "low" | "medium" | "high" | "critical"
+    refund_usd: Int,     // 0 when not a refund; else the requested amount
+    confidence: Int,     // 0-100
+}
+
+/// The final triage decision per ticket. This is what the audit trail
+/// records — every field is replay-stable.
+schema TriageDecision {
+    ticket_id: String,
+    consensus_intent: String,
+    consensus_urgency: String,
+    /// "auto_reply" | "human_review" | "escalate" — what the agent
+    /// actually decided to do after policy and approval gates ran.
+    action: String,
+    /// Why we landed there. Human-readable; the field name matches the
+    /// audit log column so a reviewer can grep.
+    reason: String,
+    /// Draft response text. Empty when the policy required a human and
+    /// no auto-draft was attempted.
+    draft: String,
+    /// Approximate cost in dollars; sum across every model call we made
+    /// for this ticket. Filled in from the host cost ledger.
+    cost_usd: Float,
+}

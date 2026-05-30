@@ -197,7 +197,10 @@ impl<'a> Checker<'a> {
                     };
                 }
             }
-            self.report(errors::type_not_found(span, name));
+            let candidates = self.ctx.item_names();
+            self.report(errors::type_not_found_with_candidates(
+                span, name, &candidates,
+            ));
             return Ty::Error;
         }
         // Dotted paths (e.g. `std.io.Reader`) are not yet routed through a

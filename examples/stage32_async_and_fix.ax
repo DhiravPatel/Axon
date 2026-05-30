@@ -1,0 +1,44 @@
+//! examples/stage32_async_and_fix.ax — Stage 32 demo.
+//!
+//! Two production-ready depth investments:
+//!
+//!   §32.1 async I/O slice — `flow_parallel_asks` overlaps N model calls on
+//!         a tokio thread pool. The interpreter stays single-threaded; only
+//!         the *waits* (where the latency lives) cross thread boundaries.
+//!         Same recording/replay contract as a serial run.
+//!   §32.2 `axon fix` — diagnostics carry mechanically applicable `Fix`es;
+//!         the new `axon fix` subcommand prints a unified diff (dry run)
+//!         or rewrites in place (--apply). Three high-frequency codes
+//!         ship with fixes today: E0202 (did-you-mean), E0203 (unknown
+//!         type, did-you-mean), E0210 (insert into `uses { ... }`).
+//!
+//! Run:  axon run examples/stage32_async_and_fix.ax
+
+fn main() uses { Console, LLM, Net } {
+    print("---- §32.1 async I/O slice: flow_parallel_asks ----")
+    let m_fast = mock_model_slow("fast", 50)
+    let m_med = mock_model_slow("medium", 100)
+    let m_slow = mock_model_slow("slow", 200)
+
+    // Three "model calls" that would total 350 ms run in serial.
+    // flow_parallel_asks overlaps them on tokio::spawn_blocking workers,
+    // so the whole batch returns in ~max(50, 100, 200) ≈ 200 ms wall time.
+    // Results come back in input order, not completion order — replay
+    // stays byte-identical to the serial path.
+    let responses = flow_parallel_asks([
+        { target: m_fast, user: "q1" },
+        { target: m_med,  user: "q2" },
+        { target: m_slow, user: "q3" },
+    ])
+    print("response[0]: ")
+    print(list_get(responses, 0))
+    print("response[1]: ")
+    print(list_get(responses, 1))
+    print("response[2]: ")
+    print(list_get(responses, 2))
+
+    print("---- §32.2 axon fix machinery ----")
+    print("Run `axon fix examples/stage32_typos.ax` to see the unified-diff")
+    print("dry-run path. Add --apply to rewrite the file in place.")
+    print("See crates/axon-cli/tests/stage32_*.rs for the test coverage.")
+}

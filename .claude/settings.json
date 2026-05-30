@@ -11,7 +11,26 @@
       "Bash(pnpm install *)",
       "Bash(pnpm typecheck *)",
       "Bash(pnpm build *)",
-      "Bash(rm \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec/page.tsx\" \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/features/page.tsx\"; mkdir -p \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec/[slug]\" \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/features/[slug]\")"
+      "Bash(rm \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec/page.tsx\" \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/features/page.tsx\"; mkdir -p \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec/[slug]\" \"/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/features/[slug]\")",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(awk -F'[:,]' '{p+=$2; f+=$3} END {print \"passed:\", p, \"failed:\", f}')",
+      "Bash(grep -B 1 \"missing field \\\\`fixes\\\\`\")",
+      "Bash(grep -v \"with_fix\\\\|fixes:\\\\|Diagnostic\\\\s*$\\\\|test\")",
+      "Bash(grep -A 2 \"missing field \\\\`fixes\\\\`\")",
+      "Bash(./target/debug/axon fix *)",
+      "Bash(cd \"/Users/dhiravpatel/Documents/Project 2/Axon\" && ./target/debug/axon fix --apply /tmp/axon-fix-demo/typo.ax 2>&1 && ./target/debug/axon check /tmp/axon-fix-demo/typo.ax 2>&1 && cat /tmp/axon-fix-demo/typo.ax)",
+      "Read(//private/tmp/axon-fix-demo/**)",
+      "Bash(./target/debug/axon run *)",
+      "Bash(cp examples/stage32_typos.ax /tmp/axon-fix-demo/typos-backup.ax)",
+      "Bash(cp /tmp/axon-fix-demo/typos-backup.ax examples/stage32_typos.ax)",
+      "Bash(awk '-F[:;]' ' *)",
+      "Bash(./target/debug/axon help *)",
+      "Bash(git commit -m ' *)",
+      "Read(//tmp/**)",
+      "Bash(./target/debug/axon replay *)",
+      "Bash(cd \"/Users/dhiravpatel/Documents/Project 2/Axon\" && cat /tmp/triage-replay.txt 2>&1 | head -30)",
+      "Read(//private/tmp/**)"
     ],
     "additionalDirectories": [
       "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec"

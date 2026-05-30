@@ -67,6 +67,18 @@ impl Scope {
             .rev()
             .find_map(|f| f.get(name))
     }
+
+    /// Every bound identifier across all live frames. Used by
+    /// did-you-mean fixes when a reference can't be resolved.
+    pub(crate) fn all_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for f in &self.frames {
+            for k in f.keys() {
+                out.push(k.clone());
+            }
+        }
+        out
+    }
 }
 
 // ===========================================================================
@@ -101,10 +113,18 @@ impl<'a> Checker<'a> {
             .map(|r| self.lower_effect_row(r))
             .unwrap_or_default();
         let body_span = f.body.span;
-        let body_ty = self.with_effect_row(declared_eff.clone(), |c, used| {
-            let t = c.check_block(&f.body, &declared_ret, &mut scope, &params, used);
-            t
-        });
+        // Compute fix anchors so a missing-effect diagnostic carries a real
+        // rewrite. `uses_row_inner` is the position right before the
+        // closing `}` of the existing row; `insert_at_body` is the body's
+        // opening `{` when no row exists yet.
+        let (uses_inner, insert_body) =
+            effect_row_fix_anchors(f.effect_row.as_ref(), body_span);
+        let body_ty = self.with_effect_row_at(
+            declared_eff.clone(),
+            uses_inner,
+            insert_body,
+            |c, used| c.check_block(&f.body, &declared_ret, &mut scope, &params, used),
+        );
         // Tail-implicit return: if the block produced a value, it must match
         // the declared return type. `check_block` already handles the tail
         // case; we only diagnose if the *whole* body type is wrong.
@@ -271,6 +291,50 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Compute `(uses_row_inner, insert_at_body)` for an effect-row fix.
+///
+/// `uses_row_inner` is `Some((span, has_effects))` when the function
+/// already has a `uses { ... }` row — the span points just before the
+/// closing `}`, and `has_effects` tells the fix whether to prepend `, `.
+/// `insert_at_body` is the body's opening-brace position, used when no
+/// row exists and one must be synthesized.
+fn effect_row_fix_anchors(
+    row: Option<&axon_ast::EffectRow>,
+    body_span: Span,
+) -> (Option<(Span, bool)>, Option<(usize, u16)>) {
+    match row {
+        Some(r) => {
+            // Anchor the insertion at the end of the last existing effect
+            // (e.g. right after `Console` in `uses { Console }`). That
+            // gives clean output — `Console, Fs.Read }` — instead of
+            // splicing in front of the closing brace and dragging the
+            // pre-existing space with us.
+            //
+            // For an empty row (`uses { }`), anchor at the first byte
+            // inside the braces; the fix synthesizes `X, Y` with no
+            // leading comma. We approximate that position as `span.start
+            // + "uses {".len()` since we have no token-level offset.
+            let has_effects = !r.effects.is_empty();
+            let inner_end = if has_effects {
+                r.effects.last().unwrap().span.end as usize
+            } else {
+                // Empty row: insert right after `uses {` (6 chars + a
+                // possible space). We point at end-1 to land inside the
+                // braces; the resulting `uses {X, Y}` is still legal.
+                (r.span.end as usize).saturating_sub(1)
+            };
+            let inner = Span::in_file(inner_end, inner_end, r.span.file);
+            (Some((inner, has_effects)), None)
+        }
+        None => {
+            // No row exists — synthesize one right before the body's
+            // opening `{`. We use `body_span.start` as the insertion
+            // anchor; the fix prepends the row text + a trailing space.
+            (None, Some((body_span.start as usize, body_span.file)))
+        }
+    }
+}
+
 // ===========================================================================
 // Effect-row helpers
 // ===========================================================================
@@ -283,22 +347,46 @@ impl<'a> Checker<'a> {
         allowed: EffectRow,
         f: impl FnOnce(&mut Self, &mut EffectRow) -> R,
     ) -> R {
+        self.with_effect_row_at(allowed, None, None, f)
+    }
+
+    /// Same as [`Self::with_effect_row`], but carries enough source-location
+    /// information for the resulting diagnostic to attach a mechanically-
+    /// applicable fix:
+    ///   - `uses_row_inner` is `(inner_span, has_effects)` for an existing
+    ///     `uses { ... }` row (between the braces). Pass `None` when the
+    ///     function has no `uses` clause at all.
+    ///   - `insert_at_body` is the byte offset right at the body's
+    ///     opening `{`, so the fix can synthesize a complete `uses { ... }`
+    ///     row when one doesn't exist.
+    fn with_effect_row_at<R>(
+        &mut self,
+        allowed: EffectRow,
+        uses_row_inner: Option<(Span, bool)>,
+        insert_at_body: Option<(usize, u16)>,
+        f: impl FnOnce(&mut Self, &mut EffectRow) -> R,
+    ) -> R {
         let mut used = EffectRow::pure();
         let out = f(self, &mut used);
         let missing = used.difference(&allowed);
         if !missing.is_empty() {
-            // Span: we attribute to a representative location — the body's
-            // first statement if available. Callers can refine.
-            // For now we anchor on the *function* span via a stored Span. We
-            // simply emit at Span::DUMMY if we lack a better one.
-            self.report(errors::effect_not_declared(
-                Span::DUMMY,
+            // Anchor the diagnostic at the `uses` row when present (the
+            // user's eye looks there), else at the function body's open
+            // brace (the next-best landmark).
+            let report_span = uses_row_inner
+                .map(|(s, _)| s)
+                .or_else(|| insert_at_body.map(|(at, file)| Span::in_file(at, at, file)))
+                .unwrap_or(Span::DUMMY);
+            self.report(errors::effect_not_declared_with_fix(
+                report_span,
                 &missing,
                 &Ty::Fn {
                     params: Vec::new(),
                     ret: Box::new(Ty::Unit),
                     effects: allowed,
                 },
+                uses_row_inner,
+                insert_at_body,
             ));
         }
         out
@@ -712,6 +800,25 @@ impl<'a> Checker<'a> {
 // ===========================================================================
 
 impl<'a> Checker<'a> {
+    /// Names in scope at the current point — locals from `scope` plus
+    /// every top-level item. Used by did-you-mean fixes.
+    fn candidate_names(&self, scope: &Scope) -> Vec<String> {
+        let mut out = scope.all_names();
+        out.extend(self.ctx.item_names());
+        // Add the built-in functions / types the user can reference
+        // directly. Kept short — we only need enough to make typos
+        // surface a useful suggestion.
+        for name in [
+            "print", "println", "print_int", "len", "str", "int", "bool",
+            "list_get", "list_len", "list_push", "str_contains", "str_substring",
+            "read_file", "write_file", "time_now", "http_fetch",
+            "mock_model", "default_model", "anthropic",
+        ] {
+            out.push(name.to_string());
+        }
+        out
+    }
+
     fn literal_ty(
         &mut self,
         lit: &Literal,
@@ -758,7 +865,10 @@ impl<'a> Checker<'a> {
             if let Some(ty) = builtins::builtin_type(name) {
                 return ty;
             }
-            self.report(errors::name_not_found(span, name));
+            let candidates = self.candidate_names(scope);
+            self.report(errors::name_not_found_with_candidates(
+                span, name, &candidates,
+            ));
             return Ty::Error;
         }
         // Dotted path: only resolve the head, then walk fields via the type
@@ -777,7 +887,10 @@ impl<'a> Checker<'a> {
                 ty
             }
             None => {
-                self.report(errors::name_not_found(span, head));
+                let candidates = self.candidate_names(scope);
+                self.report(errors::name_not_found_with_candidates(
+                    span, head, &candidates,
+                ));
                 Ty::Error
             }
         }
@@ -975,6 +1088,7 @@ impl<'a> Checker<'a> {
                         },
                         secondary: Vec::new(),
                         notes: Vec::new(),
+                        fixes: Vec::new(),
                     },
                 );
                 (*inner.clone(), EffectRow::pure(), vec![])
@@ -1133,7 +1247,12 @@ impl<'a> Checker<'a> {
         let id = match self.ctx.lookup(&name) {
             Some(id) => id,
             None => {
-                self.report(errors::name_not_found(call.span, &name));
+                let candidates = self.ctx.item_names();
+                self.report(errors::name_not_found_with_candidates(
+                    call.span,
+                    &name,
+                    &candidates,
+                ));
                 return Ty::Error;
             }
         };

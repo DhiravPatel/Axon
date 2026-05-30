@@ -1,0 +1,28 @@
+//! examples/stage32_typos.ax — companion to stage32_async_and_fix.ax.
+//!
+//! Three diagnostics with mechanically applicable fixes attached:
+//!   E0202 — did-you-mean typo on a local
+//!   E0203 — did-you-mean typo on a type
+//!   E0210 — `Fs.Read` used but not in the `uses` row
+//!
+//! Try:
+//!     axon check examples/stage32_typos.ax        # see the diagnostics
+//!     axon fix   examples/stage32_typos.ax        # see the unified diff
+//!     axon fix --apply examples/stage32_typos.ax  # rewrite in place
+//!     axon fix --only E0202 examples/stage32_typos.ax  # one code only
+
+schema Profile {
+    name: String,
+    age: Int,
+}
+
+fn lookup(p: Profle) -> String {  // E0203: meant `Profile`
+    p.name
+}
+
+fn main() uses { Console } {
+    let greeting = "hi"
+    print(greetng)                // E0202: meant `greeting`
+    let body = read_file("README") // E0210: needs `Fs.Read` in the row
+    print(body)
+}

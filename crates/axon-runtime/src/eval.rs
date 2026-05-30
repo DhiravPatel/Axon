@@ -206,6 +206,98 @@ impl Interpreter {
             .map(|r| (r.cursor(), r.total(), r.is_lenient()))
     }
 
+    // -----------------------------------------------------------------
+    // §32 host-driven model-I/O parallelism — narrow hooks the CLI uses
+    // to overlap N `complete` calls on a tokio thread pool while keeping
+    // recording/replay/budget bookkeeping inside the interpreter.
+    //
+    // Without these the host would either have to duplicate the logic in
+    // `call_provider` (and drift) or make `recording` / `replay` /
+    // `budget_stack` public (and break encapsulation).
+    // -----------------------------------------------------------------
+
+    /// True iff a recording session is active. Host parallel dispatchers
+    /// call `record_model_call` for each response *in input order* when
+    /// this is true, so replay is byte-identical to a serial run.
+    pub fn recording_active(&self) -> bool {
+        self.recording.borrow().is_some()
+    }
+
+    /// True iff a replay session is active. Host parallel dispatchers
+    /// must pop N events with `pop_replay_model_call` instead of touching
+    /// the providers.
+    pub fn replay_active(&self) -> bool {
+        self.replay.borrow().is_some()
+    }
+
+    /// Pop one `ModelCall` event from the active replay. Errors cleanly
+    /// when no replay is active, the recording is exhausted, or the next
+    /// event has a different kind.
+    pub fn pop_replay_model_call(
+        &self,
+        span: Span,
+    ) -> EvalResult<axon_models::ChatResponse> {
+        let mut r = self.replay.borrow_mut();
+        let replay = r.as_mut().ok_or_else(|| {
+            EvalSignal::error(
+                "internal: pop_replay_model_call without active replay",
+                span,
+            )
+        })?;
+        let ev = replay.next_event().map_err(|e| EvalSignal::error(e, span))?;
+        match ev {
+            crate::record::RecordedEvent::ModelCall { response, .. } => Ok(response),
+            _ => Err(EvalSignal::error(
+                "replay desynchronized: expected a model_call event",
+                span,
+            )),
+        }
+    }
+
+    /// Append a `ModelCall` event to the active recording. No-op when
+    /// no recording is active.
+    pub fn record_model_call(
+        &self,
+        provider_name: &str,
+        response: axon_models::ChatResponse,
+    ) {
+        if let Some(rec) = self.recording.borrow_mut().as_mut() {
+            rec.push(crate::record::RecordedEvent::ModelCall {
+                provider: provider_name.to_owned(),
+                response,
+            });
+        }
+    }
+
+    /// Refuse this call when a *previous* model call already put the
+    /// active budget over a ceiling. Mirrors the precheck inside
+    /// `call_provider` so host-driven batches can't bypass budgets.
+    pub fn precheck_budget(&self, span: Span) -> EvalResult<()> {
+        if let Some(breach) = self.budget_stack.borrow().precheck() {
+            return Err(EvalSignal::error(
+                format!("budget exceeded before model call: {breach}"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Debit every active budget for one host-driven model call.
+    pub fn debit_budget_for(&self, resp: &axon_models::ChatResponse) {
+        let tokens =
+            (resp.usage.input_tokens as u64) + (resp.usage.output_tokens as u64);
+        let _ = self
+            .budget_stack
+            .borrow()
+            .debit(resp.usage.cost_usd, tokens);
+    }
+
+    /// `true` if the named capability is in the currently-attenuated set.
+    /// Used by host bindings that drive model I/O outside `call_provider`.
+    pub fn caps_have(&self, name: &str) -> bool {
+        self.active_caps.has(name)
+    }
+
     /// Register top-level item bindings derived from a `Program`. Functions
     /// become closures; constants become their evaluated value; agents and
     /// stateful items become "not-yet-supported" Native shims that error at
@@ -1964,7 +2056,7 @@ impl Interpreter {
     /// the absolute upper bound on request rounds.
     fn run_tool_use_loop(
         &mut self,
-        provider: &Rc<dyn axon_models::ModelProvider>,
+        provider: &std::sync::Arc<dyn axon_models::ModelProvider>,
         mut req: axon_models::ChatRequest,
         tools: &[std::rc::Rc<crate::tool::ToolDef>],
         iteration_cap: usize,
@@ -2359,7 +2451,7 @@ impl Interpreter {
 
     fn call_provider(
         &mut self,
-        provider: &Rc<dyn axon_models::ModelProvider>,
+        provider: &std::sync::Arc<dyn axon_models::ModelProvider>,
         req: &axon_models::ChatRequest,
         span: Span,
     ) -> EvalResult<axon_models::ChatResponse> {
@@ -2431,7 +2523,7 @@ impl Interpreter {
         &self,
         v: &Value,
         span: Span,
-    ) -> EvalResult<Rc<dyn axon_models::ModelProvider>> {
+    ) -> EvalResult<std::sync::Arc<dyn axon_models::ModelProvider>> {
         match v {
             Value::Model(p) => Ok(p.clone()),
             other => Err(EvalSignal::error(

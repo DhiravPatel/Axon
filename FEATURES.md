@@ -1,6 +1,107 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**890 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**939 tests passing** across 30+ crates).
+
+---
+
+## Stage 32 — Async I/O Slice: `flow_parallel_asks` + Mechanically Applicable Fixes (`axon fix`)
+
+The first real piece of the async-runtime migration plus the diagnostic-rewrite machinery `axon fix --all` was waiting on. Both are bounded, production-shaped slices — not stage-wide claims.
+
+### §32.1 Async I/O slice — `flow_parallel_asks`
+
+The migration of the whole interpreter to `async fn` is genuinely a multi-week project (every host binding, every channel, every model call). This stage delivers the *bounded first slice*: the boundary where the latency actually lives — model I/O.
+
+- **Trait tightened to `Send + Sync`** — [crates/axon-models/src/lib.rs](crates/axon-models/src/lib.rs): `ModelProvider` now requires `Send + Sync`, so providers can cross thread boundaries. Both shipped impls (`AnthropicProvider`, `MockProvider`) were already thread-safe; the bound just makes it sound.
+- **`Value::Model` switched `Rc` → `Arc`** — [crates/axon-runtime/src/value.rs](crates/axon-runtime/src/value.rs): provider handles are now `Arc<dyn ModelProvider>` so a clone can move into a `tokio::spawn_blocking` closure. Touches every Value::Model site: `eval.rs`, `builtin.rs`, the runtime tests, the tools tests.
+- **New host binding `flow_parallel_asks(asks)`** — [crates/axon-cli/src/host.rs](crates/axon-cli/src/host.rs): takes a `List<{ target, user, system?, max_tokens? }>`, runs each ask on a `tokio::spawn_blocking` worker, joins in **input order** (not completion order), returns a `List<String>`. The acceptance test proves real overlap: 3 × 200 ms mock asks finish in < 400 ms wall time.
+- **Singleton tokio runtime** — held in a `OnceLock<tokio::runtime::Runtime>` with a 4-thread worker pool. `spawn_blocking` uses the default 512-thread blocking pool for the actual provider calls.
+- **Replay determinism preserved** — joins and records events in input order, so a recording captured during a parallel run replays byte-identical to a serial run. [crates/axon-cli/tests/stage32_replay.rs](crates/axon-cli/tests/stage32_replay.rs) forces completion order to be inverse-of-input and proves the recorded transcript is still input-ordered.
+- **Narrow public hooks on `Interpreter`** — [crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs): `recording_active`, `replay_active`, `pop_replay_model_call`, `record_model_call`, `precheck_budget`, `debit_budget_for`, `caps_have`. Lets the host scheduler reuse the same recording/replay/budget bookkeeping `ask` already uses, without making the interpreter's internals public.
+- **Testing-only `mock_model_slow(text, ms)`** host builtin — a `SleepingProvider` that sleeps then returns deterministic text. Lets the acceptance test be honest about overlapping waits.
+
+**Honest scope.** This is the *first slice*, not the whole migration:
+- `eval.rs` is still synchronous. Every host binding outside `flow_parallel_asks` still calls `provider.complete` on the calling thread.
+- The plumbing (Arc, Send+Sync, public hooks) is in place. Subsequent stages can move individual primitives (e.g. `parallel { ... }`, `select`, `for await`) onto the async substrate without further upheaval.
+
+### §32.2 Mechanically applicable fixes — `Diagnostic.fixes` + `axon fix`
+
+- **`Fix` + `FixEdit` on `Diagnostic`** — [crates/axon-diag/src/lib.rs](crates/axon-diag/src/lib.rs): every diagnostic can now carry one or more `Fix { description, edits: Vec<FixEdit> }`, where each edit is a span-keyed text replacement. Empty for diagnostics the compiler can't mechanically resolve. Existing `Diagnostic::error(...)` API is unchanged — the new `fixes` field is opt-in via `.with_fix(fix)`.
+- **`closest` + Levenshtein helper** — [crates/axon-tyck/src/errors.rs](crates/axon-tyck/src/errors.rs): used to power did-you-mean suggestions. Cap is `max(2, target.len()/3)`, same shape as `rustc`'s did-you-mean.
+- **Three high-frequency diagnostics ship with fixes today:**
+  - **E0202** (unknown name) — `name_not_found_with_candidates(span, name, candidates)`. Suggests the closest in-scope binding. Used at all three name-resolution failure sites (path heads, dotted heads, spawn target).
+  - **E0203** (unknown type) — `type_not_found_with_candidates`. Suggests the closest registered type/schema/agent. Wired at the lowering site in [crates/axon-tyck/src/lower.rs](crates/axon-tyck/src/lower.rs).
+  - **E0210** (effect not declared in `uses` row) — `effect_not_declared_with_fix(span, missing, declared, uses_row_inner, insert_at_body)`. Inserts the missing effect into an existing `uses { ... }` row, or synthesizes a complete clause when the function has none. Anchor positions computed by `effect_row_fix_anchors`.
+
+- **`axon fix [--apply] [--only CODE] <file>`** — [crates/axon-cli/src/main.rs](crates/axon-cli/src/main.rs):
+  - **Default = dry run.** Prints a unified diff against the source and a short summary like `fix [E0202]: replace 'greetng' with 'greeting'`. Useful in CI / code review.
+  - **`--apply`** rewrites the file in place. Idempotent: rerunning on a clean file is a no-op.
+  - **`--only CODE`** restricts to fixes attached to one diagnostic code. Lets `axon fix --apply --only E0202` rip through the easy did-you-means without touching effect rows.
+  - **Conflict handling.** Edits to overlapping spans defer the second fix; the user reruns to pick it up.
+  - **Two-pass apply.** Selects accepted hunks in source order, then splices all accepted edits in descending start-offset order in a single pass — so an early fix that *grows* the file doesn't invalidate the offsets of later fixes.
+  - **Hand-rolled unified diff** (no `similar` / `difflib` dep). LCS-based, ±2 lines of context.
+
+### Test coverage
+- [crates/axon-cli/tests/stage32_async.rs](crates/axon-cli/tests/stage32_async.rs) — 5 end-to-end tests. The acceptance test (3 × 200 ms < 400 ms wall time), input-order determinism (slow → fast still arrives slow-first), capability gating (`LLM` + `Net` required), pre-dispatch validation (malformed item rejects the whole batch), and the empty-batch no-op.
+- [crates/axon-cli/tests/stage32_replay.rs](crates/axon-cli/tests/stage32_replay.rs) — 2 tests. Record-then-replay round-trip is byte-identical even when completion order ≠ input order; recording captures one `ModelCall` event per ask.
+- [crates/axon-cli/tests/stage32_fix.rs](crates/axon-cli/tests/stage32_fix.rs) — 8 end-to-end tests through the `axon` binary. Dry-run + apply for E0202, E0210 (existing row), E0210 (synthesized row), E0203, `--only` filtering, idempotence, no-candidate-no-fix.
+- Workspace total: **939 passing**, up from 924.
+
+### What's NOT in this stage (deliberate)
+- **Full async migration of `eval.rs`.** That stays multi-week; this stage doesn't pretend otherwise. Read the §32.1 honest scope note above.
+- **GBNF wired into a real local-inference backend.** The grammar emitter shipped Stage 31; routing into llama.cpp's grammar API is the next backend-bridging stage.
+- **Realtime / voice flagship.** That waits on the real async runtime.
+- **`axon fix --all` recursive over a project tree.** Single-file today; recursion + ignore-rules is mechanical follow-up.
+- **More fix codes.** Three is enough to prove the machinery; adding fixes for E0204 (duplicate definition), E0205 (wrong arity), E0207 (no such method) follows the same `*_with_fix` constructor pattern in [crates/axon-tyck/src/errors.rs](crates/axon-tyck/src/errors.rs).
+
+---
+
+## Stage 31 — Depth over Breadth: Computer-Use, GBNF, Zero-Config, Error Recovery, Async Scaffolding
+
+A focused stage answering the "stop adding spec surface" feedback: ship one flagship new capability (computer-use), three foundational depth investments (zero-config, GBNF, whole-program error recovery), and the scaffolding for the eventual async runtime — without claiming the async runtime itself is rewritten.
+
+### §35 Computer-use primitives (flagship)
+- New crate [crates/axon-computer/](crates/axon-computer/) — `Computer` capability + typed click/type/screenshot/scroll/drag/key/wait tools + a deterministic `MockDriver` whose action log makes every test byte-stable.
+- `ComputerDriver` trait so real backends (Playwright, CDP, macOS AT-SPI, Win32) plug in as separate crates. The shipped driver returns an 8-byte PNG signature + a fill byte for screenshots; real pixels are a downstream crate's job.
+- **Tainted-flow ready** — screenshots return `tainted: true` so the host wraps the bytes in `Tainted<Image>` at the language boundary; pixel contents can't enter a `system:` prompt without an explicit sanitize step.
+- **Allowlist key validation** — single chars + a curated set (`enter`, `tab`, `esc`, …, `F1`..`F24`); unknown keys (and out-of-bounds clicks, oversized type strings, `wait > 60s`) error before they reach the backend.
+- 10 host bindings: `computer_screenshot`, `computer_click`, `computer_double_click`, `computer_mouse_move`, `computer_drag`, `computer_scroll`, `computer_type`, `computer_key`, `computer_wait`, `computer_action_log`.
+- `Computer` is added to the standard default capability set so `axon run` drives the mock driver without flags.
+
+### §56.3 Native constrained decoding (schema → GBNF)
+- New module [crates/axon-tyck/src/gbnf.rs](crates/axon-tyck/src/gbnf.rs) — walks any `schema` AST and emits a GBNF grammar a constrained-decoding backend (llama.cpp / mlx / vllm) can enforce token-by-token.
+- Covers the cross-backend JSON subset: `string`/`integer`/`number`/`boolean`/`null`; records as fixed-key objects; `List<T>` / `Set<T>` as JSON arrays; `T?` as `T | null`; `Tainted<T>` / refinements / effect-suffix wrappers pass through transparently.
+- Stable JSON-value prelude (`ws`, `string`, `integer`, `number`, `boolean`, `value`, `array`, `object`) is appended once so the grammar is portable.
+- Host binding `schema_to_gbnf(name)` consults a per-program schema mirror populated at load time by `register_schemas(&program)`.
+
+### Zero-config defaults
+- **`default_model()`** builtin — returns an Anthropic provider bound to `claude-opus-4-7` when `ANTHROPIC_API_KEY` is set, otherwise a mock model with a clear "no API key set; run `axon login anthropic` for a real model" response. A bare program can `ask default_model() { user: q }` and just run.
+- **Post-run footer** — `axon run` prints `─── axon run: 1.23s · N tokens · $0.0X` to stderr when stderr is a TTY (suppressed in CI/piped output and by `$AXON_NO_FOOTER`). Drives off the existing cost ledger so it's always accurate.
+- **`axon run` with no path defaults to `.`** — scaffolded projects' "next: axon run" instruction works without an argument.
+
+### Whole-program error recovery
+- **Cascade suppression** in [crates/axon-parser/src/parser.rs](crates/axon-parser/src/parser.rs) — `error()` now drops any diagnostic emitted while the parser is still at the same token position as the previous error, plus exact-message+exact-span duplicates. The classic "one bad token, ten cascade lines" pattern is now one error.
+- **Top-level item resync** — when an item parse fails or emits errors, `recover_to_next_item()` walks forward to the next item-start keyword (`fn`, `agent`, `tool`, `type`, `schema`, …) or contextual ident (`test`, `eval`, `policy`). Brace depth is deliberately *not* tracked — when the broken body had unbalanced braces, depth-tracking would walk to EOF.
+- Result on a hand-crafted multi-error file: 14 cascade errors → 8 distinct errors. The parser keeps going and parses the subsequent items.
+
+### Async runtime scaffolding (foundation only — NOT the rewrite)
+- New crate [crates/axon-async/](crates/axon-async/) — tokio multi-thread runtime wrapper + typed `Task<T>` join/cancel handle + `AsyncMailbox<T>` with `Block` / `DropOldest` / `DropNew` backpressure policies matching the spec's `Stream<T>`.
+- `AsyncRuntime::with_wall_budget(ms, fut)` for `with budget(wall = 30s)` enforcement; `join_all(futs)` for structured-concurrency `parallel { … }`.
+- 8 unit tests — including `concurrent_tasks_actually_overlap` which proves 4×50ms tasks complete in <180ms (vs ~200ms serial). That's the proof point for the eventual rewrite.
+- **What this is NOT**: it doesn't migrate `eval.rs` to async. That's a multi-week rewrite — every host binding, every channel, every model call. The scaffolding is here so when the migration happens, the contract is settled.
+
+### Test coverage
+- `crates/axon-computer` — 10 unit tests (screenshot tainting, in-bounds click, oob rejection, type validation, key allowlist, drag endpoints, wait cap, scripted-frames, ordered action log, JSON round-trip).
+- `crates/axon-async` — 8 unit tests (spawn/join, join_all order, wall-budget timeout, mailbox block/drop_new/drop_oldest, task cancel idempotence, **concurrent_tasks_actually_overlap**).
+- `crates/axon-tyck::gbnf` — 7 unit tests (empty schema, primitives, list, option, tainted pass-through, prelude presence, unknown-type fallback).
+- `crates/axon-cli/tests/stage31_depth.rs` — 9 end-to-end tests through the `axon` binary.
+- Workspace total: **924 passed, 0 failed** (up from 890).
+
+### Honest scope: what's NOT in this stage
+- **Real async runtime** — eval.rs is still synchronous. The scaffolding lets the migration land cleanly when it does. That migration is genuinely a multi-week project.
+- **Real browser/desktop drivers** — only the deterministic mock backend ships in-tree. A Playwright/CDP driver is a separate crate.
+- **Real local-inference integration** for the GBNF grammar — the emitter is done; routing the grammar into llama.cpp / mlx / vllm / etc. is per-backend wire work.
+- **`axon fix --all`** — the catalogue is in place (Stage 30 §57) but applying structured fix-edits needs each diagnostic to carry rewrite candidates first.
 
 ---
 
