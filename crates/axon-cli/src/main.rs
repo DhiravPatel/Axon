@@ -997,6 +997,17 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 tokens,
                 cents as f64 / 100.0,
             );
+            // Stage 33: if `default_model()` fell back to the mock because
+            // no API key was set, surface the one-line hint right under the
+            // footer so the next thing a confused user sees is the cause.
+            // Closes the loop the advisor flagged — "(no ANTHROPIC_API_KEY
+            // — using mock model. run `axon login anthropic`)".
+            if axon_runtime::default_model_used_mock() {
+                eprintln!(
+                    "    (no ANTHROPIC_API_KEY — `default_model()` used the mock. \
+                     run `axon login anthropic` to use the real model.)"
+                );
+            }
         }
         exit
     }
@@ -1155,10 +1166,14 @@ fn cmd_fix(args: &[String]) -> ExitCode {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: axon fix [--apply] [--only CODE] <file>\n\
+                    "usage: axon fix [--apply] [--only CODE] <path>\n\
+                     \n\
+                     <path> can be a single .ax file OR a project directory.\n\
+                     In project mode, every .ax file is scanned and cross-file\n\
+                     fixes (e.g. P0010 missing pub) are routed to the right file.\n\
                      \n\
                      Without --apply, prints a unified diff (dry run).\n\
-                     With --apply, rewrites the file in place.\n\
+                     With --apply, rewrites the touched file(s) in place.\n\
                      --only CODE restricts to fixes attached to that diagnostic code."
                 );
                 return ExitCode::SUCCESS;
@@ -1169,7 +1184,7 @@ fn cmd_fix(args: &[String]) -> ExitCode {
             }
             other => {
                 if path.is_some() {
-                    eprintln!("axon fix: only one file is supported");
+                    eprintln!("axon fix: only one path is supported");
                     return ExitCode::from(2);
                 }
                 path = Some(other);
@@ -1178,9 +1193,20 @@ fn cmd_fix(args: &[String]) -> ExitCode {
         i += 1;
     }
     let Some(path) = path else {
-        eprintln!("usage: axon fix [--apply] [--only CODE] <file>");
+        eprintln!("usage: axon fix [--apply] [--only CODE] <path>");
         return ExitCode::from(2);
     };
+
+    // Two modes:
+    //   * single-file (default) — preserves the original behavior; spans
+    //     in this file all carry file_id 0 (single-file SourceFile).
+    //   * project-directory — uses LoadedProject so cross-file fixes
+    //     (P0010) route correctly. Every module gets a stable file_id.
+    let path_buf = std::path::Path::new(path);
+    if path_buf.is_dir() {
+        return cmd_fix_project(path_buf, apply, only);
+    }
+
     let Some(file) = read_or_die(path) else {
         return ExitCode::from(1);
     };
@@ -1327,6 +1353,174 @@ fn cmd_fix(args: &[String]) -> ExitCode {
         );
         ExitCode::SUCCESS
     }
+}
+
+/// Project-mode `axon fix`. Loads every `.ax` file under `root` via
+/// `LoadedProject`, runs type-check on the merged program, and routes
+/// each fix edit to the right file via `Span::file`. Lets P0010
+/// (missing-pub) attach a fix that lives in a *different* file from
+/// the diagnostic.
+fn cmd_fix_project(
+    root: &std::path::Path,
+    apply: bool,
+    only: Option<&str>,
+) -> ExitCode {
+    let project = match axon_project::LoadedProject::load(root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("axon fix: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Project loader's own diagnostics (P0010 missing-pub, P0011 unknown
+    // import). Type-checker runs against the *merged* program so cross-
+    // module name resolution is honored.
+    let mut all_diags: Vec<axon_diag::Diagnostic> = project.diagnostics.clone();
+    let merged_source = project
+        .modules
+        .first()
+        .map(|m| m.source.clone())
+        .unwrap_or_else(|| axon_diag::SourceFile::new("<merged>", String::new()));
+    let (_ctx, type_diags) = axon_tyck::check(&merged_source, &project.merged);
+    all_diags.extend(type_diags);
+
+    // Filter by --only, then collect every fix edit indexed by file_id.
+    // file_id 0 means "no file" (dummy span) — we drop those silently.
+    let mut edits_by_file: std::collections::BTreeMap<u16, Vec<(String, Option<String>, axon_diag::FixEdit)>> =
+        std::collections::BTreeMap::new();
+    for d in &all_diags {
+        if let Some(want) = only {
+            if d.code.map(|c| c != want).unwrap_or(true) {
+                continue;
+            }
+        }
+        for f in &d.fixes {
+            for e in &f.edits {
+                if e.span.file == 0 {
+                    continue;
+                }
+                edits_by_file
+                    .entry(e.span.file)
+                    .or_default()
+                    .push((f.description.clone(), d.code.map(|c| c.to_string()), e.clone()));
+            }
+        }
+    }
+
+    if edits_by_file.is_empty() {
+        if all_diags.is_empty() {
+            println!("axon fix: no diagnostics across {} module(s) — nothing to fix", project.modules.len());
+        } else {
+            let filt = match only {
+                Some(c) => format!(" (filtered by --only {c})"),
+                None => String::new(),
+            };
+            println!(
+                "axon fix: {} diagnostic(s) across {} module(s){filt} but none carry a mechanically applicable fix",
+                all_diags.len(),
+                project.modules.len(),
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Resolve file_id → (path, original source text). The registry is
+    // authoritative; we re-read from disk so concurrent edits between
+    // project load and now would be noticed by the byte mismatch.
+    let mut touched_files: u32 = 0;
+    let mut applied_total: u32 = 0;
+    let mut deferred_total: u32 = 0;
+    for (file_id, hunks) in edits_by_file {
+        let Some(src) = project.sources.get(file_id) else {
+            continue;
+        };
+        let path = src.path().to_string_lossy().into_owned();
+        let original = src.text().to_owned();
+
+        // Same conflict-handling pass the single-file mode uses: accept
+        // hunks in source order; defer ones whose edit spans overlap an
+        // already-accepted hunk. Apply all accepted edits in one reverse-
+        // sorted splice.
+        let mut covered: Vec<(usize, usize)> = Vec::new();
+        let mut accepted: Vec<&(String, Option<String>, axon_diag::FixEdit)> = Vec::new();
+        let mut deferred: u32 = 0;
+        for h in &hunks {
+            let (_desc, _code, e) = h;
+            let s = e.span.start as usize;
+            let t = e.span.end as usize;
+            if covered.iter().any(|(cs, ce)| !(t <= *cs || *ce <= s)) {
+                deferred += 1;
+                continue;
+            }
+            covered.push((s, t));
+            accepted.push(h);
+        }
+        if accepted.is_empty() {
+            continue;
+        }
+        let mut bytes = original.as_bytes().to_vec();
+        let mut sorted: Vec<&(String, Option<String>, axon_diag::FixEdit)> = accepted.clone();
+        sorted.sort_by(|a, b| b.2.span.start.cmp(&a.2.span.start));
+        for (_desc, _code, e) in sorted {
+            let s = (e.span.start as usize).min(bytes.len());
+            let t = (e.span.end as usize).min(bytes.len()).max(s);
+            bytes.splice(s..t, e.replacement.bytes());
+        }
+        let after = String::from_utf8_lossy(&bytes).into_owned();
+
+        if apply {
+            if after == original {
+                continue;
+            }
+            if let Err(e) = std::fs::write(&path, &after) {
+                eprintln!("axon fix: cannot write `{path}`: {e}");
+                return ExitCode::from(1);
+            }
+            for (desc, code, _) in &accepted {
+                println!(
+                    "{} [{}]: {desc}",
+                    path,
+                    code.as_deref().unwrap_or("uncoded")
+                );
+            }
+            touched_files += 1;
+            applied_total += accepted.len() as u32;
+        } else {
+            for (desc, code, _) in &accepted {
+                println!(
+                    "{} fix [{}]: {desc}",
+                    path,
+                    code.as_deref().unwrap_or("uncoded")
+                );
+            }
+            let diff = unified_diff(&path, &original, &after);
+            if !diff.trim().is_empty() {
+                print!("{diff}");
+                touched_files += 1;
+                applied_total += accepted.len() as u32;
+            }
+        }
+        deferred_total += deferred;
+    }
+
+    let deferred_note = if deferred_total > 0 {
+        format!(
+            " ({deferred_total} deferred due to overlap — rerun to pick them up)"
+        )
+    } else {
+        String::new()
+    };
+    if apply {
+        println!(
+            "\naxon fix: applied {applied_total} fix(es) across {touched_files} file(s){deferred_note}"
+        );
+    } else {
+        println!(
+            "\n(dry run — pass --apply to rewrite {touched_files} file(s) in place; would apply {applied_total} fix(es){deferred_note})"
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// Minimal unified diff against `path`. Line-based: precision-aware

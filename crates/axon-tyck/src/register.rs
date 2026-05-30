@@ -270,30 +270,36 @@ impl<'a> Checker<'a> {
     }
 
     fn register_placeholder(&mut self, item: &Item) {
-        let (name, span) = match item {
+        // (item_span, identifier_span) — the identifier span lets the
+        // duplicate-definition fix replace just the name, not the
+        // whole item.
+        let (name, span, name_span) = match item {
             Item::Use(_) => return,
-            Item::Fn(f) => (f.name.name.clone(), f.span),
-            Item::Type(t) => (t.name.name.clone(), t.span),
-            Item::Schema(s) => (s.name.name.clone(), s.span),
-            Item::Agent(a) => (a.name.name.clone(), a.span),
-            Item::Actor(a) => (a.name.name.clone(), a.span),
-            Item::Supervisor(s) => (s.name.name.clone(), s.span),
-            Item::Graph(g) => (g.name.name.clone(), g.span),
-            Item::Network(n) => (n.name.name.clone(), n.span),
-            Item::Orchestrate(o) => (o.name.name.clone(), o.span),
-            Item::Policy(p) => (p.name.name.clone(), p.span),
-            Item::MemPolicy(p) => (p.name.name.clone(), p.span),
-            Item::Model(m) => (m.name.name.clone(), m.span),
-            Item::Tool(t) => (t.name.name.clone(), t.span),
-            Item::Memory(m) => (m.name.name.clone(), m.span),
-            Item::Prompt(p) => (p.name.name.clone(), p.span),
-            Item::Trait(t) => (t.name.name.clone(), t.span),
+            Item::Fn(f) => (f.name.name.clone(), f.span, f.name.span),
+            Item::Type(t) => (t.name.name.clone(), t.span, t.name.span),
+            Item::Schema(s) => (s.name.name.clone(), s.span, s.name.span),
+            Item::Agent(a) => (a.name.name.clone(), a.span, a.name.span),
+            Item::Actor(a) => (a.name.name.clone(), a.span, a.name.span),
+            Item::Supervisor(s) => (s.name.name.clone(), s.span, s.name.span),
+            Item::Graph(g) => (g.name.name.clone(), g.span, g.name.span),
+            Item::Network(n) => (n.name.name.clone(), n.span, n.name.span),
+            Item::Orchestrate(o) => (o.name.name.clone(), o.span, o.name.span),
+            Item::Policy(p) => (p.name.name.clone(), p.span, p.name.span),
+            Item::MemPolicy(p) => (p.name.name.clone(), p.span, p.name.span),
+            Item::Model(m) => (m.name.name.clone(), m.span, m.name.span),
+            Item::Tool(t) => (t.name.name.clone(), t.span, t.name.span),
+            Item::Memory(m) => (m.name.name.clone(), m.span, m.name.span),
+            Item::Prompt(p) => (p.name.name.clone(), p.span, p.name.span),
+            Item::Trait(t) => (t.name.name.clone(), t.span, t.name.span),
             Item::Impl(_) => return,
-            Item::Const(c) => (c.name.name.clone(), c.span),
-            Item::Effect(e) => (e.name.name.clone(), e.span),
-            Item::Test(t) => (t.name.clone(), t.span),
-            Item::Eval(e) => (e.name.clone(), e.span),
-            Item::Config(c) => (c.name.name.clone(), c.span),
+            Item::Const(c) => (c.name.name.clone(), c.span, c.name.span),
+            Item::Effect(e) => (e.name.name.clone(), e.span, e.name.span),
+            // Test/Eval names are bare strings rather than `Ident`s, so
+            // we don't have a sub-span; the fix anchor falls back to the
+            // whole item span (the rewrite would be conservative).
+            Item::Test(t) => (t.name.clone(), t.span, t.span),
+            Item::Eval(e) => (e.name.clone(), e.span, e.span),
+            Item::Config(c) => (c.name.name.clone(), c.span, c.name.span),
         };
         let (_id, dup) = self.ctx.register(ItemSig {
             name: name.clone(),
@@ -303,7 +309,10 @@ impl<'a> Checker<'a> {
         });
         if let Some(prev_id) = dup {
             let prev_span = self.ctx.get(prev_id).map(|s| s.span).unwrap_or(Span::DUMMY);
-            self.report(errors::duplicate_definition(span, &name, prev_span));
+            let existing = self.ctx.item_names();
+            self.report(errors::duplicate_definition_with_fix(
+                span, &name, prev_span, name_span, &existing,
+            ));
         }
     }
 

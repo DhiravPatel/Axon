@@ -75,6 +75,43 @@ pub fn duplicate_definition(span: Span, name: &str, prev: Span) -> Diagnostic {
     d
 }
 
+/// E0204 with a rename-suggestion fix attached.
+///
+/// `name_span` points at the *second* item's name identifier (not its
+/// whole item span); replacing that span renames the duplicate without
+/// disturbing the rest of the file. `existing_names` is every name
+/// already registered in the context — we use it to pick the first
+/// `{name}_N` (N = 2..) that doesn't collide.
+pub fn duplicate_definition_with_fix(
+    span: Span,
+    name: &str,
+    prev: Span,
+    name_span: Span,
+    existing_names: &[String],
+) -> Diagnostic {
+    let mut d = duplicate_definition(span, name, prev);
+    let suggested = pick_unique_rename(name, existing_names);
+    d = d.with_fix(
+        Fix::new(format!("rename the second `{name}` to `{suggested}`")).with_edit(FixEdit {
+            span: name_span,
+            replacement: suggested,
+        }),
+    );
+    d
+}
+
+fn pick_unique_rename(base: &str, taken: &[String]) -> String {
+    for n in 2..1024 {
+        let cand = format!("{base}_{n}");
+        if !taken.iter().any(|t| t == &cand) {
+            return cand;
+        }
+    }
+    // Pathological; just append a fixed counter so the rewrite still
+    // produces a syntactically valid identifier the user can edit.
+    format!("{base}_renamed")
+}
+
 pub fn wrong_arity(span: Span, name: &str, expected: usize, found: usize) -> Diagnostic {
     Diagnostic::error(
         format!(
@@ -83,6 +120,78 @@ pub fn wrong_arity(span: Span, name: &str, expected: usize, found: usize) -> Dia
         span,
     )
     .with_code("E0205")
+}
+
+/// E0205 with a concrete rewrite attached.
+///
+/// `call_span` is the whole call expression (`f(a, b, c)`) — its `.end`
+/// is the byte right *after* the closing `)`, so `.end - 1` lands on
+/// `)`. `arg_spans` is one entry per *actual* argument. The fix:
+///   - too few args → insert `, nil, nil, ...` right before the `)`.
+///   - too many args → delete from the end of the last-kept arg to
+///     the end of the last actual arg (sweeping commas + trailing args).
+///
+/// Pass `None` for `arg_spans` (or an empty slice) to skip the fix —
+/// the diagnostic still renders without a fix payload.
+pub fn wrong_arity_with_fix(
+    call_span: Span,
+    name: &str,
+    expected: usize,
+    found: usize,
+    arg_spans: &[Span],
+) -> Diagnostic {
+    let mut d = wrong_arity(call_span, name, expected, found);
+    if call_span.end == 0 || call_span.file == 0 && call_span.start == 0 {
+        return d; // no real span — can't fix
+    }
+    if found < expected {
+        // Pad with `nil` placeholders. Insertion point: right before `)`.
+        let to_add = expected - found;
+        let placeholders: Vec<String> = (0..to_add).map(|_| "nil".to_string()).collect();
+        let prefix = if found == 0 { "" } else { ", " };
+        let insertion = format!("{prefix}{}", placeholders.join(", "));
+        let at = (call_span.end as usize).saturating_sub(1);
+        d = d.with_fix(
+            Fix::new(format!(
+                "pad with {to_add} `nil` placeholder(s) — replace each with a real value"
+            ))
+            .with_edit(FixEdit {
+                span: Span::in_file(at, at, call_span.file),
+                replacement: insertion,
+            }),
+        );
+    } else if found > expected && expected > 0 && arg_spans.len() == found {
+        // Drop the trailing args. Replace span goes from the end of the
+        // last KEPT arg to the end of the last actual arg — sweeps the
+        // `, arg, arg` tail (including commas) cleanly.
+        let from = arg_spans[expected - 1].end as usize;
+        let to = arg_spans.last().unwrap().end as usize;
+        if to > from {
+            d = d.with_fix(
+                Fix::new(format!(
+                    "drop the {} trailing argument(s)",
+                    found - expected
+                ))
+                .with_edit(FixEdit {
+                    span: Span::in_file(from, to, call_span.file),
+                    replacement: String::new(),
+                }),
+            );
+        }
+    } else if found > expected && expected == 0 && !arg_spans.is_empty() {
+        // The call is `f(a, b, c)` and we want `f()`. Delete from the
+        // first arg's start to the last arg's end.
+        let from = arg_spans[0].start as usize;
+        let to = arg_spans.last().unwrap().end as usize;
+        d = d.with_fix(
+            Fix::new(format!("drop all {found} argument(s) — call expects 0"))
+                .with_edit(FixEdit {
+                    span: Span::in_file(from, to, call_span.file),
+                    replacement: String::new(),
+                }),
+        );
+    }
+    d
 }
 
 pub fn no_such_field(span: Span, field: &str, on_ty: &Ty) -> Diagnostic {
@@ -99,6 +208,31 @@ pub fn no_such_method(span: Span, method: &str, on_ty: &Ty) -> Diagnostic {
         span,
     )
     .with_code("E0207")
+}
+
+/// E0207 with a did-you-mean fix. `candidates` is the list of known
+/// methods on `on_ty` — derived in the type checker via the same
+/// dispatch table that resolves `recv.method(...)`. Returns the base
+/// diagnostic unchanged when no candidate is close enough.
+pub fn no_such_method_with_candidates(
+    span: Span,
+    method: &str,
+    on_ty: &Ty,
+    candidates: &[String],
+) -> Diagnostic {
+    let mut d = no_such_method(span, method, on_ty);
+    if let Some(best) = closest(method, candidates) {
+        d = d
+            .with_note(format!("did you mean `.{best}()`?"))
+            .with_fix(
+                Fix::new(format!("replace `.{method}(...)` with `.{best}(...)`"))
+                    .with_edit(FixEdit {
+                        span,
+                        replacement: best,
+                    }),
+            );
+    }
+    d
 }
 
 pub fn cannot_call_non_function(span: Span, ty: &Ty) -> Diagnostic {
@@ -199,9 +333,13 @@ pub fn effect_not_declared_with_fix(
 // ---------------------------------------------------------------------------
 
 /// Find the closest candidate to `target`, or `None` when nothing is close
-/// enough to be useful. "Close enough" caps at edit distance 2 for short
-/// names and ~⅓ the length of the input for longer ones — same shape as
-/// `rustc`'s did-you-mean.
+/// enough to be useful. Two acceptance gates:
+///   * Levenshtein within `max(2, target.len() / 3).min(4)` — same shape
+///     as `rustc`'s did-you-mean for typos a single char off.
+///   * Prefix containment in either direction — catches the common
+///     "I wrote the long form, the real name is the short form" case
+///     (e.g. `.length()` ↔ `.len()`, `recall_all` ↔ `recall`) which
+///     edit-distance alone misses.
 pub(crate) fn closest(target: &str, candidates: &[String]) -> Option<String> {
     if candidates.is_empty() {
         return None;
@@ -212,13 +350,24 @@ pub(crate) fn closest(target: &str, candidates: &[String]) -> Option<String> {
         if c == target {
             continue;
         }
-        let d = edit_distance(target, c);
-        if d > cap {
+        let mut score = edit_distance(target, c);
+        // Prefix containment: pretend the distance is the size diff so a
+        // candidate that's a strict prefix (or extension) of the target
+        // beats unrelated candidates at the same distance. Only honored
+        // when both names share at least 3 chars — otherwise short
+        // identifiers like `a` would match every name starting with `a`.
+        let prefix_hit = target.len() >= 3
+            && c.len() >= 3
+            && (target.starts_with(c.as_str()) || c.starts_with(target));
+        if prefix_hit {
+            let diff = target.len().abs_diff(c.len());
+            score = score.min(diff);
+        } else if score > cap {
             continue;
         }
         match best {
-            Some((bd, _)) if d >= bd => {}
-            _ => best = Some((d, c.as_str())),
+            Some((bd, _)) if score >= bd => {}
+            _ => best = Some((score, c.as_str())),
         }
     }
     best.map(|(_, s)| s.to_owned())

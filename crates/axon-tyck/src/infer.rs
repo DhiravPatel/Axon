@@ -291,6 +291,29 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Method names available on `recv_ty`. Used by `no_such_method`'s
+/// did-you-mean fix when the user typos a method on a built-in type.
+/// Mirrors the dispatch table in `method_call_ty` — kept hand-curated
+/// rather than derived from the match arms so future entries don't
+/// silently change the suggestion surface.
+fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
+    use Ty::*;
+    let names: &[&str] = match recv_ty {
+        String => &[
+            "tainted", "len", "to_upper", "to_lower", "trim",
+            "contains", "starts_with", "ends_with", "split",
+        ],
+        List(_) => &["len", "push", "pop", "first", "last", "reverse", "map", "filter"],
+        Map(_, _) => &["set", "get", "contains"],
+        Set(_) => &["add", "contains"],
+        Chan(_) => &["send", "recv", "len", "is_empty"],
+        Tainted(_) => &["untaint"],
+        Memory => &["recall", "store"],
+        _ => &[],
+    };
+    names.iter().map(|s| s.to_string()).collect()
+}
+
 /// Compute `(uses_row_inner, insert_at_body)` for an effect-row fix.
 ///
 /// `uses_row_inner` is `Some((span, has_effects))` when the function
@@ -1008,11 +1031,15 @@ impl<'a> Checker<'a> {
         }
         let arity = param_tys.len();
         if arg_exprs.len() != arity {
-            if let Some(name) = &name_hint {
-                self.report(errors::wrong_arity(span, name, arity, arg_exprs.len()));
-            } else {
-                self.report(errors::wrong_arity(span, "<callable>", arity, arg_exprs.len()));
-            }
+            let arg_spans: Vec<Span> = arg_exprs.iter().map(|e| e.span).collect();
+            let label = name_hint.clone().unwrap_or_else(|| "<callable>".to_string());
+            self.report(errors::wrong_arity_with_fix(
+                span,
+                &label,
+                arity,
+                arg_exprs.len(),
+                &arg_spans,
+            ));
         }
         for (e, expected) in arg_exprs.iter().zip(param_tys.iter()) {
             self.check(e, expected, scope, params, used);
@@ -1111,7 +1138,11 @@ impl<'a> Checker<'a> {
                         let arg_tys = h.params.iter().map(|p| p.ty.clone()).collect();
                         (h.ret.clone(), h.effects.clone(), arg_tys)
                     } else {
-                        self.report(errors::no_such_method(span, name, &recv_ty));
+                        let cands: Vec<String> =
+                            handlers.iter().map(|h| h.name.clone()).collect();
+                        self.report(errors::no_such_method_with_candidates(
+                            method.span, name, &recv_ty, &cands,
+                        ));
                         return Ty::Error;
                     }
                 } else {
@@ -1127,7 +1158,10 @@ impl<'a> Checker<'a> {
                 (Ty::Dyn, EffectRow::pure(), vec![Ty::Dyn; arity])
             }
             (other, name) => {
-                self.report(errors::no_such_method(span, name, other));
+                let cands = builtin_methods_for(other);
+                self.report(errors::no_such_method_with_candidates(
+                    method.span, name, other, &cands,
+                ));
                 return Ty::Error;
             }
         };
@@ -1140,11 +1174,13 @@ impl<'a> Checker<'a> {
             }
         }
         if arg_exprs.len() != expected_args.len() {
-            self.report(errors::wrong_arity(
+            let arg_spans: Vec<Span> = arg_exprs.iter().map(|e| e.span).collect();
+            self.report(errors::wrong_arity_with_fix(
                 span,
                 &method.name,
                 expected_args.len(),
                 arg_exprs.len(),
+                &arg_spans,
             ));
         }
         for (e, expected) in arg_exprs.iter().zip(expected_args.iter()) {
