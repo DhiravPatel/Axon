@@ -79,8 +79,12 @@ fn dry_run_proposes_replacement_for_local_typo() {
     let out = run_fix(&path, &[]);
     assert!(out.status.success(), "{:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Stage 33 emitted `fix [E0202]`; Stage 34 appends a confidence
+    // tier so the modern label is `fix [E0202, safe]`. Either form
+    // satisfies the contract (the diagnostic code is the load-bearing
+    // part).
     assert!(
-        stdout.contains("fix [E0202]"),
+        stdout.contains("fix [E0202"),
         "stdout missing E0202 label: {stdout}"
     );
     assert!(

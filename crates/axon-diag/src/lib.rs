@@ -256,6 +256,31 @@ pub struct Diagnostic {
     pub fixes: Vec<Fix>,
 }
 
+/// Confidence tier for a [`Fix`] (§34.1).
+///
+/// `Safe` fixes are purely additive or deterministic-from-known-set
+/// rewrites that never delete user code or insert a placeholder the
+/// user must replace — e.g. `pub` insertion, did-you-mean rename to an
+/// in-scope binding, append to an existing `uses { ... }` row.
+///
+/// `Suggested` fixes need human review before they're applied. They may
+/// delete user-written code (drop trailing args) or insert placeholders
+/// (`nil` padding) that don't type-check on their own. The default for
+/// any newly-constructed [`Fix`] is `Suggested` so existing call sites
+/// stay safe; opt into `Safe` explicitly with `.safe()`.
+///
+/// Consumers: `axon fix --watch` only auto-applies `Safe` fixes; the
+/// LSP code-action handler sets `is_preferred = true` on `Safe` fixes;
+/// `axon fix --interactive` shows `[safe]` / `[suggested]` next to the
+/// description in the prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Confidence {
+    Safe,
+    /// Default — conservative; never silently auto-applied.
+    #[default]
+    Suggested,
+}
+
 /// One mechanically applicable rewrite suggested by a diagnostic.
 #[derive(Clone, Debug)]
 pub struct Fix {
@@ -264,6 +289,11 @@ pub struct Fix {
     pub description: String,
     /// Concrete edits — all applied atomically when the user accepts.
     pub edits: Vec<FixEdit>,
+    /// Whether this fix is safe to auto-apply. See [`Confidence`]. The
+    /// default is `Suggested`; constructors must call `.safe()` to opt
+    /// in — the tier is opt-in by design so a forgotten tag never
+    /// triggers a silent rewrite.
+    pub confidence: Confidence,
 }
 
 /// One span-keyed text replacement. `replacement.is_empty()` is a delete;
@@ -319,6 +349,7 @@ impl Fix {
         Self {
             description: description.into(),
             edits: Vec::new(),
+            confidence: Confidence::default(),
         }
     }
 
@@ -327,6 +358,7 @@ impl Fix {
         Self {
             description: format!("replace with `{replacement}`"),
             edits: vec![FixEdit { span, replacement }],
+            confidence: Confidence::default(),
         }
     }
 
@@ -338,6 +370,7 @@ impl Fix {
                 span: Span::in_file(at, at, file),
                 replacement: text,
             }],
+            confidence: Confidence::default(),
         }
     }
 
@@ -348,6 +381,21 @@ impl Fix {
 
     pub fn with_edit(mut self, edit: FixEdit) -> Self {
         self.edits.push(edit);
+        self
+    }
+
+    /// Mark this fix as `Confidence::Safe`. Use only for purely
+    /// additive or deterministic-from-known-set rewrites — see
+    /// [`Confidence`] for the precise rule.
+    pub fn safe(mut self) -> Self {
+        self.confidence = Confidence::Safe;
+        self
+    }
+
+    /// Mark this fix as `Confidence::Suggested` (the default). Exists
+    /// so call sites can document intent explicitly where it matters.
+    pub fn suggested(mut self) -> Self {
+        self.confidence = Confidence::Suggested;
         self
     }
 }
@@ -473,5 +521,32 @@ mod tests {
         assert!(out.contains("let x = 1"));
         assert!(out.contains("^ here"));
         assert!(out.contains("= note: for testing"));
+    }
+
+    // ---- §34.1 Confidence tiers --------------------------------------
+
+    #[test]
+    fn confidence_default_is_suggested() {
+        // Locks the backwards-compat invariant. Every Fix constructor
+        // must default to Suggested so existing code never starts
+        // silently auto-applying under --watch.
+        assert_eq!(Confidence::default(), Confidence::Suggested);
+        let a = Fix::new("x");
+        let b = Fix::replace(Span::new(0, 1), "y");
+        let c = Fix::insert(0, 0, "z");
+        assert_eq!(a.confidence, Confidence::Suggested);
+        assert_eq!(b.confidence, Confidence::Suggested);
+        assert_eq!(c.confidence, Confidence::Suggested);
+    }
+
+    #[test]
+    fn safe_builder_flips_confidence_and_is_order_correct() {
+        let a = Fix::new("x").safe();
+        assert_eq!(a.confidence, Confidence::Safe);
+        // Chaining: last call wins (no silent stickiness).
+        let b = Fix::new("x").safe().suggested();
+        assert_eq!(b.confidence, Confidence::Suggested);
+        let c = Fix::new("x").suggested().safe();
+        assert_eq!(c.confidence, Confidence::Safe);
     }
 }

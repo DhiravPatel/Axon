@@ -42,5 +42,12 @@ axon-computer = { workspace = true }
 axon-models = { workspace = true }
 axon-async = { workspace = true }
 tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# §34.5 — `axon fix --watch` uses notify for cross-platform file events,
+# ctrlc for cooperative shutdown of the watch loop.
+notify     = "6"
+ctrlc      = "3"
 serde_json = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+libc = "0.2"

@@ -21,12 +21,16 @@
 //! together at the top.
 
 pub mod analyze;
+pub mod code_actions;
 pub mod cost_lens;
+pub mod effect_lens;
 pub mod position;
 pub mod query;
 pub mod server;
 
 pub use analyze::{analyze, Analysis};
+pub use code_actions::code_actions_for;
 pub use cost_lens::{lenses_for, CallKind, CostLens};
+pub use effect_lens::{lenses_for as effect_lenses_for, EffectLens, EffectLensStatus};
 pub use position::{offset_to_position, position_to_offset, span_to_range};
 pub use server::run;

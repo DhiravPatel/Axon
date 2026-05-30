@@ -1,6 +1,106 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**955 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1007 tests passing** across 30+ crates).
+
+---
+
+## Stage 34 — Errors Heal Themselves In Your Editor: LSP Code Actions + `axon fix --watch` + Effect-Row Lens + `axon why`
+
+The advisor's #2 priority shipped end-to-end, with verification: an adversarial 4-reviewer workflow demanded 3 critical + 7 major fixes before merge. All addressed; this entry documents both what shipped and what the verification pass caught.
+
+### §34.1 Fix confidence tiers (`Confidence::{Safe, Suggested}`)
+
+Foundation for everything else in this stage. Without tiers, `--watch` couldn't safely auto-apply anything and LSP code actions couldn't tell editors which fix to auto-pick.
+
+- **`Confidence` enum on `axon_diag::Fix`** ([crates/axon-diag/src/lib.rs](crates/axon-diag/src/lib.rs)). Default `Suggested` for backwards compat; opt-in `Safe` via `.safe()` builder.
+- **Categorization rule (documented + locked by integration tests):**
+  - **Safe** — purely additive or deterministic-from-known-set: E0202/E0203/E0207 did-you-mean rename, E0204 `{name}_N` deterministic rename, E0210 effect-row append/synthesize (purely additive — tyck already proved the effects are needed), P0010 `pub` insertion.
+  - **Suggested** — deletes user code or inserts placeholders: E0205 nil-padding, E0205 drop-trailing-args, E0205 drop-all-args.
+- **8 categorization-locking integration tests** ([crates/axon-cli/tests/stage34_confidence_tiers.rs](crates/axon-cli/tests/stage34_confidence_tiers.rs)) — if a future contributor adds a fix site without explicit tagging, this suite catches the missing `.safe()` on any new Safe-class fix.
+
+### §34.2 Effect-row code lens (LSP)
+
+Surfaces the **inferred** `uses { ... }` row above every top-level `fn` and tool body — the §59 effect-overlay feature the spec promises.
+
+- **Tyck-side: inferred-effect capture** ([crates/axon-tyck/src/ctx.rs](crates/axon-tyck/src/ctx.rs), [crates/axon-tyck/src/infer.rs](crates/axon-tyck/src/infer.rs)) — new `inferred_fn_effects: HashMap<ItemId, EffectRow>` table populated by a new `with_effect_row_capturing` variant that returns the accumulated `used` row. Clobbering risk on duplicate-definition defended by `sig.span == fn.span` guard.
+- **LSP-side: new [crates/axon-lsp/src/effect_lens.rs](crates/axon-lsp/src/effect_lens.rs)** — mirrors `cost_lens.rs`. Three statuses: `Derived` (no row written), `Matches` (declared = inferred), `OverDeclared { unused }` (declared is a strict superset; label lists unused atoms).
+- Wired into the existing `CodeLensRequest` handler ([crates/axon-lsp/src/server.rs](crates/axon-lsp/src/server.rs)) alongside cost lenses.
+- **Honest scope cut (v0):** top-level `Item::Fn` + `Item::Tool` only. Agent member fns share the global name table; nested-fn lenses land when items are keyed by `(parent_id, name)`.
+
+### §34.3 `axon why <EFFECT> [<path>] [--from <fn>]`
+
+Traces every chain of calls from the entry function that ultimately requires `<EFFECT>`:
+
+```
+why Net in main:
+  main()  uses { Console, Net }
+       └─ fetch_html()  uses { Net }
+            └─ http_fetch()  [built-in requires Net]
+```
+
+- **New [crates/axon-cli/src/why.rs](crates/axon-cli/src/why.rs)** — DFS over the call graph, pruning branches whose subtree doesn't carry the target effect. Mutual recursion guarded with a `[recursion]` leaf.
+- Built-in effects via `Ctx::builtin_effects_for`; user fns recurse via the inferred-effect table.
+- **§34.6 fix M4** — `generate { ... }` and `spawn x` emit synthetic `[requires LLM, Net]` / `[requires Spawn]` leaves so the tree never has an empty-children dead end.
+- **Honest scope cuts (v0, documented in `--help` and module rustdoc):**
+  - Method-effect dispatch is **name-only** — `.store(...)` / `.recall(...)` surface as `[method requires Memory — name-only match]` regardless of receiver type.
+  - Calls inside agent handler / actor handler / lifecycle bodies aren't traversed.
+
+### §34.4 LSP `textDocument/codeAction` — every diagnostic with a `Fix` gets a lightbulb
+
+The advisor's "where users actually want fixes." Every diagnostic at the cursor that carries a `Fix` shows up as a `CodeAction { kind: QUICKFIX }` with a `WorkspaceEdit` the editor can apply in one click.
+
+- **New [crates/axon-lsp/src/code_actions.rs](crates/axon-lsp/src/code_actions.rs)** — pure function `code_actions_for(analysis, text, uri, range) -> Vec<CodeActionOrCommand>`. One CodeAction per Fix, with the diagnostic linked back so editors dim the squiggle on apply.
+- **Safe-tier fixes set `is_preferred = true`** — editors mark them as the auto-pick. "Fix on save" only triggers when the user has explicitly opted in via editor config.
+- **Cross-file fixes (P0010, where the edit lives in a different file) are dropped silently in v0** — single-file LSP can't represent the cross-file edit; the CLI's project mode still handles them.
+- Server wired: `ServerCapabilities.code_action_provider` advertises QUICKFIX.
+
+### §34.5 `axon fix --interactive` and `axon fix --watch`
+
+- **`--interactive`** — walks each accepted hunk and prompts `[y]es / [n]o / [a]ll-from-here / [q]uit`. Falls back to dry-run cleanly when stdin is not a TTY. Inline preview shows one before/after line of context.
+- **`--watch`** — re-runs on every save via [notify](https://crates.io/crates/notify). **Auto-applies only Safe-tier fixes**; Suggested ones report to stdout with a hint to run `axon fix --interactive`. Cooperative shutdown via [ctrlc](https://crates.io/crates/ctrlc).
+- **Mutual exclusivity:** `--apply`, `--interactive`, `--watch` are checked exclusive — picking two is exit-2.
+- **Tier label in dry-run output:** `fix [E0202, safe]: ...` — a user reviewing the diff knows what would auto-apply under `--watch`.
+
+### §34.6 — Adversarial verification: 3 critical + 7 major findings, all fixed
+
+The Stage 34 implementation was adversarially reviewed. The reviewers' verdict was **block** — production code can't ship with the bugs they found. Every finding was addressed and pinned by regression tests in [crates/axon-cli/tests/stage34_verify_fixes.rs](crates/axon-cli/tests/stage34_verify_fixes.rs):
+
+**Critical (security/data-loss):**
+
+- **C1 — `axon fix --watch <dir>` could rewrite arbitrary system .ax files.** Original code accepted any path that `exists()`. Fixed: directory mode requires an `axon.toml` in the tree (or an ancestor of it) AND requires the canonical watch root to be a descendant of CWD. Override with `AXON_FIX_WATCH_FORCE=1`. Refusal messages name the exact safety rule that fired. Single-file mode is bounded by definition (one file) and isn't subject to the CWD-descendant gate.
+- **C2 — Path traversal via `[run] src = "../etc"` and src/ symlinks.** Fixed: `load_directory` canonicalizes the project root + requires `run.src` and each dep's `src/` to canonicalize as descendants of their respective roots. `walk_dir` rejects symlinks via `symlink_metadata` and double-checks each entry against the canonicalized root. Dep paths to sibling project dirs (legitimate workspace pattern) remain allowed.
+- **C3 — TOCTOU race between watcher event and apply.** Fixed: stat the file at read, re-stat right before write; abort the apply if mtime advanced.
+
+**Major (correctness/honesty):**
+
+- **M1 — Project-mode `--watch` never recorded mtime per file** → infinite re-trigger loop risk. Fixed: `apply_safe_fixes_to_project` returns the list of touched paths; the watch loop records mtimes for both modes.
+- **M2 — Single-file `--watch foo.ax` fired on sibling .ax files** despite the comment claiming a filter. Fixed: canonicalized target path captured before the loop; other-path events dropped.
+- **M3 — Watch debounce had no maxWait.** A chatty auto-save editor could slide the deadline forever. Fixed: quiet-window (250 ms) AND maxWait (2 s) — whichever fires first.
+- **M4 — `axon why` was missing `ExprKind::Generate` and `ExprKind::Spawn` arms** → false dead-end. Fixed: both emit synthetic call-site leaves.
+- **M5 — `effect_lens.rs` rustdoc lied about `OverDeclared` label format and row-variable behavior.** Fixed: rustdoc rewritten to match output; row-variable handling honestly documented as v0 limitation.
+- **M6 — `axon why` method dispatch is name-only** — original rustdoc overstated fidelity. Fixed: tree label now reads `[method requires Memory — name-only match]`; `--help` lists it as a v0 scope cut.
+- **M7 — Ctrl-C handler installed AFTER `watcher.watch()`** (race window) AND install failure was non-fatal. Fixed: handler installed first; failure is fatal.
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-diag::tests` | 2 new | Confidence default + builder semantics |
+| `axon-lsp::effect_lens` | 7 new | derived/matches/over-declared/transitive/anchor-span |
+| `axon-lsp::code_actions` | 7 new | lightbulb appears, no-fix-no-action, range filter, multiple fixes, is_preferred Safe, cross-file dropped |
+| `axon-cli::tests::stage34_confidence_tiers` | 8 new | Every existing fix code's tier locked |
+| `axon-cli::tests::stage34_why_and_lens` | 8 new | CLI `axon why` end-to-end + effect-lens smoke |
+| `axon-cli::tests::stage34_interactive_watch` | 6 new | Dry-run tier labels, --interactive non-TTY fallback, mode mutex, --watch startup, suggested-not-auto-applied, P0010 cross-file routing |
+| `axon-cli::tests::stage34_verify_fixes` | 9 new | C1 manifest gate, C1 CWD gate, C2 `run.src` escape, C2 symlink skip, M2 sibling filter, M4 Generate leaf, M4 Spawn leaf, M6 help honesty |
+| **Workspace total** | **1007 passing**, up from 955 | |
+
+### What's NOT in this stage (deliberate)
+
+- **Async eval core** — multi-week per the advisor's own prior note; the bounded `flow_parallel_asks` slice shipped Stage 32. The full migration is its own stage.
+- **`axon fix --interactive` for project mode** — per-hunk prompts across many files need per-file UI; single-file ships today.
+- **Real package registry / git deps / lockfile** — its own stage.
+- **`axon test --doc`** — separate substantial pipeline.
+- **Snapshot testing, debugger DAP, `axon bench`** — each a stage-sized commitment.
 
 ---
 

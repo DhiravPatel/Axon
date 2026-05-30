@@ -31,10 +31,14 @@ pub fn name_not_found_with_candidates(
         d = d
             .with_note(format!("did you mean `{best}`?"))
             .with_fix(
-                Fix::new(format!("replace `{name}` with `{best}`")).with_edit(FixEdit {
-                    span,
-                    replacement: best,
-                }),
+                // §34.1 Safe: rename to a known in-scope binding, no
+                // semantic change to surrounding tokens.
+                Fix::new(format!("replace `{name}` with `{best}`"))
+                    .with_edit(FixEdit {
+                        span,
+                        replacement: best,
+                    })
+                    .safe(),
             );
     }
     d
@@ -56,10 +60,13 @@ pub fn type_not_found_with_candidates(
         d = d
             .with_note(format!("did you mean `{best}`?"))
             .with_fix(
-                Fix::new(format!("replace `{name}` with `{best}`")).with_edit(FixEdit {
-                    span,
-                    replacement: best,
-                }),
+                // §34.1 Safe: rename to a known type/schema/agent.
+                Fix::new(format!("replace `{name}` with `{best}`"))
+                    .with_edit(FixEdit {
+                        span,
+                        replacement: best,
+                    })
+                    .safe(),
             );
     }
     d
@@ -92,10 +99,15 @@ pub fn duplicate_definition_with_fix(
     let mut d = duplicate_definition(span, name, prev);
     let suggested = pick_unique_rename(name, existing_names);
     d = d.with_fix(
-        Fix::new(format!("rename the second `{name}` to `{suggested}`")).with_edit(FixEdit {
-            span: name_span,
-            replacement: suggested,
-        }),
+        // §34.1 Safe: deterministic `{name}_N` rename over a known-set
+        // (every registered name was scanned to pick N). Replaces only
+        // the identifier; surrounding tokens are untouched.
+        Fix::new(format!("rename the second `{name}` to `{suggested}`"))
+            .with_edit(FixEdit {
+                span: name_span,
+                replacement: suggested,
+            })
+            .safe(),
     );
     d
 }
@@ -152,13 +164,16 @@ pub fn wrong_arity_with_fix(
         let insertion = format!("{prefix}{}", placeholders.join(", "));
         let at = (call_span.end as usize).saturating_sub(1);
         d = d.with_fix(
+            // §34.1 Suggested: nil placeholders rarely typecheck. The
+            // user must replace each with a real value.
             Fix::new(format!(
                 "pad with {to_add} `nil` placeholder(s) — replace each with a real value"
             ))
             .with_edit(FixEdit {
                 span: Span::in_file(at, at, call_span.file),
                 replacement: insertion,
-            }),
+            })
+            .suggested(),
         );
     } else if found > expected && expected > 0 && arg_spans.len() == found {
         // Drop the trailing args. Replace span goes from the end of the
@@ -168,6 +183,9 @@ pub fn wrong_arity_with_fix(
         let to = arg_spans.last().unwrap().end as usize;
         if to > from {
             d = d.with_fix(
+                // §34.1 Suggested: deletes user-written code. The
+                // trailing args may have been intentional — never
+                // silently auto-apply.
                 Fix::new(format!(
                     "drop the {} trailing argument(s)",
                     found - expected
@@ -175,7 +193,8 @@ pub fn wrong_arity_with_fix(
                 .with_edit(FixEdit {
                     span: Span::in_file(from, to, call_span.file),
                     replacement: String::new(),
-                }),
+                })
+                .suggested(),
             );
         }
     } else if found > expected && expected == 0 && !arg_spans.is_empty() {
@@ -184,11 +203,13 @@ pub fn wrong_arity_with_fix(
         let from = arg_spans[0].start as usize;
         let to = arg_spans.last().unwrap().end as usize;
         d = d.with_fix(
+            // §34.1 Suggested: deletes user-written code.
             Fix::new(format!("drop all {found} argument(s) — call expects 0"))
                 .with_edit(FixEdit {
                     span: Span::in_file(from, to, call_span.file),
                     replacement: String::new(),
-                }),
+                })
+                .suggested(),
         );
     }
     d
@@ -225,11 +246,13 @@ pub fn no_such_method_with_candidates(
         d = d
             .with_note(format!("did you mean `.{best}()`?"))
             .with_fix(
+                // §34.1 Safe: rename to a method known on the receiver type.
                 Fix::new(format!("replace `.{method}(...)` with `.{best}(...)`"))
                     .with_edit(FixEdit {
                         span,
                         replacement: best,
-                    }),
+                    })
+                    .safe(),
             );
     }
     d
@@ -300,6 +323,9 @@ pub fn effect_not_declared_with_fix(
             to_add.join(", ")
         };
         d = d.with_fix(
+            // §34.1 Safe: purely additive — extend an existing row.
+            // The effects came from real call sites the tyck already
+            // proved; appending them only widens the function's row.
             Fix::new(format!(
                 "add `{}` to the `uses {{...}}` row",
                 to_add.join("`, `")
@@ -307,7 +333,8 @@ pub fn effect_not_declared_with_fix(
             .with_edit(FixEdit {
                 span: Span::in_file(inner.end as usize, inner.end as usize, inner.file),
                 replacement: insertion,
-            }),
+            })
+            .safe(),
         );
     } else if let Some((at, file)) = insert_at_body {
         // Synthesize a fresh `uses { ... } ` clause right before the
@@ -315,6 +342,10 @@ pub fn effect_not_declared_with_fix(
         // legible: `fn f() uses { Net } { ... }`.
         let insertion = format!("uses {{ {} }} ", to_add.join(", "));
         d = d.with_fix(
+            // §34.1 Safe: synthesizing a missing row is also purely
+            // additive — the function previously had no row (== empty),
+            // so widening to {missing_effects} only allows what tyck
+            // already verified.
             Fix::new(format!(
                 "add a `uses {{ {} }}` row to the function signature",
                 to_add.join(", ")
@@ -322,7 +353,8 @@ pub fn effect_not_declared_with_fix(
             .with_edit(FixEdit {
                 span: Span::in_file(at, at, file),
                 replacement: insertion,
-            }),
+            })
+            .safe(),
         );
     }
     d

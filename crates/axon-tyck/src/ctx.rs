@@ -18,6 +18,15 @@ pub struct Ctx {
     /// Populated at startup by `pass_register_items`. Consulted in
     /// `call_ty` to flag missing-effect errors statically.
     builtin_effects: HashMap<String, EffectRow>,
+    /// §34.2 — inferred effect row per top-level fn / tool, captured at
+    /// the end of body-checking. `check_fn_body` and friends write into
+    /// this; consumers (the LSP effect-row code lens, `axon why`) read
+    /// it to surface the actually-used effects vs the declared row.
+    ///
+    /// Nested fns inside agent members are *not* keyed here in v0 —
+    /// the bare name space would clash. Lens emission is therefore
+    /// restricted to top-level Item::Fn / Item::Tool.
+    inferred_fn_effects: HashMap<ItemId, EffectRow>,
 }
 
 impl Ctx {
@@ -56,6 +65,26 @@ impl Ctx {
     /// Look up the registered effect row for `name`, if any.
     pub fn builtin_effects_for(&self, name: &str) -> Option<&EffectRow> {
         self.builtin_effects.get(name)
+    }
+
+    /// §34.2 — record the inferred effect row for a top-level fn / tool.
+    /// Called by the body-check pass after the closure that accumulates
+    /// `used` effects returns. Safe to call multiple times for the same
+    /// id; the last write wins.
+    pub fn record_inferred_effects(&mut self, id: ItemId, row: EffectRow) {
+        self.inferred_fn_effects.insert(id, row);
+    }
+
+    /// Look up the inferred effect row by item id.
+    pub fn inferred_effects_by_id(&self, id: ItemId) -> Option<&EffectRow> {
+        self.inferred_fn_effects.get(&id)
+    }
+
+    /// Look up the inferred effect row by name (resolves through the
+    /// item table first). Returns `None` if the name doesn't resolve
+    /// or wasn't a fn/tool body that was checked.
+    pub fn inferred_effects_for(&self, name: &str) -> Option<&EffectRow> {
+        self.inferred_effects_by_id(self.lookup(name)?)
     }
 
     /// Overwrite the signature at `id`. Used by the registration pass to

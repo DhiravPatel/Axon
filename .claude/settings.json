@@ -30,7 +30,25 @@
       "Read(//tmp/**)",
       "Bash(./target/debug/axon replay *)",
       "Bash(cd \"/Users/dhiravpatel/Documents/Project 2/Axon\" && cat /tmp/triage-replay.txt 2>&1 | head -30)",
-      "Read(//private/tmp/**)"
+      "Read(//private/tmp/**)",
+      "Bash(cd \"/Users/dhiravpatel/Documents/Project 2/Axon\" && find ~/.cargo/registry/src -name \"code_action*.rs\" 2>/dev/null | grep -i \"lsp-types-0.95\" | head -3)",
+      "Read(//Users/dhiravpatel/.cargo/registry/src/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(git checkout *)",
+      "Bash(tee /tmp/stage34_step1_full.txt)",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after step 1:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(tee /tmp/stage34_pass.log)",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"stage34:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after fix:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(cp /tmp/spaces.ax \"/tmp/unicode_ñöç.ax\")",
+      "Bash(\"/Users/dhiravpatel/Documents/Project 2/Axon/target/debug/axon\" fix \"/tmp/unicode_ñöç.ax\")",
+      "Bash(\"/Users/dhiravpatel/Documents/Project 2/Axon/target/debug/axon\" fix --watch /nonexistent.ax)",
+      "Bash(RUST_BACKTRACE=1 \"/Users/dhiravpatel/Documents/Project 2/Axon/target/debug/axon\" fix /tmp/parse_err2.ax)",
+      "Bash(\"/Users/dhiravpatel/Documents/Project 2/Axon/target/debug/axon\" parse /tmp/parse_err2.ax)",
+      "Bash(tee /tmp/s34_pass2.log)",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after verify-fixes:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"final:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after all fixes:\", p, \"passed,\", f, \"failed\" }')"
     ],
     "additionalDirectories": [
       "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec"

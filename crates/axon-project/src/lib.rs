@@ -247,10 +247,29 @@ impl LoadedProject {
         let manifest = Manifest::from_dir(root)?;
         let mut sources = SourceRegistry::new();
 
+        // §34.6 (Stage 34 verification fix C2) — canonicalize the root
+        // up-front so every descendant check below operates on a
+        // resolved, absolute path. Reject manifests whose `run.src` or
+        // `deps.*.path` escape the project root via `../` or absolute
+        // paths — these are arbitrary-file-overwrite primitives once
+        // `axon fix --watch` is pointed at the project.
+        let canon_root = root.canonicalize().map_err(|e| {
+            format!("axon: cannot canonicalize `{}`: {e}", root.display())
+        })?;
+
         // Load every dependency first so their modules end up in the
         // registry with stable ids before main-project modules. Deps are
         // namespaced under the dep name (e.g. `helpers.foo` for module
         // `foo` in dep `helpers`).
+        //
+        // §34.6 verification fix C2 — note: deps are NOT required to be
+        // descendants of the main project's canonical root. Sibling
+        // path-deps in the same workspace are a legitimate use case.
+        // The security boundary for arbitrary-file rewrite lives in
+        // `axon fix --watch` itself (which refuses non-axon.toml dirs
+        // outside CWD), NOT in this loader. We *do* require each dep's
+        // `src/` to stay inside the dep's own canonical root, so a
+        // malicious sub-manifest can't point into /etc.
         let mut modules: Vec<ModuleFile> = Vec::new();
         for (dep_name, dep) in &manifest.deps {
             let dep_root = root.join(&dep.path);
@@ -268,6 +287,13 @@ impl LoadedProject {
                     dep_manifest.run.src
                 ));
             }
+            // Dep's src/ must stay within the canonical dep root —
+            // refuses `[deps.x.path] = "ok"` paired with `[run] src =
+            // "../../etc"` inside the dep's own axon.toml.
+            let canon_dep = dep_root.canonicalize().map_err(|e| {
+                format!("axon: cannot canonicalize dep `{dep_name}`: {e}")
+            })?;
+            require_descendant(&canon_dep, &dep_src, &format!("dependency `{dep_name}` src"))?;
             let dep_modules =
                 collect_modules(&dep_src, &dep_src, Some(dep_name), &mut sources)?;
             modules.extend(dep_modules);
@@ -281,6 +307,7 @@ impl LoadedProject {
                 manifest.run.src
             ));
         }
+        require_descendant(&canon_root, &src_dir, "`run.src`")?;
         let main_modules = collect_modules(&src_dir, &src_dir, None, &mut sources)?;
         modules.extend(main_modules);
         // Stable order — dep modules first (alphabetical by combined path),
@@ -373,6 +400,10 @@ fn check_privacy(modules: &[ModuleFile]) -> Vec<Diagnostic> {
                             .with_code("P0010");
                             if item_span.file != 0 {
                                 d = d.with_fix(
+                                    // §34.1 Safe: inserting `pub ` at an
+                                    // item's start is purely additive —
+                                    // it never changes any existing tokens
+                                    // and only widens visibility.
                                     axon_diag::Fix::new(format!(
                                         "make `{name}` public — insert `pub` in `{mod_path}`"
                                     ))
@@ -383,7 +414,8 @@ fn check_privacy(modules: &[ModuleFile]) -> Vec<Diagnostic> {
                                             item_span.file,
                                         ),
                                         replacement: "pub ".to_string(),
-                                    }),
+                                    })
+                                    .safe(),
                                 );
                             }
                             diags.push(d);
@@ -449,13 +481,39 @@ fn walk_dir(
     })?;
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.path());
+    // §34.6 (Stage 34 verification fix C2) — canonicalize the src_root
+    // once and refuse any entry whose resolved path escapes it. Belt-
+    // and-suspenders against symlink-out attacks even when the
+    // file-type test below also rejects symlinks.
+    let canon_root = src_root.canonicalize().map_err(|e| {
+        format!("axon: cannot canonicalize `{}`: {e}", src_root.display())
+    })?;
     for entry in entries {
         let path = entry.path();
+        // Reject symlinks outright (file or directory). `symlink_metadata`
+        // (unlike `is_dir`/`is_file`) does not follow the link, so we see
+        // the link itself. Project tree must be a real tree.
+        if let Ok(md) = std::fs::symlink_metadata(&path) {
+            if md.file_type().is_symlink() {
+                continue;
+            }
+        }
         if path.is_dir() {
+            // Confirm the directory canonicalizes inside the root before
+            // descending — defends against e.g. a junction or mount that
+            // points outside the project.
+            if require_descendant(&canon_root, &path, "module subdirectory").is_err() {
+                continue;
+            }
             walk_dir(&path, src_root, prefix, sources, out)?;
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some(SOURCE_EXTENSION) {
+            continue;
+        }
+        // Same descendant check for individual files — covers the edge
+        // case where the parent is a symlinked dir we didn't reject.
+        if require_descendant(&canon_root, &path, "module file").is_err() {
             continue;
         }
         let module_tail = module_path_for(&path, src_root)?;
@@ -477,6 +535,29 @@ fn walk_dir(
             source,
             program,
         });
+    }
+    Ok(())
+}
+
+/// §34.6 — verify `child` canonicalizes to a descendant of (or equal
+/// to) `canon_root`. Both paths are canonicalized; only the
+/// descendant-equality check is exposed to callers. Used by the
+/// project loader to refuse `[run] src = "../etc"` and by `walk_dir`
+/// to refuse symlinks-out.
+fn require_descendant(
+    canon_root: &Path,
+    child: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let canon_child = child
+        .canonicalize()
+        .map_err(|e| format!("axon: cannot canonicalize {label} `{}`: {e}", child.display()))?;
+    if !canon_child.starts_with(canon_root) {
+        return Err(format!(
+            "axon: {label} `{}` escapes the project root `{}` (refusing to follow `../` or symlink)",
+            canon_child.display(),
+            canon_root.display()
+        ));
     }
     Ok(())
 }
