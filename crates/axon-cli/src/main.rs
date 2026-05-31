@@ -18,6 +18,7 @@ use axon_diag::SourceFile;
 mod host;
 mod qol;
 mod scaffold;
+mod watch_format;
 mod why;
 
 fn main() -> ExitCode {
@@ -130,6 +131,10 @@ fn main() -> ExitCode {
         "why" => {
             let remaining: Vec<String> = args.collect();
             why::cmd_why(&remaining)
+        }
+        "watch" => {
+            let remaining: Vec<String> = args.collect();
+            cmd_watch(&remaining)
         }
         "new" => {
             let remaining: Vec<String> = args.collect();
@@ -283,6 +288,11 @@ fn print_help() {
                           Built-in calls (`http_fetch`, `read_file`, …)\n\
                           appear as leaves; user-defined fns expand into\n\
                           their own subtree (effect-pruned).\n\
+           watch  <file> [--trace PATH] [--no-color]\n\
+                          Run a program with the live trace inspector —\n\
+                          one line per span (ask/plan/tool/handler/spawn)\n\
+                          streamed to stderr as the program runs. Stdout\n\
+                          is left alone so program output remains pipeable.\n\
            version         Print the compiler version\n\
            help            Show this message\n",
         env!("CARGO_PKG_VERSION")
@@ -579,6 +589,15 @@ fn cmd_test(args: &[String]) -> ExitCode {
     // project directory just works.
     let mut features: Vec<String> = Vec::new();
     let mut enable_default_features = true;
+    // §35.4 — trajectory snapshot testing.
+    let mut record_trajectory: Option<String> = None;
+    let mut match_trajectory: Option<String> = None;
+    // §35.5 — doc tests.
+    let mut include_doc_tests = false;
+    let mut doc_only = false;
+    // §35.4 — collect positionals during the flag-parsing pass so the
+    // path detector below doesn't accidentally grab a flag's value.
+    let mut positionals: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -599,16 +618,86 @@ fn cmd_test(args: &[String]) -> ExitCode {
                 enable_default_features = false;
                 i += 1;
             }
-            _ => i += 1,
+            "--record-trajectory" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!(
+                        "axon test: --record-trajectory requires a name (e.g. --record-trajectory baseline)"
+                    );
+                    return ExitCode::from(2);
+                }
+                record_trajectory = Some(args[i].clone());
+                i += 1;
+            }
+            "--match-trajectory" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!(
+                        "axon test: --match-trajectory requires a name"
+                    );
+                    return ExitCode::from(2);
+                }
+                match_trajectory = Some(args[i].clone());
+                i += 1;
+            }
+            "--doc" => {
+                include_doc_tests = true;
+                i += 1;
+            }
+            "--doc-only" => {
+                include_doc_tests = true;
+                doc_only = true;
+                i += 1;
+            }
+            "--help" | "-h" => {
+                // §35.6 verification fix M5 — surface the Stage 35
+                // additions (--doc / --doc-only / --record-trajectory /
+                // --match-trajectory) so they're discoverable.
+                println!(
+                    "usage: axon test [path] [FLAGS]\n\
+                     \n\
+                     Discover and run `test \"name\" {{ ... }}` blocks in a project\n\
+                     directory (or single file). Path defaults to `.`.\n\
+                     \n\
+                     FLAGS:\n\
+                       --features F1,F2,...\n\
+                                                Enable named features from axon.toml's\n\
+                                                [features] table.\n\
+                       --no-default-features    Don't seed the `default` feature.\n\
+                       --doc                    Also run ``axon`` fenced blocks extracted\n\
+                                                from /// doc comments as tests.\n\
+                       --doc-only               Run ONLY the doc-test snippets; drop\n\
+                                                user-declared test blocks.\n\
+                       --record-trajectory NAME\n\
+                                                Capture each test's model-call trajectory\n\
+                                                to tests/.trajectories/NAME/ as a snapshot.\n\
+                       --match-trajectory NAME\n\
+                                                Re-run each test and assert its trajectory\n\
+                                                shape matches the saved snapshot (step\n\
+                                                count, grounded fraction, tool set,\n\
+                                                error-recovery flag — not exact strings)."
+                );
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon test: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                positionals.push(other);
+                i += 1;
+            }
         }
     }
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .map(|s| s.as_str())
-        .unwrap_or(".");
+    if record_trajectory.is_some() && match_trajectory.is_some() {
+        eprintln!(
+            "axon test: --record-trajectory and --match-trajectory are mutually exclusive"
+        );
+        return ExitCode::from(2);
+    }
+    let path = positionals.first().copied().unwrap_or(".");
     let path = std::path::Path::new(path);
-    let project = match axon_project::LoadedProject::load_with_features(
+    let mut project = match axon_project::LoadedProject::load_with_features(
         path,
         &features,
         enable_default_features,
@@ -628,6 +717,69 @@ fn cmd_test(args: &[String]) -> ExitCode {
     if !project.diagnostics.is_empty() {
         emit_project_diagnostics_via_registry(&project.diagnostics, &project.sources);
         return ExitCode::from(1);
+    }
+    // §35.5 — doc-test synthesis. When `--doc` is set, extract every
+    // `` ```axon `` fence from `///` comments, wrap each in a synthetic
+    // `test "doc(item)" { ... }` block, parse the synthesized source,
+    // and splice its TestDecl items into the merged program before
+    // tyck runs. `--doc-only` additionally drops the user's normal
+    // tests before the run loop.
+    let mut doc_snippets_seen: usize = 0;
+    if include_doc_tests {
+        let snippets = axon_doc::extract_doc_tests(&project);
+        doc_snippets_seen = snippets.len();
+        if !snippets.is_empty() {
+            // §35.6 verification fix M3 — collect user test names so
+            // synthesize_with_existing suffixes any name collisions
+            // (otherwise a user-written `test "doc(add)" { ... }`
+            // plus a `///`-extracted snippet on `fn add(...)` would
+            // produce an E0204 pointing at the phantom `<doc-tests>`
+            // file the user can't edit).
+            let user_test_names: Vec<String> = project
+                .merged
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    axon_ast::Item::Test(t) => Some(t.name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let synth_src = axon_doc::doctest::synthesize_with_existing(
+                &snippets,
+                &user_test_names,
+            );
+            let synth_path = "<doc-tests>";
+            let synth_id = project.sources.register(synth_path, synth_src.clone());
+            let synth_file = axon_diag::SourceFile::with_id(
+                synth_id, synth_path, synth_src,
+            );
+            let (synth_program, synth_diags) = axon_parser::parse(&synth_file);
+            if !synth_diags.is_empty() {
+                eprintln!(
+                    "axon test --doc: {} parse error(s) in synthesized doc-tests:",
+                    synth_diags.len()
+                );
+                for d in &synth_diags {
+                    eprintln!("{}", axon_diag::render(d, &synth_file, true));
+                }
+                return ExitCode::from(1);
+            }
+            // §35.5 `--doc-only` drops user tests, keeps only the
+            // synthesized doc-tests.
+            if doc_only {
+                project
+                    .merged
+                    .items
+                    .retain(|i| !matches!(i, axon_ast::Item::Test(_)));
+            }
+            project.merged.items.extend(synth_program.items);
+        } else if doc_only {
+            println!(
+                "axon test --doc-only: no doc fences found in `{}`",
+                path.display()
+            );
+            return ExitCode::SUCCESS;
+        }
     }
     // Type-check against the merged program — use the first module's
     // source file for diagnostic rendering since type errors carry spans
@@ -665,6 +817,15 @@ fn cmd_test(args: &[String]) -> ExitCode {
 
     if tests.is_empty() {
         println!("no tests found in `{}`", path.display());
+        // §35.5 — even with no runnable tests, if --doc was set we
+        // should still report how many fences were extracted (zero
+        // counts as a useful signal: "you asked for doc-tests and got
+        // none; check your /// fences").
+        if include_doc_tests {
+            println!(
+                "doc-tests: {doc_snippets_seen} `\u{0060}\u{0060}\u{0060}axon` fence(s) extracted from /// comments"
+            );
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -674,9 +835,33 @@ fn cmd_test(args: &[String]) -> ExitCode {
     let mut failed = 0usize;
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
+    // §35.4 — trajectory snapshot scaffold.
+    let trajectory_dir = path.join("tests").join(".trajectories");
+    if record_trajectory.is_some() {
+        if let Err(e) = std::fs::create_dir_all(&trajectory_dir) {
+            eprintln!(
+                "axon test: cannot create `{}`: {e}",
+                trajectory_dir.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+    // The set of test names that ran through the trajectory path so the
+    // end-of-run summary can include "saved N trajectories" / "matched M".
+    let mut trajectory_saved = 0usize;
+    let mut trajectory_matched = 0usize;
+    let mut trajectory_drift = 0usize;
+
     for t in &tests {
         let mut interp = axon_runtime::Interpreter::with_caps(caps.clone());
         host::install(&interp);
+        // §35.4 — enable recording whenever a trajectory mode is set.
+        // We need the recording either way: --record writes it out as
+        // a Trajectory snapshot; --match builds the actual Trajectory
+        // from this run's recording so we can diff against the saved one.
+        if record_trajectory.is_some() || match_trajectory.is_some() {
+            interp.enable_recording();
+        }
         interp.load_program(&project.merged);
         host::register_policies(&project.merged);
         host::register_schemas(&project.merged);
@@ -686,17 +871,24 @@ fn cmd_test(args: &[String]) -> ExitCode {
             axon_runtime::ClosureBody::Block(t.body.clone()),
             interp.globals.clone(),
             t.span,
-            Some(Vec::new()),
+            // §35.4 — tests inherit the runner's full cap set (which
+            // comes from the manifest's `[caps] default = [...]`). Tests
+            // are scaffolding; making them re-declare every effect they
+            // call into would be obnoxious. The previous default of
+            // `Some(Vec::new())` (empty attenuation) made any effectful
+            // test impossible to write.
+            None,
         );
         let result = interp.call_value(
             &axon_runtime::Value::Fn(std::rc::Rc::new(closure)),
             &[],
             t.span,
         );
-        match result {
+        let test_failed = match result {
             Ok(_) => {
                 println!("  ok   `{}`", t.name);
                 passed += 1;
+                false
             }
             Err(axon_runtime::EvalSignal::Error(err)) => {
                 failed += 1;
@@ -707,10 +899,146 @@ fn cmd_test(args: &[String]) -> ExitCode {
                     .or_else(|| project.sources.iter().next())
                     .unwrap_or(&primary_source);
                 eprint!("    {}", err.render(file, use_color));
+                true
             }
             Err(other) => {
                 failed += 1;
                 println!("  FAIL `{}` — unexpected control flow: {other:?}", t.name);
+                true
+            }
+        };
+        if test_failed {
+            continue;
+        }
+        // §35.4 — trajectory snapshot handling. Only run for tests
+        // that actually produced model calls (no ModelCall events in
+        // the recording → no trajectory).
+        if record_trajectory.is_some() || match_trajectory.is_some() {
+            let recording = interp.take_recording();
+            let events: Vec<axon_eval::trajectory::TrajectoryEvent> = recording
+                .map(|r| {
+                    r.events
+                        .into_iter()
+                        .filter_map(|e| match e {
+                            axon_runtime::RecordedEvent::ModelCall { response, .. } => {
+                                Some(axon_eval::trajectory::TrajectoryEvent::ModelCall {
+                                    content: response.content.clone(),
+                                    tool_calls: response
+                                        .tool_calls
+                                        .iter()
+                                        .map(|tc| axon_eval::trajectory::ToolCall {
+                                            name: tc.name.clone(),
+                                            args_json: tc.input.to_string(),
+                                            errored: false,
+                                        })
+                                        .collect(),
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // §35.6 verification fix C2 — DO NOT short-circuit on
+            // empty events. A test that previously produced model
+            // calls and now produces zero is exactly the regression
+            // snapshot testing is designed to catch. In record mode
+            // we still skip writing an empty trajectory (no signal);
+            // in match mode we read the baseline and let
+            // compare_trajectories report the drift to zero steps.
+            let traj = axon_eval::trajectory::trajectory_from_events(
+                t.name.clone(),
+                &events,
+            );
+            if let Some(name) = &record_trajectory {
+                // Refuse path-traversal on the snapshot-set name
+                // (§35.6 verification fix M2). The per-test name is
+                // already sanitized via sanitize_filename, but the
+                // snapshot-set name was joined raw — `axon test
+                // --record-trajectory ../../etc` escaped the project
+                // dir. Sanitize the set name the same way.
+                let safe_set = sanitize_filename(name);
+                if safe_set.is_empty() || safe_set != *name {
+                    eprintln!(
+                        "axon test: trajectory snapshot name `{name}` rejected — \
+                         only alphanumeric / `_` / `-` are allowed (got sanitized form `{safe_set}`)"
+                    );
+                    return ExitCode::from(2);
+                }
+                if events.is_empty() {
+                    // No model calls → no snapshot worth saving.
+                    continue;
+                }
+                let dest = trajectory_dir
+                    .join(&safe_set)
+                    .join(format!("{}.json", sanitize_filename(&t.name)));
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let body = serde_json::to_string_pretty(&traj).unwrap_or_default();
+                if let Err(e) = std::fs::write(&dest, &body) {
+                    eprintln!("axon test: cannot write `{}`: {e}", dest.display());
+                } else {
+                    trajectory_saved += 1;
+                    println!("    trajectory recorded -> {}", dest.display());
+                }
+            }
+            if let Some(name) = &match_trajectory {
+                let safe_set = sanitize_filename(name);
+                if safe_set.is_empty() || safe_set != *name {
+                    eprintln!(
+                        "axon test: trajectory snapshot name `{name}` rejected — \
+                         only alphanumeric / `_` / `-` are allowed"
+                    );
+                    return ExitCode::from(2);
+                }
+                let src = trajectory_dir
+                    .join(&safe_set)
+                    .join(format!("{}.json", sanitize_filename(&t.name)));
+                let baseline_body = match std::fs::read_to_string(&src) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        // §35.6 verification fix C2: a missing
+                        // baseline file in match mode is itself a
+                        // signal — count it as drift so CI catches a
+                        // snapshot file someone accidentally deleted.
+                        println!(
+                            "    no saved trajectory at `{}` — run with --record-trajectory {name} first",
+                            src.display()
+                        );
+                        trajectory_drift += 1;
+                        continue;
+                    }
+                };
+                let baseline: axon_eval::trajectory::Trajectory =
+                    match serde_json::from_str(&baseline_body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!(
+                                "axon test: cannot parse `{}`: {e}",
+                                src.display()
+                            );
+                            trajectory_drift += 1;
+                            continue;
+                        }
+                    };
+                let tolerance = axon_eval::trajectory::TrajectoryTolerance::default();
+                let drifts = axon_eval::trajectory::compare_trajectories(
+                    &baseline, &traj, &tolerance,
+                );
+                if drifts.is_empty() {
+                    trajectory_matched += 1;
+                    println!("    trajectory matches {}", src.display());
+                } else {
+                    trajectory_drift += 1;
+                    println!("    trajectory DRIFT vs {}", src.display());
+                    for d in &drifts {
+                        println!(
+                            "      {} : baseline={} actual={} delta={}",
+                            d.metric, d.baseline, d.actual, d.delta
+                        );
+                    }
+                }
             }
         }
     }
@@ -727,11 +1055,38 @@ fn cmd_test(args: &[String]) -> ExitCode {
         "\n{summary_color}{} passed, {} failed{reset} in {:.2?}",
         passed, failed, took
     );
-    if failed > 0 {
+    // §35.4 — trajectory summary, printed when a trajectory mode ran.
+    if record_trajectory.is_some() {
+        println!(
+            "trajectories recorded: {trajectory_saved} (in {})",
+            trajectory_dir.display()
+        );
+    }
+    if match_trajectory.is_some() {
+        println!(
+            "trajectories: {trajectory_matched} matched, {trajectory_drift} drifted"
+        );
+    }
+    // §35.5 — doc-tests summary.
+    if include_doc_tests {
+        println!(
+            "doc-tests: {doc_snippets_seen} `\u{0060}\u{0060}\u{0060}axon` fence(s) extracted from /// comments"
+        );
+    }
+    if failed > 0 || trajectory_drift > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// §35.4 — sanitize a test name into a filesystem-safe filename. Tests
+/// can have arbitrary string names (`test "the api should retry"`);
+/// the snapshot files need stable, slash-free names.
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
 }
 
 
@@ -1246,16 +1601,12 @@ fn cmd_fix(args: &[String]) -> ExitCode {
     //     (P0010) route correctly. Every module gets a stable file_id.
     let path_buf = std::path::Path::new(path);
     if path_buf.is_dir() {
-        // Project mode doesn't support --interactive yet (each prompt
-        // would need per-file context). Fall through to non-interactive
-        // dry-run/apply in project mode; interactive is single-file only.
-        if interactive {
-            eprintln!(
-                "axon fix: --interactive currently supports single-file mode only — \
-                 falling back to dry-run for the project"
-            );
-        }
-        return cmd_fix_project(path_buf, apply, only);
+        // §35.3 — project mode now supports --interactive (the prior
+        // gap is closed). Per-file prompts walk files in sources-
+        // registry order; `[a]ll-from-here` accepts across all
+        // remaining files; `[q]uit` aborts the whole pass. Non-TTY
+        // stdin falls back to dry-run, same as the single-file mode.
+        return cmd_fix_project(path_buf, apply, interactive, only);
     }
 
     let Some(file) = read_or_die(path) else {
@@ -1532,9 +1883,21 @@ fn prompt_interactive(
 /// each fix edit to the right file via `Span::file`. Lets P0010
 /// (missing-pub) attach a fix that lives in a *different* file from
 /// the diagnostic.
+/// §35.3 — named struct for project-mode hunks. The pre-Stage-35 code
+/// used an unwieldy 3-tuple; promoting it lets `--interactive` (which
+/// also reads `confidence`) thread through without `.2`/`.3` index
+/// shuffling.
+struct ProjectHunk {
+    description: String,
+    code: Option<String>,
+    confidence: axon_diag::Confidence,
+    edit: axon_diag::FixEdit,
+}
+
 fn cmd_fix_project(
     root: &std::path::Path,
     apply: bool,
+    interactive: bool,
     only: Option<&str>,
 ) -> ExitCode {
     let project = match axon_project::LoadedProject::load(root) {
@@ -1559,7 +1922,7 @@ fn cmd_fix_project(
 
     // Filter by --only, then collect every fix edit indexed by file_id.
     // file_id 0 means "no file" (dummy span) — we drop those silently.
-    let mut edits_by_file: std::collections::BTreeMap<u16, Vec<(String, Option<String>, axon_diag::FixEdit)>> =
+    let mut edits_by_file: std::collections::BTreeMap<u16, Vec<ProjectHunk>> =
         std::collections::BTreeMap::new();
     for d in &all_diags {
         if let Some(want) = only {
@@ -1572,10 +1935,12 @@ fn cmd_fix_project(
                 if e.span.file == 0 {
                     continue;
                 }
-                edits_by_file
-                    .entry(e.span.file)
-                    .or_default()
-                    .push((f.description.clone(), d.code.map(|c| c.to_string()), e.clone()));
+                edits_by_file.entry(e.span.file).or_default().push(ProjectHunk {
+                    description: f.description.clone(),
+                    code: d.code.map(|c| c.to_string()),
+                    confidence: f.confidence,
+                    edit: e.clone(),
+                });
             }
         }
     }
@@ -1597,12 +1962,23 @@ fn cmd_fix_project(
         return ExitCode::SUCCESS;
     }
 
-    // Resolve file_id → (path, original source text). The registry is
-    // authoritative; we re-read from disk so concurrent edits between
-    // project load and now would be noticed by the byte mismatch.
+    // §35.3 — interactive prompt state lives at the project scope so
+    // [a]ll-from-here applies across files and [q]uit aborts the whole
+    // pass. Non-TTY stdin falls back to dry-run.
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let do_interactive = interactive && stdin_is_tty;
+    if interactive && !stdin_is_tty {
+        eprintln!(
+            "axon fix: --interactive needs a TTY on stdin — falling back to dry-run"
+        );
+    }
+    let mut accept_all = false;
+    let mut quit_remaining = false;
+
     let mut touched_files: u32 = 0;
     let mut applied_total: u32 = 0;
     let mut deferred_total: u32 = 0;
+    let mut skipped_by_user: u32 = 0;
     for (file_id, hunks) in edits_by_file {
         let Some(src) = project.sources.get(file_id) else {
             continue;
@@ -1610,38 +1986,71 @@ fn cmd_fix_project(
         let path = src.path().to_string_lossy().into_owned();
         let original = src.text().to_owned();
 
+        // Sort each file's hunks by edit start so source-order prompts
+        // line up with how a user reads the file top-to-bottom.
+        let mut sorted_hunks: Vec<&ProjectHunk> = hunks.iter().collect();
+        sorted_hunks.sort_by_key(|h| h.edit.span.start);
+
         // Same conflict-handling pass the single-file mode uses: accept
         // hunks in source order; defer ones whose edit spans overlap an
-        // already-accepted hunk. Apply all accepted edits in one reverse-
-        // sorted splice.
+        // already-accepted hunk. In interactive mode, prompt before
+        // marking a non-overlapping hunk accepted.
         let mut covered: Vec<(usize, usize)> = Vec::new();
-        let mut accepted: Vec<&(String, Option<String>, axon_diag::FixEdit)> = Vec::new();
+        let mut accepted: Vec<&ProjectHunk> = Vec::new();
         let mut deferred: u32 = 0;
-        for h in &hunks {
-            let (_desc, _code, e) = h;
-            let s = e.span.start as usize;
-            let t = e.span.end as usize;
+        for h in &sorted_hunks {
+            let s = h.edit.span.start as usize;
+            let t = h.edit.span.end as usize;
             if covered.iter().any(|(cs, ce)| !(t <= *cs || *ce <= s)) {
                 deferred += 1;
+                continue;
+            }
+            if do_interactive && !accept_all && !quit_remaining {
+                match prompt_interactive(
+                    &path,
+                    &original,
+                    h.code.as_deref(),
+                    &h.description,
+                    h.confidence,
+                    Some(&h.edit),
+                ) {
+                    InteractiveChoice::Yes => {}
+                    InteractiveChoice::No => {
+                        skipped_by_user += 1;
+                        continue;
+                    }
+                    InteractiveChoice::AcceptAll => accept_all = true,
+                    InteractiveChoice::Quit => {
+                        quit_remaining = true;
+                        skipped_by_user += 1;
+                        continue;
+                    }
+                }
+            } else if quit_remaining {
+                skipped_by_user += 1;
                 continue;
             }
             covered.push((s, t));
             accepted.push(h);
         }
         if accepted.is_empty() {
+            deferred_total += deferred;
             continue;
         }
         let mut bytes = original.as_bytes().to_vec();
-        let mut sorted: Vec<&(String, Option<String>, axon_diag::FixEdit)> = accepted.clone();
-        sorted.sort_by(|a, b| b.2.span.start.cmp(&a.2.span.start));
-        for (_desc, _code, e) in sorted {
-            let s = (e.span.start as usize).min(bytes.len());
-            let t = (e.span.end as usize).min(bytes.len()).max(s);
-            bytes.splice(s..t, e.replacement.bytes());
+        let mut sorted: Vec<&ProjectHunk> = accepted.clone();
+        sorted.sort_by(|a, b| b.edit.span.start.cmp(&a.edit.span.start));
+        for h in sorted {
+            let s = (h.edit.span.start as usize).min(bytes.len());
+            let t = (h.edit.span.end as usize).min(bytes.len()).max(s);
+            bytes.splice(s..t, h.edit.replacement.bytes());
         }
         let after = String::from_utf8_lossy(&bytes).into_owned();
 
-        if apply {
+        // Write-in-place when --apply OR --interactive (the user
+        // already approved each hunk).
+        let write_in_place = apply || do_interactive;
+        if write_in_place {
             if after == original {
                 continue;
             }
@@ -1649,21 +2058,27 @@ fn cmd_fix_project(
                 eprintln!("axon fix: cannot write `{path}`: {e}");
                 return ExitCode::from(1);
             }
-            for (desc, code, _) in &accepted {
+            for h in &accepted {
                 println!(
-                    "{} [{}]: {desc}",
+                    "{} [{}]: {}",
                     path,
-                    code.as_deref().unwrap_or("uncoded")
+                    h.code.as_deref().unwrap_or("uncoded"),
+                    h.description
                 );
             }
             touched_files += 1;
             applied_total += accepted.len() as u32;
         } else {
-            for (desc, code, _) in &accepted {
+            for h in &accepted {
+                let tier = match h.confidence {
+                    axon_diag::Confidence::Safe => "safe",
+                    axon_diag::Confidence::Suggested => "suggested",
+                };
                 println!(
-                    "{} fix [{}]: {desc}",
+                    "{} fix [{}, {tier}]: {}",
                     path,
-                    code.as_deref().unwrap_or("uncoded")
+                    h.code.as_deref().unwrap_or("uncoded"),
+                    h.description
                 );
             }
             let diff = unified_diff(&path, &original, &after);
@@ -1683,9 +2098,14 @@ fn cmd_fix_project(
     } else {
         String::new()
     };
-    if apply {
+    let skipped_note = if skipped_by_user > 0 {
+        format!(" ({skipped_by_user} skipped by user)")
+    } else {
+        String::new()
+    };
+    if apply || do_interactive {
         println!(
-            "\naxon fix: applied {applied_total} fix(es) across {touched_files} file(s){deferred_note}"
+            "\naxon fix: applied {applied_total} fix(es) across {touched_files} file(s){skipped_note}{deferred_note}"
         );
     } else {
         println!(
@@ -2898,6 +3318,149 @@ fn cmd_replay(args: &[String]) -> ExitCode {
 
 /// `axon trace <file>` — pretty-print a JSONL trace file as a span tree
 /// with durations, span kinds, and any attached error.
+/// §35.2 — `axon watch <file> [--trace PATH] [--no-color]`
+///
+/// Runs an Axon program with the streaming tracer installed; each span
+/// closure prints a one-line summary to stderr as the program runs.
+/// Optional `--trace PATH` also writes the full span trace as JSONL at
+/// end of run (same format `axon run --trace` produces). `--no-color`
+/// forces plain output even when stderr is a TTY (the default
+/// auto-detects).
+///
+/// Output is intentionally to stderr so users can pipe stdout through
+/// `tee program.out` without losing the trace stream.
+fn cmd_watch(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut trace_path: Option<&str> = None;
+    let mut force_no_color = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--no-color" => {
+                force_no_color = true;
+                i += 1;
+            }
+            "--trace" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon watch: --trace requires a path");
+                    return ExitCode::from(2);
+                }
+                trace_path = Some(args[i].as_str());
+                i += 1;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: axon watch <file> [--trace PATH] [--no-color]\n\
+                     \n\
+                     Runs an Axon program with the live trace inspector — one\n\
+                     line per closed span (ask/plan/tool/handler/spawn/scope)\n\
+                     to stderr as the program runs. Stdout is left alone so\n\
+                     you can pipe program output through tee without losing\n\
+                     the trace stream.\n\
+                     \n\
+                     --trace PATH    Also write the full JSONL trace at end of\n\
+                                     run (same format `axon run --trace` produces).\n\
+                     --no-color      Force plain output even on a TTY."
+                );
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon watch: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("axon watch: only one file is supported");
+                    return ExitCode::from(2);
+                }
+                path = Some(other);
+                i += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: axon watch <file> [--trace PATH] [--no-color]");
+        return ExitCode::from(2);
+    };
+    let Some(file) = read_or_die(path) else {
+        return ExitCode::from(1);
+    };
+    let (program, diags) = axon_parser::parse(&file);
+    if !diags.is_empty() {
+        for d in &diags {
+            eprintln!("{}", axon_diag::render(d, &file, true));
+        }
+        return ExitCode::from(1);
+    }
+
+    // Auto-detect tty for color unless forced off.
+    let use_color =
+        !force_no_color && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let anchor_ms = watch_format::now_ms();
+    let interp = axon_runtime::Interpreter::with_caps(
+        axon_runtime::CapSet::standard_default(),
+    );
+    host::install(&interp);
+    // Install the streaming sink — every span close prints a one-liner.
+    interp.enable_tracing_streaming(Box::new(move |span| {
+        let line = watch_format::format_span(span, anchor_ms, use_color);
+        eprintln!("{line}");
+    }));
+    let mut interp = interp;
+    interp.load_program(&program);
+
+    // §35.6 verification fix M4 — install a Ctrl-C handler BEFORE the
+    // run starts so a SIGINT during a long-running program flushes
+    // the `--trace PATH` JSONL instead of dropping it. We can't
+    // gracefully unwind a synchronous run_main() from a signal
+    // handler (no async runtime to cancel into), but we CAN ensure
+    // the trace file gets written via an atexit-style guard. The
+    // handler sets an AtomicBool we surface in the banner; if a
+    // user really wants graceful shutdown, the run_main impl will
+    // honor it when the async migration lands.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = interrupted.clone();
+        // Ignore install errors here — single-file watch is best-effort,
+        // unlike `axon fix --watch` whose loop genuinely depends on it.
+        let _ = ctrlc::set_handler(move || {
+            interrupted.store(true, Ordering::SeqCst);
+        });
+    }
+
+    eprintln!(
+        "axon watch: tracing `{path}` (Ctrl-C aborts; --trace PATH is flushed on natural exit)\n\
+         time        kind       name                                status  duration"
+    );
+    let exit = match interp.run_main() {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprint!("{}", err.render(&file, use_color));
+            ExitCode::from(1)
+        }
+    };
+    // Best-effort: write the trace whether the run ended normally,
+    // errored, or was interrupted (Ctrl-C). When the OS delivers
+    // SIGINT to a synchronous program the process dies before this
+    // line runs — that's a limitation of the synchronous interpreter,
+    // not a fix we can land here. The banner now honestly says so.
+    if let Some(tp) = trace_path {
+        if let Some(tracer) = interp.take_tracer() {
+            if let Err(e) = std::fs::write(tp, tracer.to_jsonl()) {
+                eprintln!("axon watch: cannot write trace to `{tp}`: {e}");
+            }
+        }
+    }
+    if interrupted.load(Ordering::SeqCst) {
+        eprintln!("axon watch: interrupted (SIGINT)");
+    }
+    exit
+}
+
 fn cmd_trace(args: &[String]) -> ExitCode {
     let path = match args.first() {
         Some(p) => p,

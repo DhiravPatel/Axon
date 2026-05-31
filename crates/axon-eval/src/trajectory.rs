@@ -183,6 +183,193 @@ pub fn grounded_in_observations(t: &Trajectory) -> f64 {
     grounded as f64 / claims.len() as f64
 }
 
+// ---------------------------------------------------------------------------
+// §35.4 — snapshot testing support: build Trajectory from a Recording,
+// compare two Trajectories under per-metric tolerances.
+// ---------------------------------------------------------------------------
+
+/// Per-metric tolerance bounds for `compare_trajectories`. Fractional
+/// metrics (`grounded_in_observations`, `tool_accuracy`) compare with
+/// absolute delta ≤ `*_tolerance`; step count compares with a
+/// percentage tolerance (±`step_pct` of the baseline). The booleans
+/// (e.g. `recovered_from_errors`) always demand exact equality.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrajectoryTolerance {
+    pub step_pct: f64,
+    pub grounded_tolerance: f64,
+    pub tool_accuracy_tolerance: f64,
+}
+
+impl Default for TrajectoryTolerance {
+    fn default() -> Self {
+        Self {
+            step_pct: 0.20,
+            grounded_tolerance: 0.10,
+            tool_accuracy_tolerance: 0.10,
+        }
+    }
+}
+
+/// One drifted metric, returned in the diff list when a Trajectory
+/// match fails. `metric` is a stable string (`"steps"`, `"grounded"`,
+/// `"tool_accuracy"`, `"recovered"`, `"allowed_tools"`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetricDrift {
+    pub metric: String,
+    pub baseline: String,
+    pub actual: String,
+    pub delta: String,
+}
+
+/// Result of comparing two trajectories. Empty `Vec<MetricDrift>` ⇒
+/// "passes the snapshot."
+pub fn compare_trajectories(
+    baseline: &Trajectory,
+    actual: &Trajectory,
+    tolerance: &TrajectoryTolerance,
+) -> Vec<MetricDrift> {
+    let mut diffs = Vec::new();
+
+    // Step count: percentage tolerance.
+    let base_steps = baseline.steps.len() as f64;
+    let actual_steps = actual.steps.len() as f64;
+    if base_steps > 0.0 {
+        let drift = (actual_steps - base_steps).abs() / base_steps;
+        if drift > tolerance.step_pct {
+            diffs.push(MetricDrift {
+                metric: "steps".into(),
+                baseline: base_steps.to_string(),
+                actual: actual_steps.to_string(),
+                delta: format!("{:.0}%", drift * 100.0),
+            });
+        }
+    } else if actual_steps > 0.0 {
+        diffs.push(MetricDrift {
+            metric: "steps".into(),
+            baseline: "0".into(),
+            actual: actual_steps.to_string(),
+            delta: "added steps".into(),
+        });
+    }
+
+    // grounded_in_observations: absolute tolerance.
+    let base_g = grounded_in_observations(baseline);
+    let actual_g = grounded_in_observations(actual);
+    let g_delta = (actual_g - base_g).abs();
+    if g_delta > tolerance.grounded_tolerance {
+        diffs.push(MetricDrift {
+            metric: "grounded".into(),
+            baseline: format!("{base_g:.3}"),
+            actual: format!("{actual_g:.3}"),
+            delta: format!("{g_delta:.3}"),
+        });
+    }
+
+    // tool_accuracy: absolute tolerance.
+    let base_t = tool_accuracy(baseline);
+    let actual_t = tool_accuracy(actual);
+    let t_delta = (actual_t - base_t).abs();
+    if t_delta > tolerance.tool_accuracy_tolerance {
+        diffs.push(MetricDrift {
+            metric: "tool_accuracy".into(),
+            baseline: format!("{base_t:.3}"),
+            actual: format!("{actual_t:.3}"),
+            delta: format!("{t_delta:.3}"),
+        });
+    }
+
+    // recovered_from_errors: exact equality.
+    let base_r = recovered_from_errors(baseline);
+    let actual_r = recovered_from_errors(actual);
+    if base_r != actual_r {
+        diffs.push(MetricDrift {
+            metric: "recovered".into(),
+            baseline: base_r.to_string(),
+            actual: actual_r.to_string(),
+            delta: "flipped".into(),
+        });
+    }
+
+    // allowed_tools: set equality. Used-tools-only matters — if the
+    // actual run used a tool the baseline didn't, that's drift.
+    let base_tools: std::collections::BTreeSet<&str> = baseline
+        .steps
+        .iter()
+        .filter_map(|s| s.tool_call.as_ref().map(|t| t.name.as_str()))
+        .collect();
+    let actual_tools: std::collections::BTreeSet<&str> = actual
+        .steps
+        .iter()
+        .filter_map(|s| s.tool_call.as_ref().map(|t| t.name.as_str()))
+        .collect();
+    if base_tools != actual_tools {
+        let only_actual: Vec<&&str> = actual_tools.difference(&base_tools).collect();
+        let only_base: Vec<&&str> = base_tools.difference(&actual_tools).collect();
+        diffs.push(MetricDrift {
+            metric: "allowed_tools".into(),
+            baseline: format!("{:?}", base_tools),
+            actual: format!("{:?}", actual_tools),
+            delta: format!("only_actual={only_actual:?} only_base={only_base:?}"),
+        });
+    }
+
+    diffs
+}
+
+/// Build a Trajectory from a runtime `Recording`'s `ModelCall` events.
+/// Each ModelCall becomes one TrajectoryStep with the model's reply
+/// text as `observation`. Tool calls inside the model's reply (the
+/// `ToolUse` blocks in the response) surface as `TrajectoryStep.tool_call`.
+/// The final answer is the last ModelCall's content.
+///
+/// This is the bridge that lets `axon test --record-trajectory` capture
+/// a snapshot of an agent's behavior without needing a separate
+/// instrumentation pass — the existing record/replay infrastructure is
+/// the source of truth.
+pub fn trajectory_from_events(
+    task: impl Into<String>,
+    events: &[TrajectoryEvent],
+) -> Trajectory {
+    let mut steps = Vec::new();
+    let mut answer = String::new();
+    let mut allowed_tools_set: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for (i, ev) in events.iter().enumerate() {
+        let TrajectoryEvent::ModelCall { content, tool_calls } = ev;
+        let primary_tool = tool_calls.first().cloned();
+        for tc in tool_calls {
+            allowed_tools_set.insert(tc.name.clone());
+        }
+        steps.push(TrajectoryStep {
+            index: i,
+            thought: String::new(),
+            tool_call: primary_tool,
+            observation: content.clone(),
+            error: None,
+        });
+        answer.clone_from(content);
+    }
+    Trajectory {
+        task: task.into(),
+        steps,
+        answer,
+        allowed_tools: allowed_tools_set.into_iter().collect(),
+        forbidden_tools: Vec::new(),
+        optimal_steps: 0,
+    }
+}
+
+/// Caller-facing event view used to feed `trajectory_from_events`.
+/// The runtime's `Recording` lives in axon-runtime; converting at the
+/// boundary keeps axon-eval cycle-free.
+#[derive(Clone, Debug)]
+pub enum TrajectoryEvent {
+    ModelCall {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

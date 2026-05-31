@@ -1,0 +1,63 @@
+//! examples/stage35_agent_slots.ax — Stage 35.1 demo.
+//!
+//! Native agent declaration slots: `uses_tools`, `memory`, `policy`,
+//! `strategy`. The four slots desugar at spawn time into instance
+//! fields the handler can reference as `self.tools` / `self.memory` /
+//! `self.policy` / `self.strategy`. No new syntax in the parser — the
+//! existing `key: value` Setting form is reused; the runtime
+//! recognizes the four well-known keys.
+//!
+//! v0 cuts (intentional, documented):
+//!   * `uses_tools` is typed `List<dyn>` at the tyck layer, not
+//!     `List<Tool>`. Tools work because runtime value identity carries
+//!     through; tighter typing lands when Tool is a first-class type
+//!     on the surface.
+//!   * `policy: support_policy` and `strategy: "ReAct"` are BOTH
+//!     stored as `String` at runtime. The identifier-shaped form does
+//!     NOT resolve to a `policy support_policy { ... }` block — it's
+//!     just the ident's text. `policy_block_check` consumes a string
+//!     name, so this matches the consumer; future stages will validate
+//!     that the named policy actually exists.
+//!   * Precedence (§35.6 verification fix C1): if the user declares
+//!     both `uses_tools: [...]` AND `state tools = ...`, the user
+//!     state field wins.
+
+tool search(q: String) -> String uses { Net } {
+    "[search] no live index yet — query was: {q}"
+}
+
+tool refund(amount: Int) -> String uses { Tool } {
+    "[refund] queued refund for ${amount}"
+}
+
+agent Support(m: Model) {
+    uses_tools: [search, refund],
+    memory: local_memory(),
+    // String-not-resolved: see header note.
+    policy: "support_policy",
+    strategy: "ReAct",
+
+    on triage(ticket: String) -> String uses { LLM, Net, Memory, Tool } {
+        // Slot values are reachable via `self.<runtime_name>` — the
+        // canonical names are `tools`, `memory`, `policy`, `strategy`.
+        let strategy_name = self.strategy
+        let policy_name = self.policy
+        let tool_count = list_len(self.tools)
+        let mem = self.memory
+        mem.store("ticket: " + ticket)
+        let recalled = mem.recall(ticket)
+        (
+            "policy=" + policy_name +
+                " strategy=" + strategy_name +
+                " tools=" + str(tool_count) +
+                " recalled=" + str(list_len(recalled))
+        )
+    }
+}
+
+fn main() uses { Spawn, LLM, Net, Memory, Tool, Console } {
+    let m = mock_model("fixed", "ok")
+    let s = spawn Support(m = m)
+    print(s.triage("crash on iOS 17"))
+    print(s.triage("refund for double charge"))
+}

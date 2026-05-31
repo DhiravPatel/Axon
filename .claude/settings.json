@@ -48,10 +48,19 @@
       "Bash(tee /tmp/s34_pass2.log)",
       "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after verify-fixes:\", p, \"passed,\", f, \"failed\" }')",
       "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"final:\", p, \"passed,\", f, \"failed\" }')",
-      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after all fixes:\", p, \"passed,\", f, \"failed\" }')"
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"after all fixes:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(./target/debug/axon watch *)",
+      "Bash(./target/debug/axon test *)",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"stage35:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(grep -n \"Some\\(Vec::new\\(\\)\\)\\\\|None,\\\\s*$\\\\|effects: None\" \"/Users/dhiravpatel/Documents/Project 2/Axon/crates/axon-cli/src/main.rs\")",
+      "Bash(\"/Users/dhiravpatel/Documents/Project 2/Axon/target/debug/axon\" test --doc .)",
+      "Bash(grep -n \"Closure::new\\\\|attenuation\\\\|None.*\\\\$35\\\\|caps:.*None\" \"/Users/dhiravpatel/Documents/Project 2/Axon/crates/axon-runtime/src/value.rs\")",
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"final stage35:\", p, \"passed,\", f, \"failed\" }')"
     ],
     "additionalDirectories": [
-      "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec"
+      "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec",
+      "/tmp/axon_repro",
+      "/private/tmp/axon_repro"
     ]
   }
 }

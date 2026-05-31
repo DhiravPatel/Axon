@@ -501,6 +501,41 @@ impl<'a> Checker<'a> {
                 });
             }
         }
+        // §35.1 — Native agent declaration slots. The parser already
+        // accepts `uses_tools: [...]`, `memory: ...`, `policy: ident`,
+        // `strategy: ...` as generic `Setting` members today; the
+        // runtime evaluates the four well-known ones at spawn time and
+        // exposes them on the actor's state as `tools` / `memory` /
+        // `policy` / `strategy`. To make `self.tools` etc. type-check
+        // inside handler bodies, surface the four as virtual state
+        // fields here — typed `[dyn]`, `Memory`, `String`, `String`
+        // respectively. This is intentionally permissive (no per-slot
+        // type validation) so user code patterns like the test
+        // fixture `tools: List<dyn>` stay legal; tighter typing lands
+        // when the slot syntax becomes a first-class AST variant.
+        for m in members {
+            if let AgentMember::Setting { key, .. } = m {
+                let virtual_field = match key.name.as_str() {
+                    "uses_tools" => Some(("tools", Ty::List(Box::new(Ty::Dyn)))),
+                    "memory" => Some(("memory", Ty::Memory)),
+                    "policy" => Some(("policy", Ty::String)),
+                    "strategy" => Some(("strategy", Ty::String)),
+                    _ => None,
+                };
+                if let Some((name, ty)) = virtual_field {
+                    // Don't double-register if the user happens to have
+                    // a `state tools: ...` field of the same name.
+                    if !out.iter().any(|f| f.name == name) {
+                        out.push(FieldSig {
+                            name: name.to_string(),
+                            ty,
+                            has_default: true,
+                            refinements: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
         out
     }
 
