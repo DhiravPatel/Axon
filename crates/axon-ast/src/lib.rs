@@ -727,6 +727,14 @@ pub enum ExprKind {
         body: Block,
     },
     Select(Vec<SelectArm>),
+    /// `parallel { ask m1 { ... }, ask m2 { ... }, ... }` — Stage 36.
+    ///
+    /// Each arm is restricted to a single `ask` expression (the only shape
+    /// that does not require `Interpreter: Send`). The runtime dispatches
+    /// all arms concurrently and joins in input order. Stage 37 will lift
+    /// the arm restriction. Stage 36's `eval_parallel` enforces the shape
+    /// with a clear error message naming the limitation.
+    Parallel(Vec<Expr>),
     Ask {
         target: Expr,
         slots: Vec<PromptSlot>,

@@ -189,6 +189,7 @@ fn check_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
             check_block(body, diags);
         }
         ExprKind::Select(_) => diags.push(unsupported("`select`", e.span)),
+        ExprKind::Parallel(_) => diags.push(unsupported("`parallel`", e.span)),
         ExprKind::Ask { .. }
         | ExprKind::Generate { .. }
         | ExprKind::Plan { .. }

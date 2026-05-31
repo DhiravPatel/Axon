@@ -15,6 +15,7 @@
 //!     either a `Value` or a `RuntimeError`.
 
 mod actor;
+pub mod async_rt;
 pub mod attrs;
 mod budget;
 pub mod builtin;
@@ -25,6 +26,7 @@ mod error;
 mod eval;
 pub mod migrate;
 pub mod otlp;
+mod parallel;
 pub mod prompt_version;
 pub mod reasoning;
 mod record;

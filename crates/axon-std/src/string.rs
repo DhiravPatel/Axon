@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use axon_runtime::{NativeFn, Value};
 
-pub const COUNT: usize = 16;
+pub const COUNT: usize = 18;
 
 pub(crate) fn register(reg: &mut dyn FnMut(&'static str, NativeFn)) {
     reg("str_upper", n("str_upper", 1, Some(1), str_upper));
@@ -16,6 +16,10 @@ pub(crate) fn register(reg: &mut dyn FnMut(&'static str, NativeFn)) {
     reg("str_trim_start", n("str_trim_start", 1, Some(1), str_trim_start));
     reg("str_trim_end", n("str_trim_end", 1, Some(1), str_trim_end));
     reg("str_split", n("str_split", 2, Some(2), str_split));
+    // §36.B.2 sugar — these two reduce the dogfood-agent's hand-rolled
+    // `split_pipe` / `split_lines` helpers (~30 lines) to one call each.
+    reg("str_split_lines", n("str_split_lines", 1, Some(1), str_split_lines));
+    reg("str_split_once", n("str_split_once", 2, Some(2), str_split_once));
     reg("str_join", n("str_join", 2, Some(2), str_join));
     reg("str_contains", n("str_contains", 2, Some(2), str_contains));
     reg("str_starts_with", n("str_starts_with", 2, Some(2), str_starts_with));
@@ -89,6 +93,37 @@ fn str_split(args: &[Value]) -> Result<Value, String> {
         s.split(sep.as_str())
             .map(|p| Value::String(Rc::new(p.to_string())))
             .collect()
+    };
+    Ok(Value::List(Rc::new(std::cell::RefCell::new(parts))))
+}
+
+/// `str_split_lines(s)` — split on every LF, returning one element per line.
+/// Trailing newline does NOT produce a trailing empty string (matches Rust's
+/// `lines()`). CR before LF is included with the LF; this matches BufRead::lines.
+fn str_split_lines(args: &[Value]) -> Result<Value, String> {
+    let s = s_arg(args, 0, "str_split_lines")?;
+    let parts: Vec<Value> = s
+        .lines()
+        .map(|p| Value::String(Rc::new(p.to_string())))
+        .collect();
+    Ok(Value::List(Rc::new(std::cell::RefCell::new(parts))))
+}
+
+/// `str_split_once(s, sep)` — split at the FIRST occurrence of `sep`,
+/// returning `[head, tail]`. Returns the original `[s]` (single-element)
+/// when `sep` doesn't appear. Useful for parsing `key=value`, `path:line`.
+fn str_split_once(args: &[Value]) -> Result<Value, String> {
+    let s = s_arg(args, 0, "str_split_once")?;
+    let sep = s_arg(args, 1, "str_split_once")?;
+    if sep.is_empty() {
+        return Err("str_split_once: separator must not be empty".into());
+    }
+    let parts: Vec<Value> = match s.split_once(sep.as_str()) {
+        Some((head, tail)) => vec![
+            Value::String(Rc::new(head.to_string())),
+            Value::String(Rc::new(tail.to_string())),
+        ],
+        None => vec![Value::String(s.clone())],
     };
     Ok(Value::List(Rc::new(std::cell::RefCell::new(parts))))
 }

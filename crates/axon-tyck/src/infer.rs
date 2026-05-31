@@ -760,6 +760,20 @@ impl<'a> Checker<'a> {
                 Ty::Unit
             }
             ExprKind::Select(_) => Ty::Dyn,
+            ExprKind::Parallel(arms) => {
+                // Stage 36: each arm is a single ask expression. We walk
+                // every arm so any inner type errors surface, and we
+                // declare the LLM + Net effects on behalf of the block so
+                // the handler's `uses { ... }` row covers them. Precise
+                // typing (List<T> where T is the join of arm result types)
+                // is Stage 37 — for now the block returns Ty::Dyn.
+                for a in arms {
+                    let _ = self.infer(a, scope, params, used);
+                }
+                self.use_effect(used, "LLM");
+                self.use_effect(used, "Net");
+                Ty::Dyn
+            }
             ExprKind::Ask { target, slots } => {
                 let _t = self.infer(target, scope, params, used);
                 for s in slots {

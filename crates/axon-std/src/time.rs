@@ -6,11 +6,17 @@
 
 use axon_runtime::{NativeFn, Value};
 
-pub const COUNT: usize = 9;
+pub const COUNT: usize = 12;
 
 pub(crate) fn register(reg: &mut dyn FnMut(&'static str, NativeFn)) {
     reg("dur_seconds", n("dur_seconds", 1, Some(1), dur_seconds));
     reg("dur_millis", n("dur_millis", 1, Some(1), dur_millis));
+    // §36.B.2 — `.as_ms()` / `.as_ns()` shaped accessors. The bench/eval
+    // reports the async-eval work produces want sub-millisecond precision;
+    // `dur_millis` rounds; these expose the full range.
+    reg("dur_micros", n("dur_micros", 1, Some(1), dur_micros));
+    reg("dur_nanos", n("dur_nanos", 1, Some(1), dur_nanos));
+    reg("dur_seconds_f64", n("dur_seconds_f64", 1, Some(1), dur_seconds_f64));
     reg("dur_from_seconds", n("dur_from_seconds", 1, Some(1), dur_from_seconds));
     reg("dur_from_millis", n("dur_from_millis", 1, Some(1), dur_from_millis));
     reg("date_year", n("date_year", 1, Some(1), date_year));
@@ -50,6 +56,36 @@ fn dur_millis(args: &[Value]) -> Result<Value, String> {
         Value::Duration(ns) => Ok(Value::Int(*ns / 1_000_000)),
         other => Err(format!(
             "dur_millis: expected Duration, got `{}`",
+            other.type_name()
+        )),
+    }
+}
+
+fn dur_micros(args: &[Value]) -> Result<Value, String> {
+    match &args[0] {
+        Value::Duration(ns) => Ok(Value::Int(*ns / 1_000)),
+        other => Err(format!(
+            "dur_micros: expected Duration, got `{}`",
+            other.type_name()
+        )),
+    }
+}
+
+fn dur_nanos(args: &[Value]) -> Result<Value, String> {
+    match &args[0] {
+        Value::Duration(ns) => Ok(Value::Int(*ns)),
+        other => Err(format!(
+            "dur_nanos: expected Duration, got `{}`",
+            other.type_name()
+        )),
+    }
+}
+
+fn dur_seconds_f64(args: &[Value]) -> Result<Value, String> {
+    match &args[0] {
+        Value::Duration(ns) => Ok(Value::Float(*ns as f64 / 1_000_000_000.0)),
+        other => Err(format!(
+            "dur_seconds_f64: expected Duration, got `{}`",
             other.type_name()
         )),
     }

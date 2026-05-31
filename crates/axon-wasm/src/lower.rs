@@ -889,6 +889,7 @@ fn discriminant_name(k: &ExprKind) -> &'static str {
         ExprKind::For { .. } => "For",
         ExprKind::While { .. } => "While",
         ExprKind::Select(_) => "Select",
+        ExprKind::Parallel(_) => "Parallel",
         ExprKind::Ask { .. } => "Ask",
         ExprKind::Generate { .. } => "Generate",
         ExprKind::Plan { .. } => "Plan",

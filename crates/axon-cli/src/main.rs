@@ -598,9 +598,15 @@ fn cmd_test(args: &[String]) -> ExitCode {
     // §35.4 — collect positionals during the flag-parsing pass so the
     // path detector below doesn't accidentally grab a flag's value.
     let mut positionals: Vec<&str> = Vec::new();
+    // §36.A.2 — see cmd_run; same escape hatch.
+    let mut no_async = std::env::var("AXON_NO_ASYNC").is_ok();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--no-async" => {
+                no_async = true;
+                i += 1;
+            }
             "--features" => {
                 i += 1;
                 if i >= args.len() {
@@ -879,11 +885,23 @@ fn cmd_test(args: &[String]) -> ExitCode {
             // test impossible to write.
             None,
         );
-        let result = interp.call_value(
-            &axon_runtime::Value::Fn(std::rc::Rc::new(closure)),
-            &[],
-            t.span,
-        );
+        // Stage 36: route through the async-eval seam by default. The
+        // body of each test executes inside `block_on`, so `parallel { }`
+        // and `flow_parallel_asks` inside test bodies share the singleton
+        // runtime instead of crashing with nested-block_on.
+        let result = if no_async {
+            interp.call_value(
+                &axon_runtime::Value::Fn(std::rc::Rc::new(closure)),
+                &[],
+                t.span,
+            )
+        } else {
+            interp.call_value_async(
+                &axon_runtime::Value::Fn(std::rc::Rc::new(closure)),
+                &[],
+                t.span,
+            )
+        };
         let test_failed = match result {
             Ok(_) => {
                 println!("  ok   `{}`", t.name);
@@ -1113,12 +1131,21 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut replay_path: Option<String> = None;
     let mut features: Vec<String> = Vec::new();
     let mut enable_default_features = true;
+    // Stage 36: route through the async-eval boundary by default. The env
+    // var `AXON_NO_ASYNC=1` and CLI flag `--no-async` bypass `run_async`
+    // and call `run_main` directly — escape hatch for perf A/B and a
+    // kill-switch if Stage 36 turns out to regress something.
+    let mut no_async = std::env::var("AXON_NO_ASYNC").is_ok();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
             "--isolated" => {
                 isolated = true;
+                i += 1;
+            }
+            "--no-async" => {
+                no_async = true;
                 i += 1;
             }
             "--dry-run" => {
@@ -1336,7 +1363,17 @@ fn cmd_run(args: &[String]) -> ExitCode {
         host::register_policies(&program);
         host::register_schemas(&program);
         let start = std::time::Instant::now();
-        let exit = match interp.run_main() {
+        // Stage 36: route through the async-eval seam by default. The
+        // `run_async` wrapper enters the process-wide tokio runtime via
+        // `block_on` so nested `parallel { }` blocks and `flow_parallel_asks`
+        // can spawn_blocking without starting a second runtime. The
+        // `--no-async` flag bypasses the seam for perf A/B + as a kill-switch.
+        let run_result = if no_async {
+            interp.run_main()
+        } else {
+            interp.run_async()
+        };
+        let exit = match run_result {
             Ok(_) => ExitCode::SUCCESS,
             Err(err) => {
                 let use_color = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -3462,10 +3499,21 @@ fn cmd_watch(args: &[String]) -> ExitCode {
 }
 
 fn cmd_trace(args: &[String]) -> ExitCode {
+    // §36.B.4 — `axon trace promote <recording.json> --to-suite <path>` builds
+    // a regression test from a recording so production failures become
+    // standing tests without manual JSON-editing. Dispatched here so the
+    // existing `axon trace <jsonl>` pretty-printer is the default.
+    if args.first().map(|s| s.as_str()) == Some("promote") {
+        return cmd_trace_promote(&args[1..]);
+    }
     let path = match args.first() {
         Some(p) => p,
         None => {
-            eprintln!("usage: axon trace <file.jsonl>");
+            eprintln!(
+                "usage: axon trace <file.jsonl>            # pretty-print a JSONL trace\n\
+                 usage: axon trace promote <rec.json> --to-suite <path> [--name N]\n\
+                                                         # append a regression test from a recording"
+            );
             return ExitCode::from(2);
         }
     };
@@ -3543,6 +3591,248 @@ fn cmd_trace(args: &[String]) -> ExitCode {
     println!("trace: {} span(s), max span duration {total_ms}ms", spans.len());
     print_subtree(&spans, &by_parent, -1, 0);
     ExitCode::SUCCESS
+}
+
+/// `axon trace promote <recording.json> --to-suite <path> [--name N] [--assert-contains S]`
+/// — synthesize a regression test from a recording and append it to the
+/// named suite file (creates the file if missing). The §36.B.4 DX win:
+/// production failures become standing tests in one command.
+///
+/// The synthesized test:
+///   - Uses `mock_model("fixed", "<recorded-content>")` to reproduce the
+///     last assistant turn from the recording deterministically.
+///   - Asserts `str_contains(out, "<recorded-content>")` by default, or a
+///     user-supplied substring with `--assert-contains`.
+///   - Carries a header comment naming the source recording + the promote
+///     date so future readers can trace it back.
+///
+/// This is a bounded slice: trajectory-shaped assertions and `--from-watch`
+/// span replay are Stage 37.
+fn cmd_trace_promote(args: &[String]) -> ExitCode {
+    let mut rec_path: Option<&str> = None;
+    let mut to_suite: Option<&str> = None;
+    let mut name: Option<&str> = None;
+    let mut assert_contains: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--to-suite" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon trace promote: --to-suite requires a path");
+                    return ExitCode::from(2);
+                }
+                to_suite = Some(args[i].as_str());
+                i += 1;
+            }
+            "--name" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon trace promote: --name requires an identifier");
+                    return ExitCode::from(2);
+                }
+                name = Some(args[i].as_str());
+                i += 1;
+            }
+            "--assert-contains" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("axon trace promote: --assert-contains requires a substring");
+                    return ExitCode::from(2);
+                }
+                assert_contains = Some(args[i].as_str());
+                i += 1;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: axon trace promote <recording.json> --to-suite <suite.ax> \\\n\
+                     \x20                          [--name <test-id>] [--assert-contains <substr>]\n\
+                     \n\
+                     Reads a recording (produced by `axon run --record <path>`), extracts the\n\
+                     final assistant response, and appends a regression test to <suite.ax> that\n\
+                     reproduces it via mock_model. If --name is omitted, a name is auto-derived\n\
+                     from the recording filename + a short hash. The test asserts the recorded\n\
+                     content appears in the output unless --assert-contains overrides."
+                );
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("axon trace promote: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if rec_path.is_some() {
+                    eprintln!("axon trace promote: more than one recording path given");
+                    return ExitCode::from(2);
+                }
+                rec_path = Some(a);
+                i += 1;
+            }
+        }
+    }
+    let Some(rp) = rec_path else {
+        eprintln!("axon trace promote: missing recording path (got no positional arg)");
+        return ExitCode::from(2);
+    };
+    let Some(to_suite) = to_suite else {
+        eprintln!("axon trace promote: --to-suite <suite.ax> is required");
+        return ExitCode::from(2);
+    };
+    let raw = match std::fs::read_to_string(rp) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("axon trace promote: cannot read recording `{rp}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("axon trace promote: recording is not valid JSON: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Extract the LAST model_call event's content. The convention is: the
+    // recorded final response is the canonical "what we expected" for a
+    // replay-style test. Skip non-ModelCall events (TimeNow/RandomInt).
+    let events = parsed
+        .get("events")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let last_model = events.iter().rev().find(|ev| {
+        ev.get("kind").and_then(|k| k.as_str()) == Some("model_call")
+    });
+    let Some(last) = last_model else {
+        eprintln!(
+            "axon trace promote: recording `{rp}` has no `model_call` events — \
+             nothing to pin as the canonical response"
+        );
+        return ExitCode::from(1);
+    };
+    let content = last
+        .get("response")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if content.is_empty() {
+        eprintln!(
+            "axon trace promote: last model_call in `{rp}` has empty content; \
+             pinning an empty response would not be a useful regression test"
+        );
+        return ExitCode::from(1);
+    }
+    let provider = last
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .unwrap_or("anthropic");
+
+    // Auto-name from the recording's filename + a short content hash so
+    // multiple promotes of similar runs don't collide.
+    let auto_name = {
+        let stem = std::path::Path::new(rp)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rec");
+        // §36.6 verification fix L1 — hash filename + content so two
+        // recordings with identical responses but different sources don't
+        // collide on the auto-derived test name.
+        let sha8 = short_hash(&format!("{stem}:{content}"));
+        format!("promoted_{stem}_{sha8}")
+    };
+    let test_name = name.unwrap_or(&auto_name);
+    if !test_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        eprintln!(
+            "axon trace promote: test name `{test_name}` must be ASCII alphanumeric \
+             plus underscore (it becomes part of an Axon identifier)"
+        );
+        return ExitCode::from(2);
+    }
+    let expected_substr = assert_contains.unwrap_or(content);
+    let escaped_content = escape_axon_string(content);
+    let escaped_substr = escape_axon_string(expected_substr);
+    let header = format!(
+        "\n// ----- §36.B.4 PROMOTED from `{}` -----\n",
+        rp.replace('`', "")
+    );
+    let body = format!(
+        "test \"{test_name}\" {{\n\
+         \x20   // Pinned response from `{rp}` (provider: `{provider}`).\n\
+         \x20   let m = mock_model(\"fixed\", \"{escaped_content}\")\n\
+         \x20   let out = ask m {{ user: \"promote-replay\" }}\n\
+         \x20   assert(str_contains(out, \"{escaped_substr}\"), \
+         \"promoted test `{test_name}` regressed — expected response to contain `{escaped_substr}`\")\n\
+         }}\n"
+    );
+    // Append-or-create. Use OpenOptions::append so existing tests are
+    // preserved (no rewrite, no diff hazard).
+    use std::io::Write as _;
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(to_suite)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("axon trace promote: cannot open suite `{to_suite}`: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = f.write_all(header.as_bytes()).and_then(|_| f.write_all(body.as_bytes())) {
+        eprintln!("axon trace promote: write to `{to_suite}` failed: {e}");
+        return ExitCode::from(1);
+    }
+    println!("axon trace promote: appended `{test_name}` to `{to_suite}`");
+    ExitCode::SUCCESS
+}
+
+/// Tiny non-crypto hash for naming promoted tests — FNV-1a 32-bit, 8 hex chars.
+fn short_hash(s: &str) -> String {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
+}
+
+/// Escape a string for safe embedding in an Axon `"..."` literal.
+///
+/// §36.6 verification fix S3 — recordings come from external LLM responses
+/// that get baked into developer-readable source. Escape:
+///   - Standard string-literal escapes (backslash, quote, LF, CR, tab).
+///   - All control chars (< 0x20).
+///   - Bidi direction overrides (U+202A..202E, U+2066..2069) — these can
+///     hide content from human reviewers reading the suite source.
+///   - Zero-width chars (U+200B..200D, U+FEFF) — same reason.
+fn escape_axon_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        let cp = c as u32;
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ if cp < 0x20 => {
+                out.push_str(&format!("\\u{{{cp:x}}}"));
+            }
+            _ if (0x202A..=0x202E).contains(&cp)
+                || (0x2066..=0x2069).contains(&cp)
+                || (0x200B..=0x200D).contains(&cp)
+                || cp == 0xFEFF =>
+            {
+                out.push_str(&format!("\\u{{{cp:x}}}"));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// `axon repl` — interactive read-eval-print loop. Each line is parsed as
