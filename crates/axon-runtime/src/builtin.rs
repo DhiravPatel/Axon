@@ -630,10 +630,35 @@ fn builtin_anthropic(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Model(std::sync::Arc::new(provider)))
 }
 
+thread_local! {
+    /// True when `default_model()` fell back to the mock provider this
+    /// process (because no `ANTHROPIC_API_KEY`). The CLI footer reads
+    /// this to surface a one-line "you're running on the mock" hint —
+    /// the advisor's "you almost have this; finish the loop".
+    pub(crate) static DEFAULT_MODEL_FELL_BACK_TO_MOCK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Returns whether `default_model()` was ever resolved to a mock during
+/// this process. Public so the CLI footer can render the hint.
+pub fn default_model_used_mock() -> bool {
+    DEFAULT_MODEL_FELL_BACK_TO_MOCK.with(|c| c.get())
+}
+
+/// Clear the mock-fallback flag — needed for `axon test`, which runs
+/// multiple programs in sequence and shouldn't carry state across.
+pub fn reset_default_model_mock_flag() {
+    DEFAULT_MODEL_FELL_BACK_TO_MOCK.with(|c| c.set(false));
+}
+
 /// Zero-config default model. If `ANTHROPIC_API_KEY` is set, return
 /// an Anthropic provider bound to `claude-opus-4-7`. Otherwise return
 /// a mock model whose fixed response is the canonical placeholder so
 /// the program still runs end-to-end with no setup.
+///
+/// When the mock path fires, sets `DEFAULT_MODEL_FELL_BACK_TO_MOCK` so
+/// the CLI footer can render the "no API key — using mock — run
+/// `axon login anthropic`" hint on every run that touched a model.
 fn builtin_default_model(_args: &[Value]) -> Result<Value, String> {
     if std::env::var("ANTHROPIC_API_KEY")
         .map(|v| !v.is_empty())
@@ -643,6 +668,7 @@ fn builtin_default_model(_args: &[Value]) -> Result<Value, String> {
             .map_err(|e| e.to_string())?;
         return Ok(Value::Model(std::sync::Arc::new(provider)));
     }
+    DEFAULT_MODEL_FELL_BACK_TO_MOCK.with(|c| c.set(true));
     Ok(Value::Model(std::sync::Arc::new(
         axon_models::MockProvider::new(axon_models::MockBehavior::Fixed(
             "(default_model: no API key set; this is a placeholder response. \

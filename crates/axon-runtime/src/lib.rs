@@ -37,6 +37,7 @@ mod value;
 
 pub use actor::{Actor, AgentDef, HandlerDef, Lifecycle, LifecycleHandlerDef, StateField};
 pub use budget::{Budget, BudgetBreach, BudgetStack};
+pub use builtin::{default_model_used_mock, reset_default_model_mock_flag};
 pub use prompt_version::{PromptVersion, PromptVersionError, PromptVersionRegistry};
 pub use reasoning::{Effort, ReasoningBreach, ReasoningBudget, ReasoningBudgetStack};
 pub use restart_policy::{ExitKind, RestartPolicy};

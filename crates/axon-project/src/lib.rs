@@ -310,14 +310,17 @@ impl LoadedProject {
 /// are visible regardless of `pub`, so a `use` of a same-module name
 /// (`use foo` where `foo` lives in the current file) is a no-op.
 fn check_privacy(modules: &[ModuleFile]) -> Vec<Diagnostic> {
-    // Build a map: module_path -> set of (item_name, is_pub).
-    let mut exports: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    // Build a map: module_path -> set of (item_name, (is_pub, item_span)).
+    // The item span lets P0010 attach a cross-file fix that inserts `pub`
+    // at the start of the item in its source module.
+    let mut exports: HashMap<String, HashMap<String, (bool, Span)>> = HashMap::new();
     for m in modules {
         let entry = exports.entry(m.module_path.clone()).or_default();
         for item in &m.program.items {
             if let Some(name) = item_name(item) {
                 let is_pub = item_is_pub(item);
-                entry.insert(name, is_pub);
+                let span = item_span(item);
+                entry.insert(name, (is_pub, span));
             }
         }
     }
@@ -353,18 +356,37 @@ fn check_privacy(modules: &[ModuleFile]) -> Vec<Diagnostic> {
                 };
                 for name in &names {
                     match mod_exports.get(name) {
-                        Some(true) => {} // pub — OK
-                        Some(false) => {
-                            diags.push(
-                                Diagnostic::error(
-                                    format!(
-                                        "item `{name}` in module `{mod_path}` is not `pub` — \
-                                         declare it with `pub` to expose it outside the module"
-                                    ),
-                                    u.span,
-                                )
-                                .with_code("P0010"),
-                            );
+                        Some((true, _)) => {} // pub — OK
+                        Some((false, item_span)) => {
+                            // P0010: the imported item exists but isn't
+                            // declared `pub`. Attach a cross-file fix that
+                            // inserts `pub ` at the item's start in its
+                            // source module. axon fix (project mode) routes
+                            // the edit to the right file via item_span.file.
+                            let mut d = Diagnostic::error(
+                                format!(
+                                    "item `{name}` in module `{mod_path}` is not `pub` — \
+                                     declare it with `pub` to expose it outside the module"
+                                ),
+                                u.span,
+                            )
+                            .with_code("P0010");
+                            if item_span.file != 0 {
+                                d = d.with_fix(
+                                    axon_diag::Fix::new(format!(
+                                        "make `{name}` public — insert `pub` in `{mod_path}`"
+                                    ))
+                                    .with_edit(axon_diag::FixEdit {
+                                        span: Span::in_file(
+                                            item_span.start as usize,
+                                            item_span.start as usize,
+                                            item_span.file,
+                                        ),
+                                        replacement: "pub ".to_string(),
+                                    }),
+                                );
+                            }
+                            diags.push(d);
                         }
                         None => {
                             diags.push(
@@ -547,5 +569,21 @@ fn item_name(item: &Item) -> Option<String> {
         // because two `test "..."` blocks can share a name (they're just
         // labels). Same for `use` and `impl`.
         Item::Test(_) | Item::Eval(_) | Item::Use(_) | Item::Impl(_) => None,
+    }
+}
+
+/// Span of the item's first byte — the position to insert `pub ` at when
+/// fixing a missing-pub diagnostic. For items the spec doesn't recognize
+/// as having a `pub` modifier (`use`, `impl`, `test`, `eval`), returns
+/// `Span::DUMMY` (file = 0) so the fix isn't attached.
+fn item_span(item: &Item) -> Span {
+    match item {
+        Item::Fn(f) => f.span,
+        Item::Type(t) => t.span,
+        Item::Schema(s) => s.span,
+        Item::Trait(t) => t.span,
+        Item::Const(c) => c.span,
+        Item::Effect(e) => e.span,
+        _ => Span::DUMMY,
     }
 }

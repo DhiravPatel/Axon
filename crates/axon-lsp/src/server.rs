@@ -7,7 +7,8 @@ use axon_diag::Severity;
 use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     notification::{DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics},
-    request::{Completion, GotoDefinition, HoverRequest, Initialize, Request as _, Shutdown},
+    request::{CodeLensRequest, Completion, GotoDefinition, HoverRequest, Initialize, Request as _, Shutdown},
+    CodeLens, CodeLensOptions, CodeLensParams, Command,
     CompletionItem as LspCompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeResult, Location, MarkupContent, MarkupKind, OneOf, PublishDiagnosticsParams, ServerCapabilities,
@@ -33,6 +34,9 @@ pub fn run() -> std::io::Result<()> {
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".into(), ":".into()]),
             ..Default::default()
+        }),
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(false),
         }),
         ..Default::default()
     })
@@ -97,6 +101,10 @@ fn handle_request(req: Request, docs: &HashMap<Url, String>) -> Response {
         }
         Completion::METHOD => {
             let result = extract::<CompletionParams>(req).and_then(|(id, p)| completion(id, p, docs));
+            into_resp(id, result)
+        }
+        CodeLensRequest::METHOD => {
+            let result = extract::<CodeLensParams>(req).and_then(|(id, p)| code_lens(id, p, docs));
             into_resp(id, result)
         }
         Initialize::METHOD => {
@@ -262,6 +270,39 @@ fn completion(
             items,
         })),
     ))
+}
+
+/// §32 LSP cost lens — emits a non-clickable code lens above each
+/// `ask` / `generate` / `plan` showing an *estimated* per-call cost,
+/// latency, and token counts. No API call is performed; the estimate is
+/// derived purely from prompt source-text length. See `cost_lens`
+/// module docs for the heuristic. The `Command` carries an empty
+/// command string so editors render the title as an inline label only
+/// (clicking is a no-op — by design).
+fn code_lens(
+    id: RequestId,
+    params: CodeLensParams,
+    docs: &HashMap<Url, String>,
+) -> Result<(RequestId, Option<Vec<CodeLens>>), Response> {
+    let uri = params.text_document.uri.clone();
+    let text = match docs.get(&uri) {
+        Some(t) => t.clone(),
+        None => return Ok((id, None)),
+    };
+    let analysis = analyze(uri.as_str(), &text);
+    let lenses = crate::cost_lens::lenses_for(&analysis.program)
+        .into_iter()
+        .map(|l| CodeLens {
+            range: crate::position::span_to_range(&text, l.span),
+            command: Some(Command {
+                title: l.label,
+                command: String::new(),
+                arguments: None,
+            }),
+            data: None,
+        })
+        .collect();
+    Ok((id, Some(lenses)))
 }
 
 // ---------------------------------------------------------------------------

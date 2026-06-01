@@ -1,6 +1,69 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**939 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**955 tests passing** across 30+ crates).
+
+---
+
+## Stage 33 — `axon fix` Goes Wide + Project Mode + LSP Cost Lens + Footer Loop Closed
+
+Three priority-1/priority-2 advisor items, shipped end-to-end. The pitch: errors are now expected to come with rewrites attached, the rewrites work across a whole project, and the LSP shows the dollar cost of every model call as you type.
+
+### §33.1 Three new mechanical fixes (catalogue: 3 → 6)
+
+The Stage 32 `axon fix` engine proved the apply loop is safe. Adding new fixes is now just a `*_with_fix` constructor in [crates/axon-tyck/src/errors.rs](crates/axon-tyck/src/errors.rs) + a one-line wire at the diagnostic call site.
+
+- **E0204** (duplicate definition) — `duplicate_definition_with_fix(span, name, prev, name_span, existing_names)` picks the first unused `{name}_N` (N = 2..) and replaces the *second* item's name identifier. Existing names are scraped from `Ctx::item_names()` so the rename doesn't collide with any other top-level identifier in scope.
+- **E0205** (wrong arity) — `wrong_arity_with_fix(call_span, name, expected, found, arg_spans)`:
+  - Too few args → inserts `, nil, nil, ...` right before the closing `)`. Prepended comma when there's at least one existing arg; bare list when none.
+  - Too many args → replaces from the end of the last-kept arg to the end of the last actual arg with the empty string, sweeping commas + trailing args in one splice.
+  - `expected == 0` (call expects zero, user passed any) special-case → deletes from the first arg's start to the last arg's end so `f(1, 2, 3)` becomes `f()`.
+- **E0207** (no such method) — `no_such_method_with_candidates(span, method, on_ty, candidates)`. Candidates come from `handlers` on agent/actor handles, or from a hand-curated `builtin_methods_for(ty)` table mirroring the dispatch arms in `method_call_ty` (kept hand-curated so future entries don't silently change the suggestion surface).
+- **`closest()` extended with prefix-of acceptance** — Stage 32 capped Levenshtein at `max(2, len/3).min(4)`. That misses the common typo class `length` → `len` (edit distance 3). The new rule: candidates that are a strict prefix of the target (or vice versa) — with both at least 3 chars long — bypass the edit-distance cap. Catches `length`↔`len`, `recall_all`↔`recall`, `from_string`↔`from_str`.
+
+### §33.2 `axon fix` recursive over a project tree (cross-file fixes route correctly)
+
+- New `cmd_fix_project(root, apply, only)` in [crates/axon-cli/src/main.rs](crates/axon-cli/src/main.rs) — when the argument to `axon fix` is a directory, the CLI loads the project via `LoadedProject::load(root)` (every `.ax` file gets a stable file_id), type-checks the merged program, and routes every fix edit to the right file via `Span::file`.
+- **Cross-file P0010 fix.** [crates/axon-project/src/lib.rs](crates/axon-project/src/lib.rs) now stores `(is_pub, item_span)` per export. The P0010 diagnostic fires in the *importing* file but the attached fix targets the *exporting* file — the fix-edit's `Span::file` points to the helper module, and `axon fix` applies it there. Demoed: `use helpers.{greet}` triggers P0010 in `main.ax`; `axon fix --apply` inserts `pub` in `helpers.ax`.
+- **Conflict + offset handling unchanged** from Stage 32 — accepted hunks splice in descending start-offset order per file, so an early growth-fix doesn't invalidate later offsets.
+- Per-file diff/apply with a summary that names every touched file.
+
+### §33.3 LSP code lens — per-call cost estimate above `ask`/`generate`/`plan`
+
+New crate module [crates/axon-lsp/src/cost_lens.rs](crates/axon-lsp/src/cost_lens.rs). Walks the program AST to find every `ask`/`generate`/`plan` and emits a `CostLens { span, label, input_tokens, assumed_output_tokens, estimated_cost_usd, estimated_latency_ms }` per call:
+
+```
+~ $0.0192 · ~9.0s · in 6 / out 256  (ask)
+```
+
+- **No API call.** Estimates come from prompt source-text length divided by 4 (the cross-provider ballpark) — same heuristic the Stage 31 cost ledger falls back to. Pessimistic 256-token assumed completion so users budget on the safe side.
+- **Provider rates hard-coded** at Opus-tier defaults (`$15/M in`, `$75/M out`, ~30 tok/sec, 600ms setup) — same rates the in-process ledger uses. Exact numbers come from `axon prof --cost` against a real recording.
+- **Wired into LSP via `textDocument/codeLens`** — [crates/axon-lsp/src/server.rs](crates/axon-lsp/src/server.rs) advertises `code_lens_provider: Some(CodeLensOptions { resolve_provider: false })` and handles `CodeLensRequest::METHOD`. Editors render the title as an inline label above the call; the command field is empty (clicking is a no-op — by design; it's an info display).
+- **Walker covers every relevant nesting** — let/var inits, if/match/while/for bodies, method call receivers, binary operands, pipelines, try/recover bodies, spawn/await/try/force wrappers. New unit tests in `cost_lens` cover the no-asks case, one-lens-per-call counting, and span anchoring.
+
+### §33.4 Mock-model footer — close the loop
+
+The advisor flagged this directly: when `default_model()` falls back to the mock provider because `ANTHROPIC_API_KEY` isn't set, the post-run footer should *say so* on one line. Now it does.
+
+- [crates/axon-runtime/src/builtin.rs](crates/axon-runtime/src/builtin.rs) — new thread-local `DEFAULT_MODEL_FELL_BACK_TO_MOCK: Cell<bool>` flipped to `true` whenever `builtin_default_model` resolves to the mock path. New `default_model_used_mock()` / `reset_default_model_mock_flag()` exports.
+- The `axon run` footer in [crates/axon-cli/src/main.rs](crates/axon-cli/src/main.rs) checks the flag right after the cost/tokens line and renders:
+  ```
+  ─── axon run: 0.21s  ·  0 tokens  ·  $0.0000
+      (no ANTHROPIC_API_KEY — `default_model()` used the mock. run `axon login anthropic` to use the real model.)
+  ```
+- Subject to the same TTY check as the main footer (suppressed in CI / piped output / `AXON_NO_FOOTER`).
+
+### Test coverage
+- 4 new unit tests in `crates/axon-lsp::cost_lens` (one-lens-per-ask, nested visit through let-init, no-asks-no-lenses, cost/latency components).
+- 10 new end-to-end tests in [crates/axon-cli/tests/stage33_fixes_and_lens.rs](crates/axon-cli/tests/stage33_fixes_and_lens.rs): E0204 rename, E0205 too-few (nil padding), E0205 too-many (drop trailing), E0207 length→len, P0010 cross-file routing, multi-file dry-run summary, cost-lens span anchoring + count, footer-shows-when-mock, footer-silent-when-not.
+- Workspace total: **955 passing**, up from 939.
+
+### Honest scope: deferred to a later stage
+- **`--watch` mode** for `axon fix --all` — needs `notify` (or similar) for file events; the recursive walk is in place but reruns are manual.
+- **More LSP affordances** the spec promises (§59): effect-row code lens, prompt-render preview panel, one-click "record cassette for this test". The cost lens is the highest-leverage one of the four; the others are separate days of work.
+- **Doc tests** (`axon test --doc` from §60.2) — separate substantial work; the doc generator and test runner exist but extracting executable ````axon` blocks from `///` comments is its own pipeline.
+- **`axon why <effect> <file>`** — useful but a separate command.
+- **`axon explain <paste>`** — the explain catalogue already serves this; the convenience flag is a wrapper.
+- **`select` / `parallel { ... }` async slices** — these are Stage 34 territory; the Arc-Send-Sync substrate Stage 32 shipped is the foundation, but the per-primitive migration is its own bounded slice each.
 
 ---
 
