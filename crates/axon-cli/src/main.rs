@@ -18,6 +18,7 @@ use axon_diag::SourceFile;
 mod host;
 mod qol;
 mod scaffold;
+mod why;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -125,6 +126,10 @@ fn main() -> ExitCode {
         "fix" => {
             let remaining: Vec<String> = args.collect();
             cmd_fix(&remaining)
+        }
+        "why" => {
+            let remaining: Vec<String> = args.collect();
+            why::cmd_why(&remaining)
         }
         "new" => {
             let remaining: Vec<String> = args.collect();
@@ -262,13 +267,22 @@ fn print_help() {
                                                        items are dropped when X isn't active.\n\
                             --no-default-features      Don't seed the `default` feature.\n\
                             (no flag)                  Grant the standard default set.\n\
-           fix    [--apply] [--only CODE] <file>\n\
+           fix    [--apply | --interactive | --watch] [--only CODE] <path>\n\
                           Apply mechanically applicable fixes attached to\n\
                           diagnostics (did-you-mean replacements, missing\n\
-                          `uses` effects, ...). Without --apply, prints a\n\
-                          unified diff so you can review the changes; with\n\
-                          --apply, rewrites the file in place. --only\n\
-                          restricts to one diagnostic code.\n\
+                          `uses` effects, ...). Without a mode flag, prints\n\
+                          a unified diff (dry run). --apply rewrites in\n\
+                          place; --interactive walks each hunk with y/n/a/q;\n\
+                          --watch auto-applies Safe-tier fixes on save\n\
+                          (requires axon.toml + a descendant of CWD by\n\
+                          default; AXON_FIX_WATCH_FORCE=1 to override).\n\
+                          --only restricts to one diagnostic code.\n\
+           why    <EFFECT> [<path>] [--from <fn>]\n\
+                          Trace every call site that introduces <EFFECT>\n\
+                          into the chosen entry function (default `main`).\n\
+                          Built-in calls (`http_fetch`, `read_file`, …)\n\
+                          appear as leaves; user-defined fns expand into\n\
+                          their own subtree (effect-pruned).\n\
            version         Print the compiler version\n\
            help            Show this message\n",
         env!("CARGO_PKG_VERSION")
@@ -1151,11 +1165,16 @@ fn cmd_fix(args: &[String]) -> ExitCode {
     let mut path: Option<&str> = None;
     let mut apply = false;
     let mut only: Option<&str> = None;
+    // §34.5 — new modes.
+    let mut interactive = false;
+    let mut watch = false;
     let mut i = 0usize;
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
             "--apply" => apply = true,
+            "--interactive" | "-i" => interactive = true,
+            "--watch" | "-w" => watch = true,
             "--only" => {
                 i += 1;
                 if i >= args.len() {
@@ -1166,14 +1185,21 @@ fn cmd_fix(args: &[String]) -> ExitCode {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: axon fix [--apply] [--only CODE] <path>\n\
+                    "usage: axon fix [--apply | --interactive | --watch] [--only CODE] <path>\n\
                      \n\
                      <path> can be a single .ax file OR a project directory.\n\
                      In project mode, every .ax file is scanned and cross-file\n\
                      fixes (e.g. P0010 missing pub) are routed to the right file.\n\
                      \n\
-                     Without --apply, prints a unified diff (dry run).\n\
-                     With --apply, rewrites the touched file(s) in place.\n\
+                     MODES (mutually exclusive):\n\
+                       (none)         Print a unified diff (dry run).\n\
+                       --apply        Rewrite the touched file(s) in place.\n\
+                       --interactive  Walk each hunk with a y/n/a/q prompt;\n\
+                                      falls back to dry-run when stdin is not a TTY.\n\
+                       --watch        Re-run on every save (notify-backed);\n\
+                                      auto-applies only Confidence::Safe fixes,\n\
+                                      reports Suggested ones as notifications.\n\
+                     \n\
                      --only CODE restricts to fixes attached to that diagnostic code."
                 );
                 return ExitCode::SUCCESS;
@@ -1192,10 +1218,26 @@ fn cmd_fix(args: &[String]) -> ExitCode {
         }
         i += 1;
     }
+    // Mutual exclusivity check — mixing modes is almost always a mistake.
+    let mode_flags = [apply, interactive, watch];
+    if mode_flags.iter().filter(|b| **b).count() > 1 {
+        eprintln!(
+            "axon fix: --apply, --interactive, and --watch are mutually exclusive — pick one"
+        );
+        return ExitCode::from(2);
+    }
     let Some(path) = path else {
-        eprintln!("usage: axon fix [--apply] [--only CODE] <path>");
+        eprintln!(
+            "usage: axon fix [--apply | --interactive | --watch] [--only CODE] <path>"
+        );
         return ExitCode::from(2);
     };
+
+    // --watch dispatches to its own loop and never returns the dry-run /
+    // apply path — the loop runs forever until Ctrl-C.
+    if watch {
+        return cmd_fix_watch(path, only);
+    }
 
     // Two modes:
     //   * single-file (default) — preserves the original behavior; spans
@@ -1204,6 +1246,15 @@ fn cmd_fix(args: &[String]) -> ExitCode {
     //     (P0010) route correctly. Every module gets a stable file_id.
     let path_buf = std::path::Path::new(path);
     if path_buf.is_dir() {
+        // Project mode doesn't support --interactive yet (each prompt
+        // would need per-file context). Fall through to non-interactive
+        // dry-run/apply in project mode; interactive is single-file only.
+        if interactive {
+            eprintln!(
+                "axon fix: --interactive currently supports single-file mode only — \
+                 falling back to dry-run for the project"
+            );
+        }
         return cmd_fix_project(path_buf, apply, only);
     }
 
@@ -1222,10 +1273,14 @@ fn cmd_fix(args: &[String]) -> ExitCode {
     // Gather every Fix from every diagnostic, filtered by --only when set.
     // Each fix may contribute multiple edits; we keep the originating code
     // around so the diff/apply path can label the change.
+    //
+    // §34.1 — `confidence` is plumbed through so `--interactive` can
+    // show `[safe]` / `[suggested]` next to the description.
     struct Hunk<'a> {
         code: Option<&'a str>,
         description: &'a str,
         edits: &'a [axon_diag::FixEdit],
+        confidence: axon_diag::Confidence,
     }
     let hunks: Vec<Hunk> = diags
         .iter()
@@ -1238,6 +1293,7 @@ fn cmd_fix(args: &[String]) -> ExitCode {
                 code: d.code,
                 description: &f.description,
                 edits: &f.edits,
+                confidence: f.confidence,
             })
         })
         .collect();
@@ -1265,14 +1321,26 @@ fn cmd_fix(args: &[String]) -> ExitCode {
     //   1. select hunks: keep each in input order if none of its edits
     //      touch a span already taken by an earlier-accepted hunk. Conflicts
     //      get deferred — the user reruns `axon fix` to pick them up.
+    //      §34.5 — when `interactive` is set, also prompt the user per hunk
+    //      before accepting; `n` skips, `q` aborts the rest, `a` accepts all
+    //      remaining without prompting again. Non-TTY stdin falls back to
+    //      dry-run mode (skip the prompt entirely).
     //   2. apply every accepted edit across every accepted hunk in one
     //      reverse pass over the byte buffer, so earlier offsets stay
-    //      valid as we splice. (Applying hunks one at a time without a
-    //      global sort is wrong: an early hunk that grows the file
-    //      invalidates the offsets recorded by every later hunk.)
+    //      valid as we splice.
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let do_interactive = interactive && stdin_is_tty;
+    if interactive && !stdin_is_tty {
+        eprintln!(
+            "axon fix: --interactive needs a TTY on stdin — falling back to dry-run"
+        );
+    }
     let mut applied: Vec<&Hunk> = Vec::new();
     let mut deferred: Vec<&Hunk> = Vec::new();
+    let mut skipped_by_user: Vec<&Hunk> = Vec::new();
     let mut covered: Vec<(usize, usize)> = Vec::new();
+    let mut accept_all = false;
+    let mut quit_remaining = false;
     for h in &hunks {
         let overlaps = h.edits.iter().any(|e| {
             let s = e.span.start as usize;
@@ -1281,6 +1349,31 @@ fn cmd_fix(args: &[String]) -> ExitCode {
         });
         if overlaps {
             deferred.push(h);
+            continue;
+        }
+        if do_interactive && !accept_all && !quit_remaining {
+            match prompt_interactive(
+                path,
+                file.text(),
+                h.code,
+                h.description,
+                h.confidence,
+                h.edits.first(),
+            ) {
+                InteractiveChoice::Yes => {}
+                InteractiveChoice::No => {
+                    skipped_by_user.push(h);
+                    continue;
+                }
+                InteractiveChoice::AcceptAll => accept_all = true,
+                InteractiveChoice::Quit => {
+                    quit_remaining = true;
+                    skipped_by_user.push(h);
+                    continue;
+                }
+            }
+        } else if quit_remaining {
+            skipped_by_user.push(h);
             continue;
         }
         for e in h.edits {
@@ -1303,7 +1396,12 @@ fn cmd_fix(args: &[String]) -> ExitCode {
     let after = String::from_utf8_lossy(&bytes).into_owned();
     let before = file.text().to_owned();
 
-    if apply {
+    // §34.5 — `do_interactive` writes the file in place (the user
+    // already approved per hunk). `apply` writes unconditionally. Else
+    // dry-run.
+    let write_in_place = apply || do_interactive;
+
+    if write_in_place {
         if before == after {
             println!("axon fix: no edits to apply");
             return ExitCode::SUCCESS;
@@ -1312,9 +1410,15 @@ fn cmd_fix(args: &[String]) -> ExitCode {
             eprintln!("axon fix: cannot write `{path}`: {e}");
             return ExitCode::from(1);
         }
+        let skipped_note = if skipped_by_user.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} skipped by user)", skipped_by_user.len())
+        };
         println!(
-            "axon fix: applied {} fix(es) to {path}{}",
+            "axon fix: applied {} fix(es) to {path}{}{}",
             applied.len(),
+            skipped_note,
             if deferred.is_empty() {
                 String::new()
             } else {
@@ -1334,8 +1438,12 @@ fn cmd_fix(args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         for h in &applied {
+            let tier = match h.confidence {
+                axon_diag::Confidence::Safe => "safe",
+                axon_diag::Confidence::Suggested => "suggested",
+            };
             println!(
-                "fix [{}]: {}",
+                "fix [{}, {tier}]: {}",
                 h.code.unwrap_or("uncoded"),
                 h.description
             );
@@ -1352,6 +1460,70 @@ fn cmd_fix(args: &[String]) -> ExitCode {
             path
         );
         ExitCode::SUCCESS
+    }
+}
+
+// §34.5 — interactive per-hunk prompt support. Plain params (no trait)
+// so the caller's local `struct Hunk` doesn't need any extra plumbing.
+
+enum InteractiveChoice {
+    Yes,
+    No,
+    AcceptAll,
+    Quit,
+}
+
+fn prompt_interactive(
+    path: &str,
+    source: &str,
+    code: Option<&str>,
+    description: &str,
+    confidence: axon_diag::Confidence,
+    first_edit: Option<&axon_diag::FixEdit>,
+) -> InteractiveChoice {
+    use std::io::{BufRead, Write};
+    let tier = match confidence {
+        axon_diag::Confidence::Safe => "safe",
+        axon_diag::Confidence::Suggested => "suggested",
+    };
+    println!(
+        "\n{}: fix [{}, {tier}]: {}",
+        path,
+        code.unwrap_or("uncoded"),
+        description
+    );
+    // Show a tiny context window — the surrounding source line for the
+    // first edit. Better preview than nothing; not a full diff.
+    if let Some(edit) = first_edit {
+        let start = (edit.span.start as usize).min(source.len());
+        let end = (edit.span.end as usize).min(source.len()).max(start);
+        let line_start = source[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_end = source[start..]
+            .find('\n')
+            .map(|i| start + i)
+            .unwrap_or(source.len());
+        let line = &source[line_start..line_end];
+        println!("    - {line}");
+        let mut after_preview = String::from(&source[line_start..start]);
+        after_preview.push_str(&edit.replacement);
+        after_preview.push_str(&source[end..line_end]);
+        println!("    + {after_preview}");
+    }
+    print!("Apply? [y]es / [n]o / [a]ll-from-here / [q]uit: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return InteractiveChoice::Quit;
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "" => InteractiveChoice::Yes,
+        "n" | "no" => InteractiveChoice::No,
+        "a" | "all" => InteractiveChoice::AcceptAll,
+        "q" | "quit" => InteractiveChoice::Quit,
+        other => {
+            println!("axon fix: unrecognized choice `{other}` — skipping this hunk");
+            InteractiveChoice::No
+        }
     }
 }
 
@@ -1521,6 +1693,561 @@ fn cmd_fix_project(
         );
     }
     ExitCode::SUCCESS
+}
+
+/// §34.5 `axon fix --watch <path>` — re-run on every save via the
+/// `notify` crate. Only fixes tagged `Confidence::Safe` are auto-applied;
+/// Suggested fixes are printed to stdout (the user must run
+/// `axon fix --interactive` to review them).
+///
+/// Path semantics:
+///   * single .ax file → watch the file (via its parent dir; events are
+///     filtered to the canonicalized target path).
+///   * project directory → must contain `axon.toml` and must be a
+///     descendant of CWD (override with `AXON_FIX_WATCH_FORCE=1`).
+///     Watches the whole `src/` tree.
+///
+/// Safety contract (Stage 34 verification fixes C1, C3, M1, M2, M3, M7):
+///   * Project dirs without `axon.toml` are refused — `--watch /` won't
+///     start a recursive rewriter on system files.
+///   * Symlinks inside the watched tree are skipped (the project loader
+///     enforces this; the watch loop also filters self-emitted events).
+///   * Per-file mtime tracked for BOTH single-file and project modes —
+///     post-apply mtime is recorded so the next notify event for the
+///     same file is correctly recognized as a self-trigger.
+///   * Debounce uses a 250 ms quiet window with a 2 s maxWait — a
+///     chatty editor that saves on every keystroke still gets at least
+///     one apply per 2 s.
+///   * TOCTOU mtime compare in `apply_safe_fixes_to_file` /
+///     `apply_safe_fixes_to_project` — if the file changed between
+///     read and write, the apply is aborted and re-queued.
+///   * Single-file mode filters events to exactly the canonicalized
+///     target path; sibling .ax files in the same directory are
+///     ignored.
+///   * Ctrl-C handler is installed BEFORE the watcher starts; install
+///     failure is fatal.
+fn cmd_fix_watch(path: &str, only: Option<&str>) -> ExitCode {
+    use notify::{event::ModifyKind, EventKind, RecursiveMode, Watcher};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let watch_target = std::path::PathBuf::from(path);
+    if !watch_target.exists() {
+        eprintln!("axon fix --watch: `{path}` does not exist");
+        return ExitCode::from(1);
+    }
+
+    // Stage 34 verification fix C1: refuse pointing --watch at arbitrary
+    // dirs (`/`, `/etc`, the user's home). Require an axon.toml at or
+    // above the watched directory, AND require the canonical watch path
+    // to be a descendant of CWD. The env-var override exists for CI /
+    // sandboxed users who genuinely need to opt out.
+    let force = std::env::var("AXON_FIX_WATCH_FORCE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let canon_target = match watch_target.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("axon fix --watch: cannot canonicalize `{}`: {e}", path);
+            return ExitCode::from(1);
+        }
+    };
+    // §34.6 verification fix C1 — directory-mode safety checks. The
+    // checks only apply to dir-mode because single-file mode is
+    // bounded by definition: it only ever touches one file (the
+    // target). Pointing `--watch foo.ax` at /etc/hosts is bad if you
+    // own /etc/hosts, but that's a separate trust boundary the user
+    // has already crossed by running the command at all. The danger
+    // is pointing `--watch /` at a tree and having it walk + rewrite
+    // many files — that's what these checks gate.
+    if watch_target.is_dir() && !force {
+        // Must have axon.toml in the tree (the dir itself or an ancestor
+        // of it inside the watch root). Project loader requires this
+        // anyway; we surface a clearer error before the watcher starts.
+        let mut has_manifest = false;
+        let mut probe: Option<&std::path::Path> = Some(canon_target.as_path());
+        while let Some(p) = probe {
+            if p.join("axon.toml").is_file() {
+                has_manifest = true;
+                break;
+            }
+            probe = p.parent();
+        }
+        if !has_manifest {
+            eprintln!(
+                "axon fix --watch: refusing to watch `{}` — no `axon.toml` found.\n\
+                 (Pointing --watch at a directory without an Axon manifest could rewrite\n\
+                  unrelated .ax files. Add an axon.toml, or set AXON_FIX_WATCH_FORCE=1 to override.)",
+                canon_target.display()
+            );
+            return ExitCode::from(1);
+        }
+        // Must be a descendant of CWD.
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c.canonicalize().unwrap_or(c),
+            Err(e) => {
+                eprintln!("axon fix --watch: cannot read CWD: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if !canon_target.starts_with(&cwd) {
+            eprintln!(
+                "axon fix --watch: refusing to watch `{}` — not a descendant of CWD `{}`.\n\
+                 (cd into the project directory, or set AXON_FIX_WATCH_FORCE=1 to override.)",
+                canon_target.display(),
+                cwd.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    // Stage 34 verification fix M7: install Ctrl-C handler BEFORE the
+    // watcher starts. A SIGINT during watcher.watch() would otherwise
+    // kill the process with no shutdown path. Install-failure is fatal
+    // because the loop's only exit signal is the AtomicBool.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        if let Err(e) = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst)) {
+            eprintln!(
+                "axon fix --watch: cannot install Ctrl-C handler: {e}\n\
+                 (Refusing to start without a shutdown path — the watch loop has no\n\
+                  other exit signal. If you really need to bypass, kill via SIGTERM.)"
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    let (tx, rx) = channel();
+    let mut watcher = match notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("axon fix --watch: cannot start watcher: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Project mode: watch the src/ tree recursively if it exists;
+    // otherwise watch the directory itself. Single-file: notify still
+    // requires watching the parent dir to catch atomic rename-based
+    // saves (vim, IDEs), so we filter events to the canonical target
+    // path inside the loop (Stage 34 verification fix M2).
+    let (watch_root, mode) = if watch_target.is_dir() {
+        let src = watch_target.join("src");
+        if src.is_dir() {
+            (src, RecursiveMode::Recursive)
+        } else {
+            (watch_target.clone(), RecursiveMode::Recursive)
+        }
+    } else {
+        let parent = watch_target
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        (parent, RecursiveMode::NonRecursive)
+    };
+    if let Err(e) = watcher.watch(&watch_root, mode) {
+        eprintln!(
+            "axon fix --watch: cannot watch `{}`: {e}",
+            watch_root.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    println!(
+        "axon fix --watch: watching `{}` (Safe-tier fixes auto-apply; Ctrl-C to stop)",
+        canon_target.display()
+    );
+    // Per-path mtime tracking — keys cover BOTH the single-file and
+    // project paths (Stage 34 verification fix M1). Updated after every
+    // successful apply (single-file branch records its target; project
+    // branch records every file it actually wrote, returned from
+    // apply_safe_fixes_to_project).
+    let mut last_applied: std::collections::HashMap<std::path::PathBuf, std::time::SystemTime> =
+        std::collections::HashMap::new();
+
+    // Run once at startup so the user sees current state, then record
+    // mtimes so the first inbound event (often the apply itself) gets
+    // recognized as a self-trigger.
+    let startup_touched = run_safe_fixes_once(&watch_target, only);
+    for p in startup_touched {
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if let Ok(mtime) = meta.modified() {
+                last_applied.insert(p.canonicalize().unwrap_or(p), mtime);
+            }
+        }
+    }
+
+    // Debounce parameters (Stage 34 verification fix M3).
+    let quiet_window = Duration::from_millis(250);
+    let max_wait = Duration::from_millis(2000);
+    // First-event timestamp in the current burst — applies always fire
+    // by max_wait_deadline even if events keep arriving inside
+    // quiet_window.
+    let mut pending_first: Option<Instant> = None;
+    let mut pending_quiet_deadline: Option<Instant> = None;
+    // Single-file mode: filter events to exactly the canonicalized
+    // target path (Stage 34 verification fix M2).
+    let target_canon: Option<std::path::PathBuf> = if watch_target.is_file() {
+        Some(canon_target.clone())
+    } else {
+        None
+    };
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            println!("\naxon fix --watch: stopped");
+            return ExitCode::SUCCESS;
+        }
+        match rx.recv_timeout(quiet_window) {
+            Ok(Ok(event)) => {
+                let interesting = matches!(
+                    event.kind,
+                    EventKind::Create(_)
+                        | EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Modify(ModifyKind::Any)
+                        | EventKind::Modify(ModifyKind::Name(_))
+                );
+                if !interesting {
+                    continue;
+                }
+                let touched: Vec<std::path::PathBuf> = event
+                    .paths
+                    .into_iter()
+                    .filter(|p| {
+                        p.extension().map(|e| e == "ax").unwrap_or(false)
+                            && p.exists()
+                    })
+                    // Single-file mode: only accept events for the
+                    // canonical target. Sibling .ax files in the same
+                    // dir don't trigger.
+                    .filter(|p| match &target_canon {
+                        Some(t) => p
+                            .canonicalize()
+                            .map(|c| c == *t)
+                            .unwrap_or(false),
+                        None => true,
+                    })
+                    // Skip symlinks defensively even though the project
+                    // loader also rejects them.
+                    .filter(|p| {
+                        std::fs::symlink_metadata(p)
+                            .map(|m| !m.file_type().is_symlink())
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if touched.is_empty() {
+                    continue;
+                }
+                // Debounce: skip events whose mtime hasn't advanced
+                // past the last applied mtime for the same path.
+                // Default-stale-on-error (safer than default-fresh, the
+                // pre-verification version was the wrong default).
+                let mut any_fresh = false;
+                for p in &touched {
+                    let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    let stale = match std::fs::metadata(&canon) {
+                        Ok(meta) => match meta.modified() {
+                            Ok(mtime) => last_applied
+                                .get(&canon)
+                                .map(|prev| *prev >= mtime)
+                                .unwrap_or(false),
+                            Err(_) => true,
+                        },
+                        Err(_) => true,
+                    };
+                    if !stale {
+                        any_fresh = true;
+                    }
+                }
+                if any_fresh {
+                    let now = Instant::now();
+                    pending_first.get_or_insert(now);
+                    pending_quiet_deadline = Some(now + quiet_window);
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("axon fix --watch: notify error: {e}");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // No event in 250 ms — drain any pending apply.
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!("axon fix --watch: watcher channel disconnected");
+                return ExitCode::from(1);
+            }
+        }
+        // Fire when EITHER quiet window expired OR max wait reached.
+        let now = Instant::now();
+        let should_apply = match (pending_first, pending_quiet_deadline) {
+            (Some(first), Some(quiet_d)) => now >= quiet_d || now >= first + max_wait,
+            _ => false,
+        };
+        if should_apply {
+            pending_first = None;
+            pending_quiet_deadline = None;
+            let touched = run_safe_fixes_once(&watch_target, only);
+            for p in touched {
+                let canon = p.canonicalize().unwrap_or(p);
+                if let Ok(meta) = std::fs::metadata(&canon) {
+                    if let Ok(mtime) = meta.modified() {
+                        last_applied.insert(canon, mtime);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// §34.5 — one pass of Safe-only fix application across `path`. Used
+/// both at startup and on every save event in `--watch`. Returns the
+/// list of files actually written (canonicalized) so the watch loop
+/// can record fresh mtimes and recognize self-triggered notify events
+/// (Stage 34 verification fix M1).
+fn run_safe_fixes_once(
+    path: &std::path::Path,
+    only: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    if path.is_dir() {
+        return apply_safe_fixes_to_project(path, only);
+    }
+    apply_safe_fixes_to_file(path, only)
+}
+
+fn apply_safe_fixes_to_file(
+    path: &std::path::Path,
+    only: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("axon fix --watch: cannot read `{}`: {e}", path.display());
+            return Vec::new();
+        }
+    };
+    // §34.6 verification fix C3 (TOCTOU): capture the mtime AT THE
+    // READ. We re-stat right before the write and abort if it changed
+    // — the user must have edited the file in the gap, and our splice
+    // was computed against stale bytes.
+    let pre_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let file = SourceFile::new(path.to_string_lossy().to_string(), text.clone());
+    let (program, parse_diags) = axon_parser::parse(&file);
+    let diags: Vec<axon_diag::Diagnostic> = if parse_diags.is_empty() {
+        let (_ctx, td) = axon_tyck::check(&file, &program);
+        td
+    } else {
+        parse_diags
+    };
+    // Filter to Safe-only fixes matching --only (when set).
+    let safe_fixes: Vec<(Option<&str>, &axon_diag::Fix)> = diags
+        .iter()
+        .filter(|d| match only {
+            Some(want) => d.code.map(|c| c == want).unwrap_or(false),
+            None => true,
+        })
+        .flat_map(|d| {
+            d.fixes
+                .iter()
+                .filter(|f| f.confidence == axon_diag::Confidence::Safe)
+                .map(move |f| (d.code, f))
+        })
+        .collect();
+    let suggested_count: usize = diags
+        .iter()
+        .flat_map(|d| d.fixes.iter())
+        .filter(|f| f.confidence == axon_diag::Confidence::Suggested)
+        .count();
+
+    if safe_fixes.is_empty() {
+        if suggested_count > 0 {
+            println!(
+                "axon fix --watch [{}]: {suggested_count} Suggested fix(es) — run `axon fix --interactive` to review",
+                path.display()
+            );
+        }
+        return Vec::new();
+    }
+
+    // Same accept-and-splice loop as the dry-run pipeline, minus the
+    // dry-run output.
+    let mut bytes = file.text().as_bytes().to_vec();
+    let mut applied = 0usize;
+    let mut covered: Vec<(usize, usize)> = Vec::new();
+    let mut accepted_edits: Vec<&axon_diag::FixEdit> = Vec::new();
+    for (_code, fix) in &safe_fixes {
+        let overlaps = fix.edits.iter().any(|e| {
+            let s = e.span.start as usize;
+            let t = e.span.end as usize;
+            covered.iter().any(|(cs, ce)| !(t <= *cs || *ce <= s))
+        });
+        if overlaps {
+            continue;
+        }
+        for e in &fix.edits {
+            covered.push((e.span.start as usize, e.span.end as usize));
+            accepted_edits.push(e);
+        }
+        applied += 1;
+    }
+    accepted_edits.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+    for e in accepted_edits {
+        let s = (e.span.start as usize).min(bytes.len());
+        let t = (e.span.end as usize).min(bytes.len()).max(s);
+        bytes.splice(s..t, e.replacement.bytes());
+    }
+    let after = String::from_utf8_lossy(&bytes).into_owned();
+    if after == text {
+        return Vec::new();
+    }
+    // §34.6 verification fix C3: TOCTOU compare right before write.
+    let now_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    if pre_mtime.is_some() && now_mtime != pre_mtime {
+        eprintln!(
+            "axon fix --watch: `{}` changed during apply — aborting (the next save will retry)",
+            path.display()
+        );
+        return Vec::new();
+    }
+    if let Err(e) = std::fs::write(path, &after) {
+        eprintln!("axon fix --watch: cannot write `{}`: {e}", path.display());
+        return Vec::new();
+    }
+    let suggested_note = if suggested_count > 0 {
+        format!(" ({suggested_count} Suggested fix(es) still need review)")
+    } else {
+        String::new()
+    };
+    println!(
+        "axon fix --watch [{}]: auto-applied {applied} Safe fix(es){suggested_note}",
+        path.display()
+    );
+    vec![path.to_path_buf()]
+}
+
+fn apply_safe_fixes_to_project(
+    root: &std::path::Path,
+    only: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let project = match axon_project::LoadedProject::load(root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("axon fix --watch: {e}");
+            return Vec::new();
+        }
+    };
+    let primary = project
+        .modules
+        .first()
+        .map(|m| m.source.clone())
+        .unwrap_or_else(|| SourceFile::new("<merged>", String::new()));
+    let mut all_diags: Vec<axon_diag::Diagnostic> = project.diagnostics.clone();
+    let (_ctx, td) = axon_tyck::check(&primary, &project.merged);
+    all_diags.extend(td);
+
+    // Group Safe edits by file_id; skip Suggested.
+    let mut edits_by_file: std::collections::BTreeMap<u16, Vec<axon_diag::FixEdit>> =
+        std::collections::BTreeMap::new();
+    let mut suggested_count = 0usize;
+    for d in &all_diags {
+        if let Some(want) = only {
+            if d.code.map(|c| c != want).unwrap_or(true) {
+                continue;
+            }
+        }
+        for fix in &d.fixes {
+            if fix.confidence == axon_diag::Confidence::Suggested {
+                suggested_count += 1;
+                continue;
+            }
+            for e in &fix.edits {
+                if e.span.file == 0 {
+                    continue;
+                }
+                edits_by_file
+                    .entry(e.span.file)
+                    .or_default()
+                    .push(e.clone());
+            }
+        }
+    }
+
+    let mut applied_total = 0usize;
+    let mut touched: Vec<std::path::PathBuf> = Vec::new();
+    for (file_id, mut edits) in edits_by_file {
+        let Some(src) = project.sources.get(file_id) else {
+            continue;
+        };
+        let path = src.path().to_path_buf();
+        let original = src.text().to_string();
+        // §34.6 verification fix C3 (TOCTOU): stat at read, compare
+        // right before write.
+        let pre_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        edits.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+        let mut bytes = original.as_bytes().to_vec();
+        // Dedup overlapping edits, accepting in source order. (Different
+        // diagnostics with the same edit shape can dup; this matches
+        // the dry-run path's behavior.)
+        let mut covered: Vec<(usize, usize)> = Vec::new();
+        let mut accepted: Vec<&axon_diag::FixEdit> = Vec::new();
+        // Sort ascending temporarily so overlap is left-to-right.
+        let mut asc: Vec<&axon_diag::FixEdit> = edits.iter().collect();
+        asc.sort_by(|a, b| a.span.start.cmp(&b.span.start));
+        for e in asc {
+            let s = e.span.start as usize;
+            let t = e.span.end as usize;
+            let conflicts = covered.iter().any(|(cs, ce)| !(t <= *cs || *ce <= s));
+            if !conflicts {
+                covered.push((s, t));
+                accepted.push(e);
+            }
+        }
+        accepted.sort_by(|a, b| b.span.start.cmp(&a.span.start));
+        for e in accepted.iter() {
+            let s = (e.span.start as usize).min(bytes.len());
+            let t = (e.span.end as usize).min(bytes.len()).max(s);
+            bytes.splice(s..t, e.replacement.bytes());
+        }
+        let after = String::from_utf8_lossy(&bytes).into_owned();
+        if after == original {
+            continue;
+        }
+        // §34.6 verification fix C3: TOCTOU compare right before write.
+        let now_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if pre_mtime.is_some() && now_mtime != pre_mtime {
+            eprintln!(
+                "axon fix --watch: `{}` changed during apply — aborting",
+                path.display()
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::write(&path, &after) {
+            eprintln!(
+                "axon fix --watch: cannot write `{}`: {e}",
+                path.display()
+            );
+            continue;
+        }
+        applied_total += accepted.len();
+        touched.push(path.clone());
+        println!(
+            "axon fix --watch [{}]: auto-applied {} Safe fix(es)",
+            path.display(),
+            accepted.len()
+        );
+    }
+    if applied_total == 0 && suggested_count > 0 {
+        println!(
+            "axon fix --watch: {suggested_count} Suggested fix(es) — run `axon fix --interactive` to review"
+        );
+    }
+    if applied_total > 0 && suggested_count > 0 {
+        println!(
+            "axon fix --watch: also {suggested_count} Suggested fix(es) still need review"
+        );
+    }
+    touched
 }
 
 /// Minimal unified diff against `path`. Line-based: precision-aware

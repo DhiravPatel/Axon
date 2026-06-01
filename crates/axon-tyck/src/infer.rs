@@ -119,12 +119,22 @@ impl<'a> Checker<'a> {
         // opening `{` when no row exists yet.
         let (uses_inner, insert_body) =
             effect_row_fix_anchors(f.effect_row.as_ref(), body_span);
-        let body_ty = self.with_effect_row_at(
+        let (body_ty, used) = self.with_effect_row_capturing(
             declared_eff.clone(),
             uses_inner,
             insert_body,
             |c, used| c.check_block(&f.body, &declared_ret, &mut scope, &params, used),
         );
+        // §34.2 — record the inferred effect row for this top-level fn
+        // so the LSP effect-row code lens (and `axon why`) can read it
+        // back. Skip when the name fails to resolve, or when the
+        // resolved item's span doesn't match this fn's span (defends
+        // against duplicate-definition clobbering).
+        if let Some(id) = self.ctx.lookup(&f.name.name) {
+            if self.ctx.get(id).map(|s| s.span) == Some(f.span) {
+                self.ctx.record_inferred_effects(id, used);
+            }
+        }
         // Tail-implicit return: if the block produced a value, it must match
         // the declared return type. `check_block` already handles the tail
         // case; we only diagnose if the *whole* body type is wrong.
@@ -146,9 +156,18 @@ impl<'a> Checker<'a> {
                     .map(|r| self.lower_effect_row(r))
                     .unwrap_or_default();
                 let body_span = b.span;
-                let body_ty = self.with_effect_row(declared_eff, |c, used| {
-                    c.check_block(b, &declared_ret, &mut scope, &params, used)
-                });
+                let (body_ty, used) = self.with_effect_row_capturing(
+                    declared_eff,
+                    None,
+                    None,
+                    |c, used| c.check_block(b, &declared_ret, &mut scope, &params, used),
+                );
+                // §34.2 — same record pattern as fn.
+                if let Some(id) = self.ctx.lookup(&t.name.name) {
+                    if self.ctx.get(id).map(|s| s.span) == Some(t.span) {
+                        self.ctx.record_inferred_effects(id, used);
+                    }
+                }
                 if !is_assignable(&body_ty, &declared_ret) {
                     self.report(errors::return_type_mismatch(
                         body_span,
@@ -371,6 +390,40 @@ impl<'a> Checker<'a> {
         f: impl FnOnce(&mut Self, &mut EffectRow) -> R,
     ) -> R {
         self.with_effect_row_at(allowed, None, None, f)
+    }
+
+    /// §34.2 — same as [`Self::with_effect_row_at`] but also returns the
+    /// accumulated `used` effect row. Callers that want to record the
+    /// row (for the LSP effect-row code lens / `axon why`) use this;
+    /// callers that don't care can keep using `with_effect_row{,_at}`.
+    fn with_effect_row_capturing<R>(
+        &mut self,
+        allowed: EffectRow,
+        uses_row_inner: Option<(Span, bool)>,
+        insert_at_body: Option<(usize, u16)>,
+        f: impl FnOnce(&mut Self, &mut EffectRow) -> R,
+    ) -> (R, EffectRow) {
+        let mut used = EffectRow::pure();
+        let out = f(self, &mut used);
+        let missing = used.difference(&allowed);
+        if !missing.is_empty() {
+            let report_span = uses_row_inner
+                .map(|(s, _)| s)
+                .or_else(|| insert_at_body.map(|(at, file)| Span::in_file(at, at, file)))
+                .unwrap_or(Span::DUMMY);
+            self.report(errors::effect_not_declared_with_fix(
+                report_span,
+                &missing,
+                &Ty::Fn {
+                    params: Vec::new(),
+                    ret: Box::new(Ty::Unit),
+                    effects: allowed,
+                },
+                uses_row_inner,
+                insert_at_body,
+            ));
+        }
+        (out, used)
     }
 
     /// Same as [`Self::with_effect_row`], but carries enough source-location

@@ -7,12 +7,14 @@ use axon_diag::Severity;
 use lsp_server::{Connection, ExtractError, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     notification::{DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics},
-    request::{CodeLensRequest, Completion, GotoDefinition, HoverRequest, Initialize, Request as _, Shutdown},
-    CodeLens, CodeLensOptions, CodeLensParams, Command,
+    request::{CodeActionRequest, CodeLensRequest, Completion, GotoDefinition, HoverRequest, Initialize, Request as _, Shutdown},
+    CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
+    CodeActionResponse, CodeLens, CodeLensOptions, CodeLensParams, Command,
     CompletionItem as LspCompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeResult, Location, MarkupContent, MarkupKind, OneOf, PublishDiagnosticsParams, ServerCapabilities,
     ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkDoneProgressOptions,
 };
 
 use crate::{analyze, query};
@@ -38,6 +40,15 @@ pub fn run() -> std::io::Result<()> {
         code_lens_provider: Some(CodeLensOptions {
             resolve_provider: Some(false),
         }),
+        // §34.4 — surface every diagnostic that carries a Fix as a
+        // quickfix lightbulb. We restrict `code_action_kinds` to
+        // QUICKFIX so editors don't ask for refactor / source-action
+        // categories we don't produce.
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+            resolve_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         ..Default::default()
     })
     .expect("server capabilities serialize");
@@ -105,6 +116,11 @@ fn handle_request(req: Request, docs: &HashMap<Url, String>) -> Response {
         }
         CodeLensRequest::METHOD => {
             let result = extract::<CodeLensParams>(req).and_then(|(id, p)| code_lens(id, p, docs));
+            into_resp(id, result)
+        }
+        CodeActionRequest::METHOD => {
+            let result =
+                extract::<CodeActionParams>(req).and_then(|(id, p)| code_action(id, p, docs));
             into_resp(id, result)
         }
         Initialize::METHOD => {
@@ -290,7 +306,7 @@ fn code_lens(
         None => return Ok((id, None)),
     };
     let analysis = analyze(uri.as_str(), &text);
-    let lenses = crate::cost_lens::lenses_for(&analysis.program)
+    let mut lenses: Vec<CodeLens> = crate::cost_lens::lenses_for(&analysis.program)
         .into_iter()
         .map(|l| CodeLens {
             range: crate::position::span_to_range(&text, l.span),
@@ -302,7 +318,44 @@ fn code_lens(
             data: None,
         })
         .collect();
+    // §34.2 — effect-row lenses sit on each fn's name; cost lenses sit
+    // on each ask/generate/plan call. They never share a span, so
+    // appending is safe and the final list stays deterministic
+    // (cost-then-effect in source order).
+    lenses.extend(
+        crate::effect_lens::lenses_for(&analysis.program, &analysis.ctx)
+            .into_iter()
+            .map(|l| CodeLens {
+                range: crate::position::span_to_range(&text, l.span),
+                command: Some(Command {
+                    title: l.label,
+                    command: String::new(),
+                    arguments: None,
+                }),
+                data: None,
+            }),
+    );
     Ok((id, Some(lenses)))
+}
+
+/// §34.4 LSP code actions — turn every `Diagnostic.fixes` payload that
+/// overlaps the requested range into a `CodeAction` the editor renders
+/// as a lightbulb. Safe-confidence fixes set `is_preferred = true` so
+/// VS Code's "Quick Fix..." menu shows them at the top (and, when the
+/// user has explicitly opted in, runs them on save).
+fn code_action(
+    id: RequestId,
+    params: CodeActionParams,
+    docs: &HashMap<Url, String>,
+) -> Result<(RequestId, Option<CodeActionResponse>), Response> {
+    let uri = params.text_document.uri.clone();
+    let text = match docs.get(&uri) {
+        Some(t) => t.clone(),
+        None => return Ok((id, None)),
+    };
+    let analysis = analyze(uri.as_str(), &text);
+    let actions = crate::code_actions::code_actions_for(&analysis, &text, &uri, params.range);
+    Ok((id, Some(actions)))
 }
 
 // ---------------------------------------------------------------------------
