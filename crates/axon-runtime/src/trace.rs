@@ -15,17 +15,43 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// §35.2 — streaming sink type. `axon watch` installs a closure that
+/// fires every time a span closes; the closure prints the span to the
+/// terminal in real time. `Send` so the host can spawn the printer on
+/// a worker if it ever needs to.
+pub type StreamSink = Box<dyn FnMut(&TraceSpan) + Send>;
+
 /// In-memory tracing collector.
 #[derive(Default)]
 pub struct Tracer {
     spans: Vec<TraceSpan>,
     open: Vec<u32>,
     next_id: u32,
+    /// §35.2 — optional streaming sink. When set, `close` invokes it
+    /// with a clone of the just-closed span. The sink is INSTEAD-OF
+    /// not IN-ADDITION-TO the buffered `spans` vec — both still
+    /// populate so `axon watch` can also write `--trace PATH` at end
+    /// of run for archival.
+    on_close: Option<StreamSink>,
 }
 
 impl Tracer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// §35.2 — install a streaming sink. The sink fires every time a
+    /// span closes, with a snapshot of the closed span (cloned to
+    /// avoid borrow conflicts with `spans`/`open`).
+    pub fn with_sink(mut self, sink: StreamSink) -> Self {
+        self.on_close = Some(sink);
+        self
+    }
+
+    /// Variant that takes `&mut self` so a caller can attach a sink to
+    /// an already-allocated Tracer.
+    pub fn set_sink(&mut self, sink: StreamSink) {
+        self.on_close = Some(sink);
     }
 
     /// Open a new span as a child of the currently-open span (if any).
@@ -59,12 +85,31 @@ impl Tracer {
 
     /// Close the span at `id`, recording its end time. Pops the open
     /// stack; in well-formed code the closed span is always the topmost.
+    /// §35.2 — if a streaming sink is installed, fires it with a clone
+    /// of the just-closed span (taking the sink out of `self` for the
+    /// duration of the call so the sink itself can re-enter the tracer
+    /// without a borrow conflict).
     pub fn close(&mut self, id: u32) {
         if let Some(span) = self.spans.iter_mut().find(|s| s.id == id) {
             span.end_ms = Some(now_ms());
         }
         if let Some(pos) = self.open.iter().rposition(|&i| i == id) {
             self.open.remove(pos);
+        }
+        if self.on_close.is_some() {
+            // Clone the just-closed span so the sink doesn't need to
+            // hold a borrow on `self.spans` (which would conflict with
+            // any tracer mutation the sink could trigger).
+            let closed = self
+                .spans
+                .iter()
+                .find(|s| s.id == id)
+                .cloned();
+            if let Some(span) = closed {
+                let mut sink = self.on_close.take().unwrap();
+                sink(&span);
+                self.on_close = Some(sink);
+            }
         }
     }
 

@@ -16,6 +16,9 @@ use axon_ast::{Item, Visibility};
 use axon_lexer::{TokenKind};
 use axon_project::{LoadedProject, ModuleFile};
 
+pub mod doctest;
+pub use doctest::{extract_from_project as extract_doc_tests, DocSnippet, SnippetDisposition};
+
 const STYLESHEET: &str = r#"
 * { box-sizing: border-box; }
 body {

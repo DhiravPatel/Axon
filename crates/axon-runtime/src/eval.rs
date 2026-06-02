@@ -156,6 +156,15 @@ impl Interpreter {
         *self.tracer.borrow_mut() = Some(crate::trace::Tracer::new());
     }
 
+    /// §35.2 — enable tracing with a streaming sink. The sink fires
+    /// every time a span closes — `axon watch` uses this to print
+    /// each span to the terminal as the program runs. Spans are also
+    /// buffered as usual so `take_tracer()` can flush at end of run
+    /// (e.g. for `axon watch --trace PATH`).
+    pub fn enable_tracing_streaming(&self, sink: crate::trace::StreamSink) {
+        *self.tracer.borrow_mut() = Some(crate::trace::Tracer::new().with_sink(sink));
+    }
+
     /// Take ownership of the current tracer (if any), leaving none in its
     /// place. Useful at end-of-run to flush spans to a file.
     pub fn take_tracer(&self) -> Option<crate::trace::Tracer> {
@@ -1693,6 +1702,61 @@ impl Interpreter {
         let init_env = env.child();
         for (k, v) in &state {
             init_env.define(k, v.clone());
+        }
+        // §35.1 — Native agent declaration slots. The parser surfaces
+        // `uses_tools: [...]`, `memory: ...`, `policy: ident`, and
+        // `strategy: ...` as `AgentMember::Setting` entries. We
+        // evaluate the four well-known slot keys at spawn time and
+        // push them onto state under their canonical runtime names
+        // (`tools`, `memory`, `policy`, `strategy`) so handler bodies
+        // can reference them as `self.tools` / `self.memory` / etc.
+        //
+        // §35.6 verification fix C1 — precedence rule:
+        //   user `state` field > slot setting
+        // The user's explicitly-declared state always wins. We
+        // pre-scan `def.state_fields` for canonical slot names and
+        // SKIP a slot whose canonical runtime name will be claimed by
+        // a state field. The tyck (register.rs::state_field_sigs)
+        // applies the same rule; without this guard, the two
+        // disagreed and runtime would have silently surfaced the slot
+        // value while tyck typed the field as the user-declared
+        // shape.
+        //
+        // `policy` and `strategy` evaluate as strings (the value is
+        // the referenced name). For `policy: ident`, the parser
+        // already gives us `AgentSettingValue::Ident(name)` — we
+        // record `Value::String(name)` so `policy_block_check` (which
+        // takes a string) can consume it without further conversion.
+        // `strategy: ident` is the same shape.
+        let user_state_names: std::collections::HashSet<&str> = def
+            .state_fields
+            .iter()
+            .map(|sf| sf.name.as_str())
+            .collect();
+        for (key, value) in &def.settings {
+            let runtime_name = match key.as_str() {
+                "uses_tools" => "tools",
+                "memory" => "memory",
+                "policy" => "policy",
+                "strategy" => "strategy",
+                _ => continue, // legacy keys (model/mempolicy/context/budget) ignored here
+            };
+            // Skip if the user already declared a same-named ctor
+            // param OR a `state` field — user wins.
+            if state.iter().any(|(n, _)| n == runtime_name) {
+                continue;
+            }
+            if user_state_names.contains(runtime_name) {
+                continue;
+            }
+            let v = match value {
+                axon_ast::AgentSettingValue::Expr(e) => self.eval_expr(e, &init_env)?,
+                axon_ast::AgentSettingValue::Ident(id) => {
+                    Value::String(std::rc::Rc::new(id.name.clone()))
+                }
+            };
+            state.push((runtime_name.to_string(), v));
+            init_env.define(runtime_name, state.last().unwrap().1.clone());
         }
         for sf in &def.state_fields {
             let v = match &sf.init {

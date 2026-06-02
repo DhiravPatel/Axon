@@ -215,6 +215,36 @@ impl<'a> Checker<'a> {
                         c.check(e, &expected, &mut scope, &params, used);
                     });
                 }
+                // §35.6 verification fix M1 — typecheck slot setting
+                // expressions against the canonical expected type so
+                // `memory: 42` is rejected at tyck time instead of
+                // crashing at runtime when handler code calls
+                // `self.memory.recall(...)` on an Int.
+                AgentMember::Setting { key, value, .. } => {
+                    use axon_ast::AgentSettingValue;
+                    let expected = match key.name.as_str() {
+                        "uses_tools" => Some(Ty::List(Box::new(Ty::Dyn))),
+                        "memory" => Some(Ty::Memory),
+                        // policy/strategy slots carry an identifier the
+                        // runtime stores as the ident's name (String). The
+                        // parser hands us AgentSettingValue::Ident, so
+                        // we don't typecheck the ident itself; we just
+                        // note the slot was used.
+                        "policy" | "strategy" => None,
+                        // Legacy keys (model/mempolicy/context/budget)
+                        // — checked elsewhere or untyped today.
+                        _ => None,
+                    };
+                    if let (Some(expected_ty), AgentSettingValue::Expr(e)) =
+                        (expected, value)
+                    {
+                        let mut scope = Scope::new();
+                        self.bind_params_in_scope(&mut scope, &a.params, &params);
+                        self.with_effect_row(EffectRow::pure(), |c, used| {
+                            c.check(e, &expected_ty, &mut scope, &params, used);
+                        });
+                    }
+                }
                 _ => {}
             }
         }

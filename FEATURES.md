@@ -1,6 +1,99 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1007 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1052 tests passing** across 30+ crates).
+
+---
+
+## Stage 35 — Authoring Ergonomics: Native Agent Slots + `axon watch` + Trajectory Snapshots + Doc Tests + Project-Mode Interactive Fix
+
+The advisor's "authoring layer" priorities, shipped end-to-end. Async eval core is **explicitly still deferred** — every prior advisor (Stage 32/33/34) flagged it as multi-week, and we keep faithfully delivering bounded ergonomic improvements that compound while the substrate matures. Adversarial verification surfaced 3 critical + 8 major findings; all addressed before merge.
+
+### §35.1 Native agent declaration slots — `uses_tools` / `memory` / `policy` / `strategy`
+
+The advisor's "collapses authoring ceremony" win. The parser already accepted arbitrary `key: value` members inside an `agent { ... }` block; Stage 35 makes four well-known keys semantic slots that desugar at spawn time.
+
+- **`agent X { uses_tools: [a, b], memory: local_memory(), policy: name, strategy: "ReAct", on … {} }`** — handler bodies reach the values via `self.tools` / `self.memory` / `self.policy` / `self.strategy` (canonical runtime names).
+- **Tyck side** ([crates/axon-tyck/src/register.rs](crates/axon-tyck/src/register.rs)) — `state_field_sigs` injects virtual fields per slot so `self.<slot>` typechecks: `tools: List<dyn>`, `memory: Memory`, `policy: String`, `strategy: String`. **§35.6 verification fix M1** — slot expressions are typechecked against the canonical expected type (`memory: 42` is now an E0211, not a runtime crash).
+- **Runtime side** ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs)) — `eval_spawn` walks `def.settings`, recognizes the four canonical keys, evaluates each in `init_env`, and pushes onto state under the runtime name. **§35.6 verification fix C1** — the user's explicit `state <name> = ...` field wins over a same-named slot (precedence rule, runtime and tyck now agree).
+- **v0 disclosures** (in module rustdoc + example header): `uses_tools` is `List<dyn>` not `List<Tool>`; `policy: ident` and `strategy: ident` are stored as `String` of the ident's text (no resolution to a `policy <name> { ... }` block — `policy_block_check` consumes a string name, so this matches the consumer).
+
+### §35.2 `axon watch <file>` — live trace inspector
+
+The advisor's "observe instead of re-run with prints" priority.
+
+- **New streaming sink** ([crates/axon-runtime/src/trace.rs](crates/axon-runtime/src/trace.rs)) — `pub type StreamSink = Box<dyn FnMut(&TraceSpan) + Send>`. `Tracer::close()` invokes the sink with a clone of the just-closed span. `with_sink` / `set_sink` builder API; spans still buffer in `spans` so end-of-run `--trace PATH` flush works.
+- **`Interpreter::enable_tracing_streaming(sink)`** ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs)).
+- **CLI** ([crates/axon-cli/src/main.rs](crates/axon-cli/src/main.rs) `cmd_watch` + new [crates/axon-cli/src/watch_format.rs](crates/axon-cli/src/watch_format.rs) module) — `axon watch <file> [--trace PATH] [--no-color]`. One line per closed span to stderr; stdout left alone for program output. Color auto-detected when stderr is a TTY. **§35.6 verification fix M4** — `ctrlc` handler installed so `--trace PATH` flushes on natural exit; banner honestly says SIGINT may abort before flush.
+- **`watch_format` is a pure module** with 6 unit tests covering anchor offset, attrs (`model=`, `tokens=`, `cost_usd=`), error markers, and color/no-color.
+
+### §35.3 `axon fix --interactive` for project mode
+
+Closes the Stage 34 "deferred to single-file" gap.
+
+- [crates/axon-cli/src/main.rs](crates/axon-cli/src/main.rs) `cmd_fix_project` takes a new `interactive: bool` param; the per-hunk `prompt_interactive` helper is reused unchanged; `[a]ll-from-here` accepts across all remaining files; `[q]uit` aborts the whole pass; non-TTY stdin falls back to dry-run.
+- The 3-tuple `(description, code, edit)` was promoted to a named `ProjectHunk` struct so `confidence` plumbing is index-shuffling-free.
+
+### §35.4 `axon test --record-trajectory` / `--match-trajectory` — snapshot testing for agents
+
+The advisor's "stops examples from rotting" via shape-not-text snapshot comparison.
+
+- **`TrajectoryEvent` + `trajectory_from_events` + `TrajectoryTolerance` + `compare_trajectories`** ([crates/axon-eval/src/trajectory.rs](crates/axon-eval/src/trajectory.rs)) — the new comparison surface. Per-metric tolerances (`step_pct = 0.20`, `grounded_tolerance = 0.10`, `tool_accuracy_tolerance = 0.10`); booleans (`recovered_from_errors`) demand exact equality; allowed-tools is set equality.
+- **`cmd_test` wires the per-test loop** to enable recording when either flag is set, builds a `Trajectory` from the recording's `ModelCall` events, and either writes to `tests/.trajectories/<NAME>/<test>.json` or compares against the saved baseline. Drift exits non-zero so CI catches it.
+- **§35.6 verification fix C2** — a test whose model calls regress to ZERO is the exact thing snapshot testing is designed to catch; the original code silently passed. Now: empty events still build a trajectory, match always reads the baseline, missing baseline in match mode counts as drift (exits non-zero).
+- **§35.6 verification fix M2** — `--record-trajectory <name>` rejects path traversal (`../`, absolute paths, anything that doesn't survive `sanitize_filename` unchanged).
+- **Closure-effect change** in `cmd_test`: tests now inherit the runner's full cap set (the manifest's `[caps] default = [...]`) instead of attenuating to empty. Without this, no effectful test could run; the prior `Some(Vec::new())` made the trajectory feature untestable.
+
+### §35.5 `axon test --doc` / `--doc-only` — doc tests for `///` comments
+
+The advisor's "doc generator + test runner both exist; extracting `` ```axon `` blocks is the missing pipe."
+
+- **New module** [crates/axon-doc/src/doctest.rs](crates/axon-doc/src/doctest.rs) — `scan_fences` finds `` ```axon[,flag] `` … `` ``` `` blocks; `classify_info` parses `ignore` / `no_run` flags; `extract_from_project` walks every module's doc pairs and produces `DocSnippet { item_name, body, disposition }`.
+- **`synthesize_with_existing`** wraps each non-ignored snippet as `test "doc(item_name)" { <body> }`. `no_run` snippets wrap in `if false { ... }` so they parse + typecheck but never execute. Name dedup against intra-doc collisions (`#2`, `#3`, …).
+- **§35.6 verification fix C3** — `body_braces_are_balanced` runs before synthesis; an unbalanced body emits a failing test stub (`assert(false, "doc snippet … has unbalanced braces — splice refused")`) instead of letting a `}` break out of the test wrapper and inject top-level items (tools, fns, tests). Tracks `"` to avoid false positives inside string literals.
+- **§35.6 verification fix M3** — `synthesize_with_existing` also dedupes against the user's existing test names so a `///`-attached snippet on `fn add` plus a user-written `test "doc(add)"` never produces an E0204 pointing at the phantom `<doc-tests>` file.
+- **`cmd_test --doc`** parses the synthesized source via the project's source registry (so spans attribute back to `<doc-tests>`), splices the synthesized `TestDecl`s into `project.merged.items`, runs everything through the regular test loop. `--doc-only` drops the user's tests first.
+
+### §35.6 — Adversarial verification round: 3 critical + 8 major findings, all fixed
+
+The Stage 35 implementation was adversarially reviewed by a 4-reviewer workflow (correctness/edge-cases, integration/cross-cutting, documentation/honesty, security). Verdict: **fix-then-ship**. All addressed; pinned by regression tests in [crates/axon-cli/tests/stage35_verify_fixes.rs](crates/axon-cli/tests/stage35_verify_fixes.rs):
+
+**Critical:**
+- **C1** — slot precedence vs `state` fields inverted (runtime said slot wins, tyck said state wins). Fix: pre-scan `def.state_fields`, skip slots whose canonical name will be claimed. Both layers now agree.
+- **C2** — `--match-trajectory` silently passed regressions that removed all model calls. Fix: always read baseline; missing baseline counts as drift; both exit non-zero.
+- **C3** — doc-test synthesis spliced raw fence bodies between `test "..." {` and `}` with no balanced-brace check; an unmatched `}` could inject arbitrary top-level items. Fix: `body_braces_are_balanced` (string-literal-aware) refuses unbalanced bodies; emits a clear failing stub.
+
+**Major (must-fix-before-merge):**
+- **M1** — slot expressions (`memory: 42`) were never typechecked. Fix: typecheck against the canonical expected type at agent-body check time.
+- **M2** — `--record-trajectory <name>` joined `name` raw onto the snapshot dir; `../../etc` escaped the project. Fix: `sanitize_filename` applied to the set name, rejected if it changes.
+- **M3** — doc-test name collisions with user tests produced E0204 errors pointing at `<doc-tests>`. Fix: `synthesize_with_existing` suffixes against user test names.
+- **M4** — `cmd_watch` banner promised `Ctrl-C to stop` but installed no handler. Fix: `ctrlc::set_handler` installed; banner honestly says SIGINT may abort before `--trace` flush.
+- **M5** — `axon test --help` didn't exist; new flags were undiscoverable. Fix: explicit `--help` branch lists every flag.
+- **M6** — Stage 35 test `user_state_field_wins_over_same_named_slot_default` didn't actually exercise the conflict path (no `uses_tools` slot in the fixture). Fix: fixture rewritten to declare both; rename the no-conflict sanity test.
+- **M7** — `watch_format` header columns didn't align with row output. Fix: padded `kind_label:<10`, `name:<35`, `dur:>6ms`; banner header re-aligned.
+- **M8** — `examples/stage35_agent_slots.ax` header under-disclosed v0 looseness; `policy: support_policy` referenced an undefined identifier. Fix: explicit `// v0 cuts:` block in the header explaining `uses_tools: List<dyn>` and that `policy`/`strategy` are stored as strings.
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-eval::trajectory` | (existing + new compare/from_events) | tolerance shapes |
+| `axon-doc::doctest` | 5 new unit tests | fence scan, flags, synthesis, dedup |
+| `axon-lsp::watch_format` | 6 new unit tests | offset, attrs, error marker, color |
+| `axon-cli::stage35_agent_slots` | 7 integration tests | each of 4 slots + compose + user-state-only + user-state-wins-over-slot |
+| `axon-cli::stage35_watch` | 5 integration tests | startup, stdout split, --trace JSONL, --help, unknown-flag |
+| `axon-cli::stage35_project_interactive` | 3 integration tests | non-TTY fallback, --apply round-trip, tier labels |
+| `axon-cli::stage35_trajectory` | 5 integration tests | record-then-match round-trip, missing-baseline note, mutex, no-model-skip, shape-drift |
+| `axon-cli::stage35_doc_tests` | 6 integration tests | extract, --doc-only, ignore, no_run, parse error, no-fences message |
+| `axon-cli::stage35_verify_fixes` | 8 regression tests | C1 slot precedence, C2 zero-call drift, C2 missing baseline, C3 brace injection, M1 type error, M2 path traversal, M3 collision suffix, M5 --help |
+| **Workspace total** | **1052 passing**, up from 1007 | |
+
+### What's NOT in this stage (explicit, fifth defer)
+
+- **Async eval core** — Stage 31/32/33/34/35 advisors all flagged this as the priority but multi-week. The substrate (Arc/Send+Sync from Stage 32, `axon-async` from Stage 31, `flow_parallel_asks` proven slice) is settled. The migration of `eval.rs` (~3500 LOC of intricate state) needs 2–3 stages of focused work, not one — trying to do it end-to-end in a session ships broken code.
+- **`select` / `parallel { ... }` / `for await` made truly async** — depends on async eval core.
+- **Real package registry / git deps / lockfile** — its own stage.
+- **GBNF → llama.cpp/vllm wiring** — per-backend bridging, its own stage.
+- **Debugger DAP, snapshot testing for non-trajectory shapes, `axon bench`** — each its own stage.
 
 ---
 
