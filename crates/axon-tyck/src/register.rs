@@ -26,7 +26,8 @@ impl<'a> Checker<'a> {
             "assert_eq", "panic", "anthropic", "mock_model", "default_model", "local_memory",
             // ---- Stage 11 stdlib: std.string ----
             "str_upper", "str_lower", "str_trim", "str_trim_start", "str_trim_end",
-            "str_split", "str_join", "str_contains", "str_starts_with", "str_ends_with",
+            "str_split", "str_split_lines", "str_split_once",
+            "str_join", "str_contains", "str_starts_with", "str_ends_with",
             "str_replace", "str_repeat", "str_len", "str_chars", "str_index_of",
             "str_substring",
             // ---- Stage 11 stdlib: std.list ----
@@ -49,7 +50,8 @@ impl<'a> Checker<'a> {
             "math_cos", "math_tan", "math_log", "math_log2", "math_exp", "math_pi",
             "math_e", "math_gcd",
             // ---- Stage 11 stdlib: std.time (pure helpers; clock is in EFFECTFUL) ----
-            "dur_seconds", "dur_millis", "dur_from_seconds", "dur_from_millis",
+            "dur_seconds", "dur_millis", "dur_micros", "dur_nanos", "dur_seconds_f64",
+            "dur_from_seconds", "dur_from_millis",
             "date_year", "date_month", "date_day", "date_make", "date_is_leap",
             // ---- Stage 11 memory: host-installed kv store ----
             "mem_open_file", "mem_open_ephemeral", "mem_set", "mem_get", "mem_remove",
@@ -166,6 +168,8 @@ impl<'a> Checker<'a> {
             "prompt_version_prompts",
             // ---- Stage 28 §29.5 consensus + spawn_pool ----
             "flow_consensus", "flow_spawn_pool",
+            // ---- Stage 36 §36.B.3 majority sugars over flow_consensus ----
+            "flow_majority", "flow_majority_with",
             // ---- Stage 28 §29.9 human pseudo-agent ----
             "human_request", "human_resolve", "human_cancel",
             // ---- Stage 28 §30 policy block ----
@@ -192,6 +196,10 @@ impl<'a> Checker<'a> {
             "schema_to_gbnf",
             // ---- Stage 32 async I/O acceptance: sleepy mock model ----
             "mock_model_slow",
+            // ---- Stage 36 §36.B.5 call-site resilience combinators ----
+            // Effect-row neutral: the inner thunk's row drives the
+            // capability check (call_value attenuates as usual).
+            "with_retry", "with_timeout",
         ];
         const EFFECTFUL: &[(&str, &[&str])] = &[
             ("print", &["Console"]),

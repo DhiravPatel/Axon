@@ -348,8 +348,11 @@ fn duration_round_trip() {
 fn function_count_matches_registry() {
     // `axon-std` registers a known number of functions; if anyone adds
     // one without updating COUNT, this catches it.
+    // §36.B.2 raised:
+    //   string 16 → 18 (str_split_lines + str_split_once)
+    //   time   9 → 12 (dur_micros + dur_nanos + dur_seconds_f64)
     assert_eq!(
         axon_std::FUNCTION_COUNT,
-        16 + 16 + 10 + 9 + 6 + 7 + 14 + 9
+        18 + 16 + 10 + 9 + 6 + 7 + 14 + 12
     );
 }

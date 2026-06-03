@@ -2563,6 +2563,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::For) => self.parse_for_expr(),
             TokenKind::Keyword(Kw::While) => self.parse_while_expr(),
             TokenKind::Keyword(Kw::Select) => self.parse_select_expr(),
+            TokenKind::Keyword(Kw::Parallel) => self.parse_parallel_expr(),
             TokenKind::Keyword(Kw::Ask) => self.parse_ask_expr(),
             TokenKind::Keyword(Kw::Generate) | TokenKind::Keyword(Kw::Gen) => {
                 self.parse_generate_expr()
@@ -2899,6 +2900,42 @@ impl<'a> Parser<'a> {
         Expr {
             span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
             kind: Box::new(ExprKind::Select(arms)),
+        }
+    }
+
+    /// Parse `parallel { arm, arm, ... }` (Stage 36).
+    ///
+    /// Each arm is an expression — the eval-time check enforces that each
+    /// arm is a single `ask` expression (the only shape Stage 36 supports;
+    /// Stage 37 lifts the restriction). Empty blocks are a parse error.
+    /// Trailing commas accepted. Newlines tolerated like other block forms.
+    fn parse_parallel_expr(&mut self) -> Expr {
+        let start = self.peek_span();
+        self.bump(); // `parallel`
+        self.expect(&TokenKind::LBrace, "`{` to open `parallel`");
+        self.eat_newlines();
+        let mut arms: Vec<Expr> = Vec::new();
+        while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
+            arms.push(self.parse_expr_bp(1));
+            self.eat_newlines();
+            if matches!(self.peek(), TokenKind::Comma) {
+                self.bump();
+                self.eat_newlines();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}` to close `parallel`");
+        if arms.is_empty() {
+            let span = Span::in_file(start.start as usize, self.prev_end(), self.file_id);
+            self.error(
+                "`parallel { }` requires at least one arm (each arm is an `ask` expression)",
+                span,
+            );
+        }
+        Expr {
+            span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+            kind: Box::new(ExprKind::Parallel(arms)),
         }
     }
 

@@ -693,6 +693,10 @@ impl Compiler {
                 "select requires the actor runtime (stage 5.5)",
                 expr.span,
             ),
+            ExprKind::Parallel(_) => self.emit_unsupported(
+                "parallel requires the tree-walking evaluator (Stage 36 added it for `--tree`, not `--vm`)",
+                expr.span,
+            ),
             ExprKind::Ask { .. } => self.emit_unsupported(
                 "ask requires a Model and the LLM effect (stage 6)",
                 expr.span,

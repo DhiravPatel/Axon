@@ -267,6 +267,7 @@ keywords! {
     Not => "not",
     On => "on",
     Or => "or",
+    Parallel => "parallel",
     Plan => "plan",
     Prompt => "prompt",
     Pub => "pub",

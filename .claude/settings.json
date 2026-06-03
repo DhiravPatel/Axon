@@ -55,7 +55,17 @@
       "Bash(grep -n \"Some\\(Vec::new\\(\\)\\)\\\\|None,\\\\s*$\\\\|effects: None\" \"/Users/dhiravpatel/Documents/Project 2/Axon/crates/axon-cli/src/main.rs\")",
       "Bash(\"/Users/dhiravpatel/Documents/Project 2/Axon/target/debug/axon\" test --doc .)",
       "Bash(grep -n \"Closure::new\\\\|attenuation\\\\|None.*\\\\$35\\\\|caps:.*None\" \"/Users/dhiravpatel/Documents/Project 2/Axon/crates/axon-runtime/src/value.rs\")",
-      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"final stage35:\", p, \"passed,\", f, \"failed\" }')"
+      "Bash(awk '-F[:;]' '{ for \\(i=1; i<=NF; i++\\) { if \\($i ~ /passed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); p += $i } if \\($i ~ /failed/\\) { gsub\\(\"[^0-9]\",\"\",$i\\); f += $i } } } END { print \"final stage35:\", p, \"passed,\", f, \"failed\" }')",
+      "Bash(cargo --version)",
+      "Bash(awk -F\"[ ;]+\" '{p+=$4; f+=$6} END{print \"passed=\" p \" failed=\" f}')",
+      "Bash(tee /tmp/axon_stage36_pre.log)",
+      "Bash(grep -B 1 \"^failures:$\" /tmp/axon_stage36_pre.log)",
+      "Bash(tee /tmp/axon_stage36_post.log)",
+      "Read(//Users/dhiravpatel/Documents/Project\\\\ 2/**)",
+      "Bash(awk -F\"[ ;]+\" '{p+=$4; f+=$6} END{print \"TOTAL passed=\" p \" failed=\" f}')",
+      "Read(//Users/dhiravpatel/Documents/Project\\\\ 2/Axon/crates/axon-runtime/src/**)",
+      "Bash(tee /tmp/axon_stage36_post2.log)",
+      "Bash(tee /tmp/axon_stage36_final.log)"
     ],
     "additionalDirectories": [
       "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec",

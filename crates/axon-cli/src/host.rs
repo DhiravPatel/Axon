@@ -5573,6 +5573,23 @@ fn install_stage28(interp: &Interpreter) {
         "flow_consensus",
         n("flow_consensus", 2, Some(2), s28_flow_consensus),
     );
+    // §36.B.3 — high-frequency one-liner sugars over flow_consensus. The
+    // typical agent shape is: parallel { ask m1{...}, ask m2{...}, ask m3{...} }
+    // returns List<String>; the next line should be `let winner = flow_majority(xs)`
+    // not hand-rolled vote-counting in user code.
+    interp.register_native(
+        "flow_majority",
+        n("flow_majority", 1, Some(1), s36_flow_majority),
+    );
+    interp.register_native(
+        "flow_majority_with",
+        n(
+            "flow_majority_with",
+            1,
+            Some(1),
+            s36_flow_majority_with,
+        ),
+    );
     interp.register_native_ext(
         "flow_spawn_pool",
         ext("flow_spawn_pool", 2, Some(2), s28_spawn_pool),
@@ -5678,6 +5695,106 @@ fn s28_flow_consensus(args: &[Value]) -> Result<Value, String> {
     let d = cons::consensus(&votes, &cfg);
     let j = serde_json::to_value(&d).map_err(|e| format!("flow_consensus: {e}"))?;
     Ok(json_to_value(&j))
+}
+
+// --------- §36.B.3 flow_majority sugars ---------
+
+/// `flow_majority(votes: List<String>) -> String` — return the option
+/// with the most votes. Ties broken deterministically by first-seen
+/// order. Empty list errors (no decision possible without input).
+///
+/// The natural sequel to `parallel { ask m1{...}, ask m2{...}, ask m3{...} }` —
+/// that block returns `List<String>` and most agents want to collapse it
+/// to one canonical answer in the next line.
+fn s36_flow_majority(args: &[Value]) -> Result<Value, String> {
+    let votes = extract_string_votes(&args[0], "flow_majority")?;
+    if votes.is_empty() {
+        return Err(
+            "flow_majority: vote list is empty — no winner can be picked. \
+             Filter out errors or require N>=1 model successes upstream."
+                .into(),
+        );
+    }
+    let outcome = majority_with_first_seen_tiebreak(&votes);
+    Ok(Value::String(Rc::new(outcome)))
+}
+
+/// `flow_majority_with(votes: List<String>) -> Record { label, support, total, tie }`
+/// — same selection rule as `flow_majority` but returns the support count
+/// and whether there was a tie at the top. Use when you need to gate on
+/// "must have at least 2-of-3 agreement" or to log dissent.
+fn s36_flow_majority_with(args: &[Value]) -> Result<Value, String> {
+    let votes = extract_string_votes(&args[0], "flow_majority_with")?;
+    if votes.is_empty() {
+        return Err(
+            "flow_majority_with: vote list is empty — no winner can be picked."
+                .into(),
+        );
+    }
+    let total = votes.len();
+    let outcome = majority_with_first_seen_tiebreak(&votes);
+    let support = votes.iter().filter(|v| **v == outcome).count();
+    // Tie: another distinct option has the same support count as the winner.
+    let tie = votes
+        .iter()
+        .filter(|v| **v != outcome)
+        .fold(std::collections::HashMap::<&str, usize>::new(), |mut m, v| {
+            *m.entry(v.as_str()).or_insert(0) += 1;
+            m
+        })
+        .values()
+        .any(|c| *c == support);
+    let mut rec: Vec<(String, Value)> = Vec::new();
+    rec.push(("label".into(), Value::String(Rc::new(outcome))));
+    rec.push(("support".into(), Value::Int(support as i64)));
+    rec.push(("total".into(), Value::Int(total as i64)));
+    rec.push(("tie".into(), Value::Bool(tie)));
+    Ok(Value::Record(Rc::new(RefCell::new(rec))))
+}
+
+fn extract_string_votes(v: &Value, name: &str) -> Result<Vec<String>, String> {
+    let xs = match v {
+        Value::List(l) => l.borrow().clone(),
+        other => {
+            return Err(format!(
+                "{name}: votes must be a List<String>, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(xs.len());
+    for (i, x) in xs.into_iter().enumerate() {
+        match x {
+            Value::String(s) => out.push(s.as_str().to_owned()),
+            other => {
+                return Err(format!(
+                    "{name}: votes[{i}] must be a String, got `{}`",
+                    other.type_name()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn majority_with_first_seen_tiebreak(votes: &[String]) -> String {
+    let mut tally: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut first_seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, v) in votes.iter().enumerate() {
+        *tally.entry(v.as_str()).or_insert(0) += 1;
+        first_seen.entry(v.as_str()).or_insert(i);
+    }
+    // Pick the highest-count option; on ties, the option that appeared
+    // earliest in the vote stream wins (deterministic across runs).
+    let winner = tally
+        .iter()
+        .max_by(|a, b| {
+            a.1.cmp(b.1)
+                .then_with(|| first_seen[b.0].cmp(&first_seen[a.0]))
+        })
+        .map(|(k, _)| k.to_string())
+        .unwrap_or_default();
+    winner
 }
 
 /// `flow_spawn_pool(constructor, size)` calls `constructor()` N times
@@ -6720,37 +6837,37 @@ pub fn register_schemas(program: &axon_ast::Program) {
 // (vs ~600 ms for the serial `flow_parallel` from Stage 28).
 // ===========================================================================
 
-/// Singleton tokio runtime used to dispatch parallel model I/O. Held for
-/// the lifetime of the process. `OnceLock` (not `thread_local`) because
-/// the runtime must outlive `block_on` and its workers run on detached
-/// threads — a thread-local would tear the runtime down at first thread
-/// exit and leak the workers.
+/// Singleton tokio runtime used to dispatch parallel model I/O.
+///
+/// Stage 36 unified this onto a single process-wide runtime in
+/// [`axon_runtime::async_rt`]. This shim preserves the original name so
+/// the existing call sites in `flow_parallel_asks_impl` don't need to
+/// change shape, but the OnceLock now lives in axon-runtime so that
+/// `Interpreter::run_async` and `parallel { }` evaluation share the same
+/// runtime — avoiding the "Cannot start a runtime from within a runtime"
+/// panic that nested-block_on would otherwise produce.
 fn parallel_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("axon-parallel")
-            // Bounded worker pool — large enough to make 8-way parallelism
-            // free, small enough that a runaway `flow_parallel_asks` can't
-            // exhaust file descriptors / RAM.
-            .worker_threads(num_workers())
-            .build()
-            .expect("tokio runtime")
-    })
-}
-
-fn num_workers() -> usize {
-    // The model I/O is blocking — `spawn_blocking` runs on a separate
-    // blocking pool whose default is 512 threads. Four worker threads on
-    // the core executor are plenty to drive coordination tasks.
-    4
+    axon_runtime::async_rt::runtime()
 }
 
 fn install_stage32(interp: &Interpreter) {
     interp.register_native_ext(
         "flow_parallel_asks",
         ext("flow_parallel_asks", 1, Some(1), flow_parallel_asks_impl),
+    );
+    // §36.B.5 call-site resilience combinators. The fn-level `@retry` /
+    // `@deadline` attributes have shipped since Stage 18; these expose
+    // the same policies as call-site sugars so user code can wrap a
+    // specific `ask`/`tool_call` without authoring a whole `fn @retry`
+    // wrapper. True syntactic `@retry(...) ask m{}` lands in Stage 37
+    // (requires AST + parser changes; the builtin form is a bounded slice).
+    interp.register_native_ext(
+        "with_retry",
+        ext("with_retry", 2, Some(3), s36_with_retry),
+    );
+    interp.register_native_ext(
+        "with_timeout",
+        ext("with_timeout", 2, Some(2), s36_with_timeout),
     );
     // Testing-only: a mock model whose `complete` sleeps `ms` before
     // returning `text`. Used by the wall-time acceptance test to prove
@@ -6901,11 +7018,13 @@ fn flow_parallel_asks_impl(
     for (provider, request) in &batch {
         let p = provider.clone();
         let r = request.clone();
-        handles.push(rt.spawn_blocking(move || p.complete(&r)));
+        handles.push(axon_runtime::async_rt::spawn_blocking_counted(move || {
+            p.complete(&r)
+        }));
     }
     // Join in input order — NOT completion order. This is what makes
     // replay byte-identical to a serial run.
-    let results: Vec<Result<axon_models::ChatResponse, String>> = rt.block_on(async move {
+    let join_async = async move {
         let mut out = Vec::with_capacity(handles.len());
         for h in handles {
             let r = match h.await {
@@ -6916,7 +7035,17 @@ fn flow_parallel_asks_impl(
             out.push(r);
         }
         out
-    });
+    };
+    // Stage 36: when called from inside `Interpreter::run_async` we're
+    // already in a tokio context; `rt.block_on(...)` would panic with
+    // "Cannot start a runtime from within a runtime". `block_in_place`
+    // releases the worker thread to siblings while we wait synchronously.
+    let results: Vec<Result<axon_models::ChatResponse, String>> =
+        if axon_runtime::async_rt::in_runtime_context() {
+            tokio::task::block_in_place(|| rt.block_on(join_async))
+        } else {
+            rt.block_on(join_async)
+        };
 
     // Now that we have all responses in input order, walk them once:
     //   1. record (in order) — replay sees the same sequence a serial run would
@@ -6939,6 +7068,155 @@ fn flow_parallel_asks_impl(
         }
     }
     Ok(list_value(out))
+}
+
+// --------- §36.B.5 call-site resilience combinators ---------
+
+/// `with_retry(thunk, times, backoff_ms = 0)` — invoke `thunk()` up to
+/// `times` total attempts on any runtime error, sleeping `backoff_ms`
+/// between attempts. Returns the first successful value; surfaces the
+/// last error if every attempt fails.
+///
+/// Use to wrap a single resilient call without authoring a `fn @retry`
+/// wrapper:
+///
+///     let answer = with_retry(|| ask m { user: "q" }, 3, 100)
+fn s36_with_retry(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let thunk = args[0].clone();
+    // §36.6 verification fix S4 — bound `times` so an unsigned cast of
+    // i64::MAX (= u32::MAX = ~4B iterations) doesn't burn the host's
+    // entire afternoon on a typo. 1000 is generous for any realistic
+    // retry workflow; users who want unbounded retry should write an
+    // explicit loop with their own termination predicate.
+    const MAX_RETRY_TIMES: i64 = 1000;
+    let times = match &args[1] {
+        Value::Int(n) if *n >= 1 && *n <= MAX_RETRY_TIMES => *n as u32,
+        Value::Int(n) => {
+            return Err(format!(
+                "with_retry: times must be in 1..={MAX_RETRY_TIMES}, got {n}"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "with_retry: times must be Int, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    // §36.6 verification fix S4b — same shape for backoff. 3_600_000 ms
+    // = 1 hour. Above that, the user almost certainly meant something
+    // other than "wait this many milliseconds between retries."
+    const MAX_BACKOFF_MS: i64 = 3_600_000;
+    let backoff_ms = match args.get(2) {
+        Some(Value::Int(n)) if *n >= 0 && *n <= MAX_BACKOFF_MS => *n as u64,
+        Some(Value::Nil) | None => 0,
+        Some(Value::Int(n)) => {
+            return Err(format!(
+                "with_retry: backoff_ms must be in 0..={MAX_BACKOFF_MS}, got {n}"
+            ));
+        }
+        Some(other) => {
+            return Err(format!(
+                "with_retry: backoff_ms must be Int, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let mut last_err: Option<axon_runtime::EvalSignal> = None;
+    for attempt in 1..=times {
+        match interp.call_value(&thunk, &[], span) {
+            Ok(v) => return Ok(v),
+            Err(sig @ axon_runtime::EvalSignal::Error(_)) => {
+                last_err = Some(sig);
+                if attempt < times && backoff_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                }
+            }
+            // Non-error control flow (Return/Break/Continue/Yield) — bubble up.
+            Err(other) => {
+                return Err(format!(
+                    "with_retry: unexpected control-flow signal from thunk: {other:?}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "with_retry: all {times} attempts failed; last error: {}",
+        last_err
+            .map(|e| eval_signal_msg(&e))
+            .unwrap_or_else(|| "(no error captured)".into())
+    ))
+}
+
+/// `with_timeout(thunk, ms)` — invoke `thunk()` synchronously and error
+/// if the call takes longer than `ms` milliseconds (post-call check, like
+/// `@deadline`). The synchronous interpreter can't abort the body
+/// mid-evaluation; the deadline is enforced as a wall-clock budget at
+/// return time. True mid-call cancellation arrives with Stage 38's async
+/// substrate.
+fn s36_with_timeout(
+    interp: &mut Interpreter,
+    args: &[Value],
+    span: axon_diag::Span,
+) -> Result<Value, String> {
+    let thunk = args[0].clone();
+    // §36.6 verification fix S4b — bound the deadline. 1 hour cap mirrors
+    // with_retry's backoff cap so users get consistent guard messages.
+    const MAX_TIMEOUT_MS: i64 = 3_600_000;
+    const MAX_TIMEOUT_NS: i64 = MAX_TIMEOUT_MS * 1_000_000;
+    let ms = match &args[1] {
+        Value::Int(n) if *n >= 0 && *n <= MAX_TIMEOUT_MS => *n as u64,
+        Value::Int(n) => {
+            return Err(format!(
+                "with_timeout: ms must be in 0..={MAX_TIMEOUT_MS}, got {n}"
+            ));
+        }
+        Value::Duration(ns) if *ns >= 0 && *ns <= MAX_TIMEOUT_NS => (*ns as u64) / 1_000_000,
+        Value::Duration(ns) => {
+            return Err(format!(
+                "with_timeout: Duration must be in 0..={MAX_TIMEOUT_MS}ms, got {ns}ns"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "with_timeout: ms must be Int or Duration, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let started = std::time::Instant::now();
+    let res = interp.call_value(&thunk, &[], span);
+    let elapsed = started.elapsed().as_millis() as u64;
+    match res {
+        Ok(v) => {
+            if elapsed > ms {
+                Err(format!(
+                    "with_timeout: budget {ms}ms exceeded after success (took {elapsed}ms)"
+                ))
+            } else {
+                Ok(v)
+            }
+        }
+        Err(sig @ axon_runtime::EvalSignal::Error(_)) => {
+            // Surface the underlying error, but annotate if it would have
+            // tripped the timeout anyway.
+            let msg = eval_signal_msg(&sig);
+            if elapsed > ms {
+                Err(format!(
+                    "with_timeout: budget {ms}ms exceeded after error in {elapsed}ms: {msg}"
+                ))
+            } else {
+                Err(msg)
+            }
+        }
+        Err(other) => Err(format!(
+            "with_timeout: unexpected control-flow signal from thunk: {other:?}"
+        )),
+    }
 }
 
 /// Pull `(model, ChatRequest)` out of one record entry. The record shape

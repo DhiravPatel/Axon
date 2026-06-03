@@ -1,6 +1,120 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1052 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1089 tests passing** across 30+ crates).
+
+---
+
+## Stage 36 — Async Eval Boundary + `parallel { }` Surface Syntax + Agent-DX Pack
+
+The seventh consecutive stage of bounded language work. Two interlocking deliveries: the **async eval boundary** (the long-deferred async substrate, sliced honestly — Stage 36 is one of three planned stages to migrate the runtime onto tokio without rewriting the interior) plus an **agent-DX pack** that makes the new substrate immediately useful to authors writing concurrent agent code. Adversarial verification surfaced 1 critical + 2 major findings; all addressed before merge with regression tests pinning each.
+
+The advisor's repeated pointed feedback over Stages 31–35 was: *stop deferring the async core; decompose it.* Stage 36 starts that decomposition. The pattern from prior stages — bounded scope, named scope cuts, end-to-end verification — held: the async work is **boundary only**, every `fn eval_*` in `eval.rs` stays synchronous, `Interpreter` stays `!Send`, and a CI-level scope-invariant test mechanically blocks accidental scope creep into Stage 37/38 territory.
+
+### §36.A — Async eval boundary: `Interpreter::run_async` + unified tokio runtime singleton
+
+The seam between the CLI dispatcher and the synchronous tree-walking interpreter is now async-aware. The interpreter interior is unchanged; the wrapper handles the runtime.
+
+- **New `crates/axon-runtime/src/async_rt.rs`** — process-wide tokio runtime via `OnceLock`, built `multi_thread().worker_threads(4).thread_name("axon-async")`. Public API: `runtime() -> &'static Runtime`, `in_runtime_context() -> bool` (detects whether we're already inside a `block_on`), `spawn_blocking_counted` (wraps `Runtime::spawn_blocking` and increments a telemetry counter), `SPAWN_BLOCKING_COUNT` / `reset_spawn_blocking_count` / `spawn_blocking_count` (used by replay determinism tests to prove zero tokio touches under replay).
+- **New `crates/axon-runtime/src/parallel.rs`** — owns the per-arm spawn/join/record/debit machinery for `parallel { }` so the eval surface site stays tight. `run_parallel_asks(interp, arms, span)` takes owned `(Arc<dyn ModelProvider>, ChatRequest)` pairs (Interpreter never crosses a thread boundary), short-circuits replay without touching tokio, and on the live path joins in input order via `block_in_place` when already in a reactor context (or plain `block_on` when called from a sync caller).
+- **`Interpreter::run_async`** and **`Interpreter::call_value_async`** in [crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs) — thin wrappers (`async_rt::runtime().block_on(async { self.run_main() })`) that enter the tokio reactor before driving the unchanged sync interior. The async sibling exists so that `cmd_test`'s per-test `call_value` invocations also enter the reactor (otherwise nested `parallel { }` inside a test would crash with "Cannot start a runtime from within a runtime").
+- **`cmd_run` and `cmd_test` route through `run_async` / `call_value_async` by default.** The `--no-async` CLI flag (and `AXON_NO_ASYNC=1` env var) bypass the seam and call `run_main` / `call_value` directly — escape hatch for perf A/B comparison and as a kill-switch.
+- **`crates/axon-cli/src/host.rs`'s `parallel_runtime()` is now a one-line shim** delegating to `axon_runtime::async_rt::runtime()` — `flow_parallel_asks` and the new `parallel { }` syntax share the singleton, avoiding the nested-runtime panic when one calls the other. The inner `block_on` is now wrapped: `if in_runtime_context() { block_in_place(|| rt.block_on(...)) } else { rt.block_on(...) }` — defuses the Stage 36 case where `flow_parallel_asks` runs inside `cmd_run` (which itself `block_on`s the singleton).
+
+### §36.A — `parallel { ask m1 { ... }, ask m2 { ... } }` as new surface syntax
+
+Stage 32 proved overlap for the host binding `flow_parallel_asks`. Stage 36 lifts it to the language: `parallel { }` is a real expression form parsed by `parse_parallel_expr`, type-checked by `ExprKind::Parallel(arms) => Ty::Dyn` (declaring `LLM + Net` effects on behalf of the block), and evaluated by `eval_parallel`.
+
+- **Lexer**: `Parallel` keyword added to `crates/axon-lexer/src/token.rs` next to `Select`.
+- **AST**: `ExprKind::Parallel(Vec<Expr>)` in [crates/axon-ast/src/lib.rs](crates/axon-ast/src/lib.rs). One variant, no slots — each arm is just an expression. The Stage 36 single-ask-per-arm restriction is enforced at eval time, not parse time, so the AST stays clean for Stage 37 lift.
+- **Parser**: `parse_parallel_expr` mirrors `parse_select_expr` in shape. Empty block is a parse error; trailing commas accepted.
+- **Tyck**: walks every arm so per-arm type errors surface; declares LLM + Net effects (matches Ask's row); returns `Ty::Dyn`.
+- **Eval**: `eval_parallel` in [crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs) enforces the §36 limit (each arm must be a single `ask` expression — Stage 37 lifts this once `Interpreter` is `Send`-safe), the batch-size ceiling (≤ 64 arms), the LLM + Net cap requirement, and rejects arms with `tools:` slots (tool-use loop needs an interpreter on the worker thread). Operand evaluation happens on the calling thread (RNG / frozen-clock thread_locals only fire here); only owned `(Arc, ChatRequest)` pairs cross the boundary into `run_parallel_asks`.
+- **Honest scope cut messaged inline**: the error for a non-Ask arm includes a workaround hint pointing at `flow_parallel_asks` for the record-arm shape. The Stage 37 lift is named.
+- **`axon-vm` and `axon-wasm`** add their `Parallel` unsupported-stub arms — `--vm` errors cleanly with "parallel requires the tree-walking evaluator"; WASM emits an `unsupported("\`parallel\`", e.span)` diagnostic.
+
+### §36.B — Agent-DX pack: features that compose with the async substrate
+
+Five candidate features were ranked by an independent research workflow; four shipped, one was deferred (named explicitly below).
+
+#### §36.B.3 — `flow_majority` / `flow_majority_with` stdlib combinators
+
+The natural sequel to `parallel { ask m1, ask m2, ask m3 }` is collapsing the resulting `List<String>` into one canonical answer. Stage 28's `flow_consensus` does this but takes typed `Vote` records and a config; the §36 sugars take a plain `List<String>`.
+
+- **`flow_majority(votes: List<String>) -> String`** ([crates/axon-cli/src/host.rs](crates/axon-cli/src/host.rs)) — returns the option with the highest count; ties broken deterministically by first-seen position.
+- **`flow_majority_with(votes: List<String>) -> Record { label, support, total, tie }`** — same selection rule but reports support count and a tie flag so callers can gate on "must have 2-of-3 agreement" or log dissent.
+- Empty list errors (no useful winner is possible).
+- Tyck-registered in [crates/axon-tyck/src/register.rs](crates/axon-tyck/src/register.rs).
+
+#### §36.B.2 — Stdlib expansion: line splits + sub-millisecond duration accessors
+
+- **`str_split_lines(s)`** ([crates/axon-std/src/string.rs](crates/axon-std/src/string.rs)) — split on every LF, no trailing empty string (matches Rust's `lines()`).
+- **`str_split_once(s, sep)`** — split at the FIRST occurrence; returns `[head, tail]` (or `[s]` when sep not found). Useful for `key=value`, `path:line` parsing.
+- **`dur_micros` / `dur_nanos` / `dur_seconds_f64`** ([crates/axon-std/src/time.rs](crates/axon-std/src/time.rs)) — the bench/eval reports the async work makes possible want sub-millisecond precision; `dur_millis` rounds to integer ms and was the only accessor.
+- `axon-std::FUNCTION_COUNT` updated (now 92, was 87) and the registry-vs-COUNT test in [crates/axon-std/tests/std.rs](crates/axon-std/tests/std.rs) updated to match.
+
+#### §36.B.4 — `axon trace promote <recording.json> --to-suite <suite.ax>`
+
+Closes the production-failure-to-regression-test loop. A recording captured by `axon run --record` becomes a self-contained test in one command:
+
+```
+axon trace promote rec.json --to-suite tests/regressions.ax [--name <id>] [--assert-contains <substr>]
+```
+
+- Reads the recording, extracts the last `model_call` event's content, appends a `test "<name>" { ... }` block that uses `mock_model("fixed", "<recorded-content>")` to reproduce the response and asserts the response appears in the output. ([crates/axon-cli/src/main.rs](crates/axon-cli/src/main.rs))
+- **APPEND, not rewrite** — existing scenarios are preserved (no diff hazard).
+- Auto-names from `<recording-stem>_<fnv1a-hash-of-filename-plus-content>` when `--name` is omitted.
+- Refuses empty / no-`model_call` recordings (pinning an empty response would not be a useful regression test).
+- String escaping handles backslash, quote, control chars, **bidi direction overrides (U+202A–202E, U+2066–2069), and zero-width characters (U+200B–200D, U+FEFF)** — recordings come from external LLM responses that get baked into developer-readable source; the escape prevents hidden injection from reviewer-invisible Unicode.
+
+#### §36.B.5 — `with_retry` / `with_timeout` call-site resilience combinators
+
+Production-shaped wrappers for individual calls. The fn-level `@retry` / `@deadline` attributes have shipped since Stage 18; these are the call-site equivalents.
+
+- **`with_retry(thunk, times, backoff_ms = 0)`** — invoke `thunk()` up to `times` total attempts on any runtime error. Bounded: `times` ∈ `1..=1000`, `backoff_ms` ∈ `0..=3_600_000`. Out-of-range values are rejected at the boundary with named errors.
+- **`with_timeout(thunk, ms)`** — invoke `thunk()` and error if it took longer than `ms`. Post-call enforcement (the synchronous interpreter can't preempt mid-eval; true mid-call cancellation lands with Stage 38). Same 1-hour ceiling. Accepts `Int` or `Duration`.
+- Both are `NativeExt` so user-supplied closures invoke through `Interpreter::call_value`, which preserves capability attenuation and tracing.
+- True syntactic `@retry(3) ask m { ... }` form is deferred to Stage 37 (requires AST + parser changes; the builtin form is the bounded slice).
+
+#### §36.B.1 (DEFERRED to Stage 37) — Contextual keywords (`prompt`/`model`/`memory`/`policy`/`tool`/`agent` usable as identifiers)
+
+Originally ranked top by the DX research workflow (PAPERCUT P2 — every new author hits `let prompt = ...` as a parse error in their first 10 minutes). Implementation requires a soft-keyword pass in the lexer + dispatch logic in the parser + a sweep of all examples for now-obsolete renames. **Too invasive to land alongside the async core in this slice** — the risk of breaking 1000+ existing parser tests in subtle ways was unacceptable. Explicitly named as a Stage 37 priority.
+
+### §36.6 — Adversarial verification round: 1 critical + 2 major + 3 should-fix, all addressed
+
+A 4-reviewer workflow (correctness, integration, docs/honesty, security) flagged:
+
+**Critical:**
+- **C1 — `parallel { }` record/replay desync on arm failure.** Original `run_parallel_asks` returned early on the first failed arm after recording earlier successes; a recording with K-of-N events would cause `pop_replay_model_call` to attribute later responses to the wrong arm. **Fix**: two-pass walk — collect all responses first, return error WITHOUT touching the recording if any arm failed; otherwise record + debit all arms in input order. A failed batch leaves the recording untouched, so replay never sees a partial K-event prefix. Regression test [crates/axon-cli/tests/stage36_verify_fixes.rs](crates/axon-cli/tests/stage36_verify_fixes.rs) `c1_failed_parallel_arm_does_not_corrupt_recording`.
+
+**Major:**
+- **S4 — `with_retry(thunk, times, backoff_ms)` `times` unbounded.** `i64::MAX` cast to `u32::MAX` = ~4B iterations on a typo. **Fix**: cap at 1000 with named error. Regression: `s4_with_retry_times_above_1000_is_rejected` + `s4_with_retry_times_at_boundary_1000_is_accepted`.
+- **S4b — `with_retry.backoff_ms` and `with_timeout.ms` unbounded.** `u64::MAX` ms = 584 million years. **Fix**: cap at 3_600_000 ms (1 hour) for both. Regression: `s4b_with_retry_backoff_above_1h_is_rejected` + `s4b_with_timeout_above_1h_is_rejected`.
+
+**Should-fix-now (all addressed in this stage):**
+- **L1 — `axon trace promote` auto-name hashed content only**, colliding when two recordings had identical responses. **Fix**: hash `{filename-stem}:{content}`. Regression: `l1_trace_promote_auto_name_distinguishes_recordings_with_identical_content`.
+- **L2 — `eval_parallel` Stage 36 limitation error message wasn't actionable.** **Fix**: include a workaround hint pointing at `flow_parallel_asks` for record-arm shape and naming the Stage 37 lift condition (Interpreter must be Send-safe). Regression: `l2_parallel_non_ask_error_mentions_workaround`.
+- **S3 — `escape_axon_string` didn't escape bidi direction overrides or zero-width Unicode.** A malicious recording could hide injected content from a reviewer reading the promoted suite source. **Fix**: explicit ranges for U+202A–202E, U+2066–2069, U+200B–200D, U+FEFF. Regression: `s3_trace_promote_escapes_bidi_and_zero_width_in_recorded_content`.
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-runtime::async_rt` | 5 unit tests | singleton-across-threads, in_runtime_context, spawn_blocking counter |
+| `axon-cli::stage36_parallel` | 8 integration tests | wall-clock < 700ms (2x200ms) and < 800ms (3x200ms), input-order determinism, single-ask-per-arm error, missing-cap error, empty-block parse error, nested-block_on guard, --no-async byte-identity |
+| `axon-cli::stage36_replay` | 2 integration tests | record→replay byte-identical stdout, two record runs produce byte-identical recordings |
+| `axon-cli::stage36_dx` | 11 integration tests | flow_majority (clear majority + first-seen tiebreak), flow_majority_with (support/total/tie), empty-votes error, str_split_lines/once, dur_micros/nanos/seconds_f64, with_retry success path + retry exhaustion, with_timeout within-budget, trace promote append (preserves header) + refusal on empty recording |
+| `axon-runtime::stage36_scope_invariants` | 3 integration tests | `async fn eval_` count in eval.rs == 0, `call_value` stays sync (not `async fn`), exactly one `Builder::new_multi_thread` (in async_rt.rs) outside axon-async crate + tests |
+| `axon-cli::stage36_verify_fixes` | 8 regression tests | C1 record-on-failure invariant, S4 times bound, S4b backoff bound, S4b timeout bound, L1 name collision, L2 actionable error, S3 bidi/zero-width escape |
+| **Workspace total** | **1089 passing**, up from 1052 | +37 net |
+
+### What's NOT in this stage (explicit scope cuts)
+
+The Stage 36 cuts are deliberate. Each cut names the future stage that owns the lift:
+
+- **Stage 37**: Arbitrary expressions per `parallel { }` arm (current restriction: single `ask`). Lifting requires either `Interpreter: Send` or worker-local snapshots. **§36.B.1 contextual keywords**. **Syntactic `@retry(3) ask m { ... }`** call-site attribute form (the `with_retry`/`with_timeout` builtin form ships this stage). **`select { }` migration to async substrate** — `eval_select` stays synchronous two-pass. **`for await pat in stream { }` migration** — still synchronous stream iteration.
+- **Stage 38**: Channels (`Value::Chan(Rc<RefCell<VecDeque>>)`) on async substrate with `axon-async::AsyncMailbox` + backpressure. `spawn x` made truly async.
+- **Stage 39+**: `Value` and `Env` `Arc`-ification (containers stay `Rc<RefCell>` for now; Interpreter stays `!Send`). Cancellation semantics for `parallel { }`. Per-arm progress streaming. `parallel { ... } with concurrency: N` syntax.
+- **Explicit non-goals**: no VM-path support for `parallel { }` (`axon run --vm` errors cleanly); no new tracer span kinds (each arm's `ask` emits its existing `ModelCall` span); no `axon-async` crate integration (deliberate — Stage 36 uses the singleton in `axon-runtime::async_rt` to minimize blast radius; the `axon-async` substrate stays the Stage 37 home for future primitives).
 
 ---
 

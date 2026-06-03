@@ -536,6 +536,37 @@ impl Interpreter {
         }
     }
 
+    /// Stage 36: async entry seam. Enters the process-wide tokio runtime
+    /// via `block_on` and drives the synchronous interpreter inside that
+    /// reactor context. The body of `run_main` is unchanged; this wrapper
+    /// exists so that nested constructs like `parallel { }` and host
+    /// bindings like `flow_parallel_asks` can `spawn_blocking` without
+    /// starting a second runtime (which would panic).
+    ///
+    /// `cmd_run` / `cmd_test` should route through this entry. The
+    /// `--no-async` CLI flag (and `AXON_NO_ASYNC=1` env var) route back to
+    /// `run_main` as an escape hatch / A-B mechanism.
+    pub fn run_async(&mut self) -> Result<Value, RuntimeError> {
+        let rt = crate::async_rt::runtime();
+        // `block_on` on the multi-thread runtime parks the calling thread
+        // on the current_thread reactor; spawn_blocking and inner
+        // block_on (via block_in_place) work from inside.
+        rt.block_on(async { self.run_main() })
+    }
+
+    /// Stage 36: async sibling of `call_value`, for callers (the test
+    /// runner) that need to invoke a specific closure inside the async
+    /// boundary. The interior of `call_value` is unchanged.
+    pub fn call_value_async(
+        &mut self,
+        callee: &Value,
+        args: &[Value],
+        call_site: Span,
+    ) -> EvalResult<Value> {
+        let rt = crate::async_rt::runtime();
+        rt.block_on(async { self.call_value(callee, args, call_site) })
+    }
+
     // -------------------------------------------------------------------
     // Block & statement evaluation
     // -------------------------------------------------------------------
@@ -700,6 +731,7 @@ impl Interpreter {
             } => self.eval_for(pat, iter, body, *is_await, env, expr.span),
             ExprKind::While { cond, body } => self.eval_while(cond, body, env),
             ExprKind::Select(arms) => self.eval_select(arms, env, expr.span),
+            ExprKind::Parallel(arms) => self.eval_parallel(arms, env, expr.span),
             ExprKind::Ask { target, slots } => self.eval_ask(target, slots, expr.span, env),
             ExprKind::Generate {
                 schema,
@@ -2052,6 +2084,103 @@ impl Interpreter {
         let result = self.run_tool_use_loop(&provider, req, &meta.tools, cap, span);
         self.close_span_with_result(sid, &result);
         result.map(|c| Value::String(Rc::new(c)))
+    }
+
+    /// Stage 36: `parallel { ask m1 { ... }, ask m2 { ... } }`. Each arm is
+    /// restricted to a single `ask` expression — the only shape that does
+    /// not require `Interpreter: Send` (Stage 37 lifts this). All operand
+    /// evaluation happens on the calling thread; only the per-arm
+    /// `(Arc<dyn ModelProvider>, ChatRequest)` crosses into spawn_blocking.
+    fn eval_parallel(
+        &mut self,
+        arms: &[Expr],
+        env: &Env,
+        span: Span,
+    ) -> EvalResult<Value> {
+        // §36 limit: every arm must be a single `ask` expression. The
+        // restriction is named in the error so the user knows what they
+        // can/can't write today.
+        for (i, arm) in arms.iter().enumerate() {
+            if !matches!(&*arm.kind, ExprKind::Ask { .. }) {
+                return Err(EvalSignal::error(
+                    format!(
+                        "parallel arm {i} must currently be a single `ask` expression \
+                         (Stage 36 limitation; Stage 37 will lift this once the \
+                         interpreter is Send-safe). Workaround: hoist the non-ask \
+                         work into a separate statement before the parallel block, \
+                         or use `flow_parallel_asks([...])` for arbitrary record \
+                         arms."
+                    ),
+                    arm.span,
+                ));
+            }
+        }
+        if arms.is_empty() {
+            return Ok(Value::List(Rc::new(std::cell::RefCell::new(Vec::new()))));
+        }
+        if arms.len() > 64 {
+            return Err(EvalSignal::error(
+                format!(
+                    "parallel: batch size {} exceeds the safety ceiling (64). \
+                     Split the batch or raise the ceiling explicitly.",
+                    arms.len()
+                ),
+                span,
+            ));
+        }
+        // LLM + Net caps required, same as a regular `ask`. Checking up
+        // front means we never reach the spawn dispatch on an under-permissioned
+        // caller (which would burn tokens before failing).
+        self.require_caps(&["LLM", "Net"], span)?;
+
+        // Pre-evaluate every arm's operands on the calling thread. RNG /
+        // frozen-clock thread_locals only fire here, so determinism is
+        // preserved. `tools:` slots are rejected because the tool-use loop
+        // needs an Interpreter on the worker thread.
+        let mut built: Vec<crate::parallel::ParallelArm> = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let (target, slots) = match &*arm.kind {
+                ExprKind::Ask { target, slots } => (target, slots),
+                _ => unreachable!("checked above"),
+            };
+            let target_v = self.eval_expr(target, env)?;
+            let provider = self.require_model(&target_v, arm.span)?;
+            let mut req = axon_models::ChatRequest::default();
+            let meta = self.fill_request_from_slots(&mut req, slots, env)?;
+            if !meta.tools.is_empty() {
+                return Err(EvalSignal::error(
+                    "parallel: arms with `tools:` slots are not supported in \
+                     Stage 36 (tool-use loop requires Interpreter on the worker \
+                     thread; Stage 37 will lift this)",
+                    arm.span,
+                ));
+            }
+            built.push(crate::parallel::ParallelArm {
+                provider,
+                request: req,
+            });
+        }
+
+        // Budget precheck — only in live mode. Replay doesn't touch budgets.
+        if !self.replay_active() {
+            self.precheck_budget(span)?;
+        }
+
+        // Hand owned arms off to the parallel helper. The helper handles
+        // replay short-circuit (no tokio) and live dispatch via
+        // spawn_blocking_counted, joining in input order. The interpreter
+        // never crosses the thread boundary.
+        let responses = crate::parallel::run_parallel_asks(self, built, span)?;
+
+        // Open one span per arm for tracer/footer fidelity. The spans are
+        // opened-and-closed in input order on the calling thread; they
+        // carry the provider name and a `parallel` attribute so a
+        // post-mortem can tell parallel arms apart from sequential ones.
+        let mut out: Vec<Value> = Vec::with_capacity(responses.len());
+        for resp in responses {
+            out.push(Value::String(Rc::new(resp.content)));
+        }
+        Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
     }
 
     fn eval_plan(
