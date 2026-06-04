@@ -34,6 +34,9 @@ pub enum BackpressurePolicy {
 }
 
 impl BackpressurePolicy {
+    /// Policy strings are case-sensitive and lowercase: `"block"`,
+    /// `"drop_oldest"`, `"drop_new"`. Anything else returns None and the
+    /// caller surfaces the named error listing the three valid options.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "block" => Some(BackpressurePolicy::Block),
@@ -52,7 +55,7 @@ impl BackpressurePolicy {
 }
 
 /// Stage 38 — internal channel state. The queue is mutable behind a
-/// `RefCell`; closed/capacity/policy/dropped are all sigle-field flags
+/// `RefCell`; closed/capacity/policy/dropped are all single-field flags
 /// behind `Cell`. The cell is shared via `Rc` so multiple `Value::Chan`
 /// clones point at the same channel (and observe each other's sends,
 /// closes, and drops).

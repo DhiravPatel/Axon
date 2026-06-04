@@ -1639,12 +1639,24 @@ impl Interpreter {
                                     format!(
                                         "chan.send: channel is full (capacity {n}, policy block). \
                                          Stage 38 synchronous-runtime send returns an error rather \
-                                         than parking; Stage 39+ will park on a real scheduler."
+                                         than parking; Stage 39+ is planned to park on a real scheduler."
                                     ),
                                     span,
                                 ));
                             }
                             crate::value::BackpressurePolicy::DropOldest => {
+                                // §38.6 verification fix S38-001 — at capacity=0,
+                                // pop_front is a no-op on an empty queue, so the
+                                // original code unconditionally pushed the new
+                                // value, leaving len()=1 on a "zero capacity"
+                                // channel. The capacity contract is "queue length
+                                // never exceeds n"; for n=0 that means we never
+                                // hold a value. The new value is dropped (counted)
+                                // and the queue is left empty.
+                                if n == 0 {
+                                    c.dropped.set(c.dropped.get().saturating_add(1));
+                                    return Ok(Value::Unit);
+                                }
                                 q.pop_front();
                                 c.dropped.set(c.dropped.get().saturating_add(1));
                                 q.push_back(args[0].clone());
@@ -1717,6 +1729,29 @@ impl Interpreter {
 
     // ---- Spawn and handler dispatch ----------------------------------
 
+    /// Stage 5.5 synchronous actor dispatch — **NOT yet async** despite
+    /// Stage 36's async eval boundary and Stage 38's channel substrate.
+    ///
+    /// `eval_spawn` evaluates the constructor, initializes state, runs
+    /// `on_start`, and returns a `Value::Spawned` immediately on the
+    /// calling thread. Message dispatch into spawned actors is also
+    /// synchronous (single-threaded, deterministic, replayable). There
+    /// is no `Value::Task` variant and no scheduler hand-off; a `spawn x`
+    /// followed by interactions with the spawned actor happens entirely
+    /// within the calling thread's eval loop.
+    ///
+    /// Truly async spawn (cross-thread task dispatch + `await task`) is
+    /// the **Stage 39** deliverable that closes the async arc. Stage 39
+    /// requires `Arc`-ification of `Value` and `Env` so the actor's
+    /// state can cross the `tokio::spawn_blocking` boundary the same way
+    /// `Value::Model` did in Stage 32. The new task type would carry a
+    /// join handle and an output slot; `await task` would block on the
+    /// handle the same way `with_timeout` blocks on a thunk today.
+    ///
+    /// Until then, `spawn x` looks async at the surface (the type
+    /// signature implies concurrent execution) but observably behaves
+    /// like a synchronous constructor call followed by lazy message
+    /// dispatch. The Stage 39 lift will make the surface honest.
     fn eval_spawn(&mut self, call: &Expr, span: Span, env: &Env) -> EvalResult<Value> {
         // The argument to `spawn` must look like `Agent(arg, arg, name = value, ...)`
         // or just `Agent`. We extract the agent name from the call's callee
@@ -3113,18 +3148,24 @@ impl Interpreter {
     /// Evaluate a `select { ... }` block. Stage 37 makes the timeout arm
     /// actually wait for its duration before firing (Stage 36 fired it
     /// immediately because the synchronous interpreter had no way to wait).
+    /// Stage 38 adds the closed-flag fast-fail.
     ///
     /// Semantics:
     ///   1. Walk every `recv(chan)` arm in declaration order; the first
     ///      one whose channel has a value pending wins (no wait).
-    ///   2. If no recv arm is ready AND a `timeout(...)` arm is present:
+    ///   2. **Stage 38 fast-fail.** If every `recv` arm is on a CLOSED-and-
+    ///      EMPTY channel (and at least one `recv` arm exists), no
+    ///      producer can ever satisfy any branch. Skip the timeout sleep
+    ///      entirely and fire the smallest declared timeout body, then
+    ///      the else body, then error.
+    ///   3. If no recv arm is ready AND a `timeout(...)` arm is present:
     ///      sleep for the shortest declared timeout, then re-check the
     ///      channels (a background tokio task — e.g. a parallel arm's
     ///      producer — may have pushed during the wait). If a channel
     ///      became ready, take it. Otherwise the timeout arm fires.
-    ///   3. Else arm (if any) fires as the final fallback when there's no
+    ///   4. Else arm (if any) fires as the final fallback when there's no
     ///      timeout.
-    ///   4. No fallback → runtime error.
+    ///   5. No fallback → runtime error.
     ///
     /// Cap: the sleep is bounded at 1 hour to prevent foot-guns. Larger
     /// timeouts surface a clean error.
