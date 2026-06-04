@@ -267,6 +267,30 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), TokenKind::Eof)
     }
 
+    /// Stage 37 — contextual keywords. The five reserved item-starter
+    /// keywords `agent`/`tool`/`model`/`memory`/`prompt` may also appear
+    /// in identifier positions (variable bindings, expression atoms,
+    /// record field labels). This predicate is the gate: in places where
+    /// either an `Ident` or one of these soft keywords is acceptable as a
+    /// name, the parser consults this and treats the soft keyword as the
+    /// corresponding identifier text.
+    ///
+    /// Why these five specifically: every one of them shadows a high-
+    /// frequency author vocabulary word (`let prompt = ...`, `let model = ...`).
+    /// The Stage 36 DX survey ranked this as PAPERCUT P2 — the single
+    /// highest-frequency new-author error.
+    ///
+    /// Why NOT every keyword: we want `let if = 1` to stay an error. The
+    /// boundary is "keywords that name domain concepts the user already
+    /// has variables for" vs. "control-flow / type-system reserved words."
+    fn is_soft_keyword(kw: axon_lexer::Keyword) -> bool {
+        use axon_lexer::Keyword as Kw;
+        matches!(
+            kw,
+            Kw::Agent | Kw::Tool | Kw::Model | Kw::Memory | Kw::Prompt
+        )
+    }
+
     // ---- Programs & items ----------------------------------------------
 
     fn parse_program(&mut self) -> Program {
@@ -2176,6 +2200,17 @@ impl<'a> Parser<'a> {
                     span: start,
                 }
             }
+            // §37 contextual keywords — `let prompt = ...`, `let model = ...`,
+            // etc. The soft-keyword binding is a single-segment Path identical
+            // in shape to an Ident binding.
+            TokenKind::Keyword(kw) if Self::is_soft_keyword(kw) => {
+                let name = kw.as_str().to_string();
+                let span = self.bump().span;
+                Pattern {
+                    kind: Box::new(PatternKind::Binding(Ident { name, span })),
+                    span,
+                }
+            }
             TokenKind::Ident(_) => {
                 // Could be a binding or a constructor `Path(...)`.
                 let path = self.parse_path();
@@ -2678,6 +2713,21 @@ impl<'a> Parser<'a> {
                     span: id.span,
                     kind: Box::new(ExprKind::Path(Path {
                         span: id.span,
+                        segments: vec![id],
+                    })),
+                }
+            }
+            // §37 contextual keywords — same shape as the Ident arm above.
+            // `print(prompt)`, `ask model { ... }`, `self.memory.recall(q)`,
+            // `tool.input_schema()`, `for a in agents { ... }` all parse.
+            TokenKind::Keyword(kw) if Self::is_soft_keyword(kw) => {
+                let name = kw.as_str().to_string();
+                let span = self.bump().span;
+                let id = Ident { name, span };
+                Expr {
+                    span,
+                    kind: Box::new(ExprKind::Path(Path {
+                        span,
                         segments: vec![id],
                     })),
                 }

@@ -2097,24 +2097,6 @@ impl Interpreter {
         env: &Env,
         span: Span,
     ) -> EvalResult<Value> {
-        // §36 limit: every arm must be a single `ask` expression. The
-        // restriction is named in the error so the user knows what they
-        // can/can't write today.
-        for (i, arm) in arms.iter().enumerate() {
-            if !matches!(&*arm.kind, ExprKind::Ask { .. }) {
-                return Err(EvalSignal::error(
-                    format!(
-                        "parallel arm {i} must currently be a single `ask` expression \
-                         (Stage 36 limitation; Stage 37 will lift this once the \
-                         interpreter is Send-safe). Workaround: hoist the non-ask \
-                         work into a separate statement before the parallel block, \
-                         or use `flow_parallel_asks([...])` for arbitrary record \
-                         arms."
-                    ),
-                    arm.span,
-                ));
-            }
-        }
         if arms.is_empty() {
             return Ok(Value::List(Rc::new(std::cell::RefCell::new(Vec::new()))));
         }
@@ -2128,57 +2110,87 @@ impl Interpreter {
                 span,
             ));
         }
-        // LLM + Net caps required, same as a regular `ask`. Checking up
-        // front means we never reach the spawn dispatch on an under-permissioned
-        // caller (which would burn tokens before failing).
-        self.require_caps(&["LLM", "Net"], span)?;
 
-        // Pre-evaluate every arm's operands on the calling thread. RNG /
-        // frozen-clock thread_locals only fire here, so determinism is
-        // preserved. `tools:` slots are rejected because the tool-use loop
-        // needs an Interpreter on the worker thread.
-        let mut built: Vec<crate::parallel::ParallelArm> = Vec::with_capacity(arms.len());
-        for arm in arms {
-            let (target, slots) = match &*arm.kind {
-                ExprKind::Ask { target, slots } => (target, slots),
-                _ => unreachable!("checked above"),
-            };
-            let target_v = self.eval_expr(target, env)?;
-            let provider = self.require_model(&target_v, arm.span)?;
-            let mut req = axon_models::ChatRequest::default();
-            let meta = self.fill_request_from_slots(&mut req, slots, env)?;
-            if !meta.tools.is_empty() {
-                return Err(EvalSignal::error(
-                    "parallel: arms with `tools:` slots are not supported in \
-                     Stage 36 (tool-use loop requires Interpreter on the worker \
-                     thread; Stage 37 will lift this)",
-                    arm.span,
-                ));
+        // §37 lifts the §36 single-ask-per-arm restriction. The arm syntax
+        // is now arbitrary, and the runtime picks a dispatch strategy:
+        //
+        //   - Fast path: every arm is a *syntactically bare* `ask`
+        //     expression. The Stage 36 spawn_blocking dispatcher runs
+        //     every arm concurrently on the blocking pool. True wall-clock
+        //     overlap.
+        //   - General path: any arm is NOT a bare ask (including a function
+        //     call that internally wraps an ask). Every arm runs
+        //     sequentially on the calling thread, in declaration order.
+        //     The Interpreter is `!Send`, so true parallelism for
+        //     multi-step arms is planned for Stage 39's `Arc`-ification of
+        //     `Value` and `Env`.
+        //
+        // The strict split is deliberate. The predictability rule the user
+        // applies is: "if every arm is a literal `ask m { ... }`, parallel
+        // overlap fires." A function call like `research(q)` that wraps an
+        // ask runs sequentially in the general path — see the regression
+        // test `parallel_arms_can_be_user_functions_calling_ask` for the
+        // canonical example of this trap. To unlock parallelism the user
+        // refactors the call sites into bare asks (a mechanical change).
+        let all_ask = arms
+            .iter()
+            .all(|a| matches!(&*a.kind, ExprKind::Ask { .. }));
+
+        if all_ask {
+            // Stage 36 fast path. Cap gate up front so we never spawn on an
+            // under-permissioned caller.
+            self.require_caps(&["LLM", "Net"], span)?;
+
+            // Pre-evaluate every arm's operands on the calling thread. RNG /
+            // frozen-clock thread_locals only fire here, so determinism is
+            // preserved. `tools:` slots are rejected because the tool-use loop
+            // needs an Interpreter on the worker thread.
+            let mut built: Vec<crate::parallel::ParallelArm> =
+                Vec::with_capacity(arms.len());
+            for arm in arms {
+                let (target, slots) = match &*arm.kind {
+                    ExprKind::Ask { target, slots } => (target, slots),
+                    _ => unreachable!("checked above"),
+                };
+                let target_v = self.eval_expr(target, env)?;
+                let provider = self.require_model(&target_v, arm.span)?;
+                let mut req = axon_models::ChatRequest::default();
+                let meta = self.fill_request_from_slots(&mut req, slots, env)?;
+                if !meta.tools.is_empty() {
+                    return Err(EvalSignal::error(
+                        "parallel: arms with `tools:` slots are not supported in \
+                         the fast path (tool-use loop requires Interpreter on \
+                         the worker thread; Stage 39 will lift this)",
+                        arm.span,
+                    ));
+                }
+                built.push(crate::parallel::ParallelArm {
+                    provider,
+                    request: req,
+                });
             }
-            built.push(crate::parallel::ParallelArm {
-                provider,
-                request: req,
-            });
+
+            // Budget precheck — only in live mode. Replay doesn't touch budgets.
+            if !self.replay_active() {
+                self.precheck_budget(span)?;
+            }
+
+            let responses = crate::parallel::run_parallel_asks(self, built, span)?;
+            let mut out: Vec<Value> = Vec::with_capacity(responses.len());
+            for resp in responses {
+                out.push(Value::String(Rc::new(resp.content)));
+            }
+            return Ok(Value::List(Rc::new(std::cell::RefCell::new(out))));
         }
 
-        // Budget precheck — only in live mode. Replay doesn't touch budgets.
-        if !self.replay_active() {
-            self.precheck_budget(span)?;
-        }
-
-        // Hand owned arms off to the parallel helper. The helper handles
-        // replay short-circuit (no tokio) and live dispatch via
-        // spawn_blocking_counted, joining in input order. The interpreter
-        // never crosses the thread boundary.
-        let responses = crate::parallel::run_parallel_asks(self, built, span)?;
-
-        // Open one span per arm for tracer/footer fidelity. The spans are
-        // opened-and-closed in input order on the calling thread; they
-        // carry the provider name and a `parallel` attribute so a
-        // post-mortem can tell parallel arms apart from sequential ones.
-        let mut out: Vec<Value> = Vec::with_capacity(responses.len());
-        for resp in responses {
-            out.push(Value::String(Rc::new(resp.content)));
+        // §37 general path — sequential on the calling thread, input order.
+        // Per-arm errors short-circuit (first error wins). Each arm's
+        // capability check is the existing one for whatever expression it
+        // contains (Ask requires LLM+Net, a pure call requires nothing).
+        let mut out: Vec<Value> = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let v = self.eval_expr(arm, env)?;
+            out.push(v);
         }
         Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
     }
@@ -2942,12 +2954,52 @@ impl Interpreter {
         // async scheduler does.
         if is_await {
             if let Value::Chan(q) = iter_v {
+                // §37 lift: after the channel drains, wait briefly for more
+                // values to arrive (a background producer — e.g., a parallel
+                // arm or a spawn_blocking task — may push asynchronously).
+                // If no new value arrives within the post-drain budget, exit
+                // the loop. Stage 38 is planned to add an explicit `closed`
+                // flag on `Value::Chan` plus migration to
+                // `axon-async::AsyncMailbox` so the loop can wait forever
+                // on an open channel and exit immediately when it's closed.
+                //
+                // The 50ms / 5ms numbers are a heuristic balance:
+                //   - 50ms total post-drain budget is long enough for a
+                //     parallel-arm producer running on the blocking pool to
+                //     deliver one more value, short enough that an empty
+                //     `for await` over an idle channel exits promptly rather
+                //     than appearing to hang.
+                //   - 5ms poll interval keeps wake latency under one frame
+                //     while the loop is waiting; CPU cost is negligible
+                //     because each iteration is just a refcell borrow.
+                // Both will be replaced by the Stage 38 closed-flag wait
+                // primitive; user-tunable polling parameters are not
+                // exposed in Stage 37.
+                const POST_DRAIN_WAIT_MS: u64 = 50;
+                const POLL_INTERVAL_MS: u64 = 5;
                 loop {
                     let next = {
                         let mut g = q.borrow_mut();
                         g.pop_front()
                     };
-                    let Some(item) = next else { break };
+                    let item = match next {
+                        Some(v) => v,
+                        None => {
+                            // Empty drain — give background producers a
+                            // window to push. Poll every POLL_INTERVAL_MS
+                            // up to POST_DRAIN_WAIT_MS so the loop wakes
+                            // promptly when a value arrives mid-window.
+                            let waited = self.wait_for_chan_value(
+                                &q,
+                                POST_DRAIN_WAIT_MS,
+                                POLL_INTERVAL_MS,
+                            );
+                            match waited {
+                                Some(v) => v,
+                                None => break,
+                            }
+                        }
+                    };
                     let child = env.child();
                     self.bind_pattern(pat, item, &child)?;
                     match self.eval_block(body, &child) {
@@ -2998,66 +3050,183 @@ impl Interpreter {
         Ok(Value::Unit)
     }
 
-    /// Evaluate a `select { ... }` block. Synchronous semantics:
+    /// Evaluate a `select { ... }` block. Stage 37 makes the timeout arm
+    /// actually wait for its duration before firing (Stage 36 fired it
+    /// immediately because the synchronous interpreter had no way to wait).
     ///
+    /// Semantics:
     ///   1. Walk every `recv(chan)` arm in declaration order; the first
-    ///      one whose channel has a value pending wins.
-    ///   2. If no recv arm is ready: take the first `timeout(...)` arm
-    ///      (it fires immediately in the sync runtime — we can't actually
-    ///      wait), else the first `else` arm.
-    ///   3. If neither is present and no recv was ready, runtime error.
+    ///      one whose channel has a value pending wins (no wait).
+    ///   2. If no recv arm is ready AND a `timeout(...)` arm is present:
+    ///      sleep for the shortest declared timeout, then re-check the
+    ///      channels (a background tokio task — e.g. a parallel arm's
+    ///      producer — may have pushed during the wait). If a channel
+    ///      became ready, take it. Otherwise the timeout arm fires.
+    ///   3. Else arm (if any) fires as the final fallback when there's no
+    ///      timeout.
+    ///   4. No fallback → runtime error.
+    ///
+    /// Cap: the sleep is bounded at 1 hour to prevent foot-guns. Larger
+    /// timeouts surface a clean error.
     fn eval_select(
         &mut self,
         arms: &[axon_ast::SelectArm],
         env: &Env,
         span: Span,
     ) -> EvalResult<Value> {
-        // First pass: find a ready Recv.
+        // §37.6 verification fix STAGE37-001 — channel expressions must
+        // be evaluated exactly once per `select` execution, even when the
+        // timeout fires and we re-probe after waking. The original code
+        // called try_take_ready_recv before AND after the sleep, each call
+        // re-evaluating every Recv arm's channel expression. For arms like
+        // `recv(open_session())` where the channel comes from an effectful
+        // constructor, that ran the side effect twice. Fix: hoist channel
+        // evaluation here; pass the prebuilt queues to both probes.
+        let mut recv_queues: Vec<
+            Option<std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Value>>>>,
+        > = Vec::with_capacity(arms.len());
         for arm in arms {
-            if let axon_ast::SelectArmKind::Recv { binding, channel } = &arm.kind {
-                let chan_v = self.eval_expr(channel, env)?;
-                let q = match chan_v {
-                    Value::Chan(q) => q,
-                    other => {
-                        return Err(EvalSignal::error(
-                            format!(
-                                "select: `recv(...)` expects a Chan, got `{}`",
-                                other.type_name()
-                            ),
-                            arm.span,
-                        ));
-                    }
-                };
-                let popped = q.borrow_mut().pop_front();
-                if let Some(v) = popped {
-                    let child = env.child();
-                    if binding.name != "_" {
-                        child.define(&binding.name, v);
-                    }
-                    return self.eval_block(&arm.body, &child);
+            match &arm.kind {
+                axon_ast::SelectArmKind::Recv { channel, .. } => {
+                    let chan_v = self.eval_expr(channel, env)?;
+                    let q = match chan_v {
+                        Value::Chan(q) => q,
+                        other => {
+                            return Err(EvalSignal::error(
+                                format!(
+                                    "select: `recv(...)` expects a Chan, got `{}`",
+                                    other.type_name()
+                                ),
+                                arm.span,
+                            ));
+                        }
+                    };
+                    recv_queues.push(Some(q));
+                }
+                _ => recv_queues.push(None),
+            }
+        }
+
+        // First pass: find a ready Recv (using the prebuilt queues).
+        if let Some(v) = self.try_take_ready_recv_with(arms, &recv_queues, env)? {
+            return Ok(v);
+        }
+        // Stage 37: if there's a timeout arm, actually wait. Pick the
+        // *minimum* declared timeout (shortest deadline fires first).
+        // This differs from `tokio::select!` which biases toward the
+        // first declared branch when multiple are equally ready; here
+        // we explicitly want the shortest deadline to fire, closer to a
+        // `Future::race` over timer futures.
+        let mut min_timeout_ms: Option<u64> = None;
+        let mut timeout_arm_idx: Option<usize> = None;
+        for (i, arm) in arms.iter().enumerate() {
+            if let axon_ast::SelectArmKind::Timeout { duration } = &arm.kind {
+                let dur_v = self.eval_expr(duration, env)?;
+                let ms = duration_to_ms(&dur_v).ok_or_else(|| {
+                    EvalSignal::error(
+                        format!(
+                            "select: timeout(...) expects a Duration or non-negative Int (ms), got `{}`",
+                            dur_v.type_name()
+                        ),
+                        arm.span,
+                    )
+                })?;
+                const MAX_SELECT_TIMEOUT_MS: u64 = 3_600_000;
+                if ms > MAX_SELECT_TIMEOUT_MS {
+                    return Err(EvalSignal::error(
+                        format!(
+                            "select: timeout {ms}ms exceeds the 1-hour safety ceiling. \
+                             Use a longer-running supervisor for deadlines past this point."
+                        ),
+                        arm.span,
+                    ));
+                }
+                if min_timeout_ms.map_or(true, |cur| ms < cur) {
+                    min_timeout_ms = Some(ms);
+                    timeout_arm_idx = Some(i);
                 }
             }
         }
-        // Second pass: take a Timeout or an Else (in declaration order).
+        if let Some(ms) = min_timeout_ms {
+            // Honest wait. The synchronous interpreter can't interleave
+            // with the tokio reactor in-place, so we use std::thread::sleep
+            // — the calling thread parks, but other tokio workers (e.g.
+            // siblings of the current task) continue. After waking we
+            // re-check the channels in case a background producer pushed.
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            // Re-probe the SAME prebuilt queues — no re-evaluation of the
+            // channel expressions per STAGE37-001.
+            if let Some(v) = self.try_take_ready_recv_with(arms, &recv_queues, env)? {
+                return Ok(v);
+            }
+            // Fire the winning timeout arm.
+            let arm = &arms[timeout_arm_idx.expect("timeout_arm_idx set with min_timeout_ms")];
+            return self.eval_block(&arm.body, env);
+        }
+        // No timeout — fall through to an else arm, then to the error.
         for arm in arms {
-            match &arm.kind {
-                axon_ast::SelectArmKind::Timeout { duration } => {
-                    // Evaluate `duration` for side effects + trace, then
-                    // run the body. In the sync runtime the timeout fires
-                    // immediately when no channel is ready.
-                    let _ = self.eval_expr(duration, env)?;
-                    return self.eval_block(&arm.body, env);
-                }
-                axon_ast::SelectArmKind::Else => {
-                    return self.eval_block(&arm.body, env);
-                }
-                _ => {}
+            if matches!(&arm.kind, axon_ast::SelectArmKind::Else) {
+                return self.eval_block(&arm.body, env);
             }
         }
         Err(EvalSignal::error(
             "select: no channel was ready and no `timeout`/`else` arm present",
             span,
         ))
+    }
+
+    /// §37 — poll a channel for a new value over a bounded post-drain
+    /// window. Returns `Some(v)` if a producer pushed during the window,
+    /// `None` if the window elapsed empty. The poll interval is small so
+    /// the loop wakes promptly on arrival without burning CPU.
+    fn wait_for_chan_value(
+        &self,
+        q: &std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Value>>>,
+        total_budget_ms: u64,
+        poll_interval_ms: u64,
+    ) -> Option<Value> {
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(total_budget_ms);
+        let step = std::time::Duration::from_millis(poll_interval_ms.max(1));
+        loop {
+            if let Some(v) = q.borrow_mut().pop_front() {
+                return Some(v);
+            }
+            if started.elapsed() >= budget {
+                return None;
+            }
+            std::thread::sleep(step);
+        }
+    }
+
+    /// Walk Recv arms in declaration order using *prebuilt* channel queues
+    /// (§37.6 STAGE37-001 fix). `recv_queues[i]` is `Some(q)` iff
+    /// `arms[i]` is a Recv arm whose channel resolved to a `Value::Chan(q)`.
+    /// Pre-resolution ensures channel expressions evaluate exactly once
+    /// per `select` execution, even when we re-probe after a timeout sleep.
+    fn try_take_ready_recv_with(
+        &mut self,
+        arms: &[axon_ast::SelectArm],
+        recv_queues: &[Option<std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Value>>>>],
+        env: &Env,
+    ) -> EvalResult<Option<Value>> {
+        for (i, arm) in arms.iter().enumerate() {
+            let Some(q) = recv_queues.get(i).and_then(|q| q.as_ref()) else {
+                continue;
+            };
+            let axon_ast::SelectArmKind::Recv { binding, .. } = &arm.kind else {
+                continue;
+            };
+            let popped = q.borrow_mut().pop_front();
+            if let Some(v) = popped {
+                let child = env.child();
+                if binding.name != "_" {
+                    child.define(&binding.name, v);
+                }
+                return Ok(Some(self.eval_block(&arm.body, &child)?));
+            }
+        }
+        Ok(None)
     }
 
     fn eval_while(&mut self, cond: &Expr, body: &Block, env: &Env) -> EvalResult<Value> {
@@ -3779,6 +3948,19 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 /// Format a `Value` as the text representation we want when interpolating
 /// into a prompt slot. Same as `Display` for most types; lists join with
 /// newlines to keep prompts readable.
+/// Coerce a Value into milliseconds for §37 `select` timeout / `for await`
+/// stream-wait shapes. Accepts `Value::Duration(ns)` (i64 nanoseconds) and
+/// `Value::Int(ms)` (treated as milliseconds for ergonomics — `timeout(100)`
+/// reads as "100ms"). Returns None for any other shape so the caller can
+/// surface a typed error.
+fn duration_to_ms(v: &Value) -> Option<u64> {
+    match v {
+        Value::Duration(ns) if *ns >= 0 => Some(*ns as u64 / 1_000_000),
+        Value::Int(ms) if *ms >= 0 => Some(*ms as u64),
+        _ => None,
+    }
+}
+
 fn stringify(v: &Value) -> String {
     match v {
         Value::String(s) => s.as_str().to_owned(),

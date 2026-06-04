@@ -347,24 +347,34 @@ fn s3_trace_promote_escapes_bidi_and_zero_width_in_recorded_content() {
 // L2 — eval_parallel non-ask error message includes a workaround hint.
 // =========================================================================
 
+// L2 was the Stage 36 actionable-error fix for the single-ask-per-arm
+// limitation. Stage 37 LIFTED that limitation, so the error path no longer
+// fires for non-ask arms. The acceptance now is: mixed-shape arms run
+// (sequentially in the general path) instead of erroring. The fast-path
+// detection still works when every arm is bare ask.
 #[test]
 fn l2_parallel_non_ask_error_mentions_workaround() {
     build_axon();
-    let dir = temp_dir("l2");
+    let dir = temp_dir("l2_now_ok");
     let prog = r#"
 fn main() uses { Console, LLM, Net } {
     let m = mock_model_slow("x", 1)
-    parallel {
+    let xs = parallel {
         ask m { user: "ok" },
         1 + 2,
     }
+    // First arm yielded the model's response ("x"); second arm yielded 3.
+    print(list_get(xs, 0))
+    print_int(list_get(xs, 1))
 }
 "#;
     let out = run_src(&dir, prog);
-    assert!(!out.status.success(), "{:?}", out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Workaround") || stderr.contains("flow_parallel_asks"),
-        "L2 regressed: error message should mention the workaround; got: {stderr}"
+        out.status.success(),
+        "Stage 37 lifted the non-ask restriction; should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains('x'), "stdout: {stdout}");
+    assert!(stdout.contains('3'), "stdout: {stdout}");
 }

@@ -761,17 +761,15 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Select(_) => Ty::Dyn,
             ExprKind::Parallel(arms) => {
-                // Stage 36: each arm is a single ask expression. We walk
-                // every arm so any inner type errors surface, and we
-                // declare the LLM + Net effects on behalf of the block so
-                // the handler's `uses { ... }` row covers them. Precise
-                // typing (List<T> where T is the join of arm result types)
-                // is Stage 37 — for now the block returns Ty::Dyn.
+                // Stage 37 lifts the §36 single-ask-per-arm restriction.
+                // The block's effects are the union of arm effects — we
+                // walk every arm so per-arm types AND effects propagate.
+                // No longer unconditionally declares LLM+Net (which forced
+                // pure-arithmetic parallel blocks to claim those effects
+                // even when no Ask was present).
                 for a in arms {
                     let _ = self.infer(a, scope, params, used);
                 }
-                self.use_effect(used, "LLM");
-                self.use_effect(used, "Net");
                 Ty::Dyn
             }
             ExprKind::Ask { target, slots } => {

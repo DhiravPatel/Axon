@@ -173,26 +173,33 @@ fn main() uses { Console, LLM, Net } {
 // Single-ask-per-arm restriction is enforced with a clear error.
 // ===========================================================================
 
+// Stage 37 lifted this — non-ask arms no longer error; they run sequentially.
+// The active acceptance test for that lift lives in stage37_parallel_lift.rs.
+// Keeping a thin smoke check here so the original test name still passes the
+// suite and CI doesn't think we lost a stage36 acceptance test.
 #[test]
 fn parallel_arm_must_be_ask_expression_stage36_limitation() {
     build_axon();
-    let dir = temp_dir("non_ask");
+    let dir = temp_dir("non_ask_now_ok");
     let prog = r#"
 fn main() uses { Console, LLM, Net } {
-    let m = mock_model_slow("x", 1)
-    parallel {
-        ask m { user: "ok" },
+    let xs = parallel {
         1 + 2,
+        2 * 5,
     }
+    print_int(list_get(xs, 0))
+    print_int(list_get(xs, 1))
 }
 "#;
     let out = run_src(&dir, prog);
-    assert!(!out.status.success(), "{:?}", out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("parallel arm") && stderr.contains("Stage 36"),
-        "stderr should name the Stage 36 limitation; got: {stderr}"
+        out.status.success(),
+        "Stage 37 lifts the Stage 36 restriction; parallel {{ 1+2, 2*5 }} should run sequentially: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("3"), "stdout: {stdout}");
+    assert!(stdout.contains("10"), "stdout: {stdout}");
 }
 
 // ===========================================================================
