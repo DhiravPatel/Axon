@@ -1,6 +1,85 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1089 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1103 tests passing** across 30+ crates).
+
+---
+
+## Stage 37 — Closing the Async Arc: `parallel { }` Arm Lift + `select`/`for await` Real Wait + Contextual Keywords
+
+Stage 36 introduced the async boundary; Stage 37 finishes the load-bearing part of what the surface syntax was already promising. The pattern that opens four times in this stage: *what the syntax looked like it meant is now what it actually does at runtime.* `parallel { }` no longer requires bare-ask arms. `select { timeout(100) }` actually waits 100ms instead of firing immediately. `for await x in chan` no longer drains eagerly on the first empty pop. And `let prompt = ...` is no longer a parse error — the five reserved item-starter keywords (`agent/tool/model/memory/prompt`) are now usable as identifiers in expression and binding positions.
+
+Adversarial verification surfaced 1 major (channel double-evaluation under timeout) which was fixed before merge with a regression test pinning single-eval. Three doc-polish findings landed in the same pass. Two reviewer findings were downgraded after reproduction failed.
+
+### §37.A — Contextual keywords (`prompt`/`model`/`memory`/`tool`/`agent` as identifiers)
+
+The Stage 36 DX research workflow ranked this as PAPERCUT P2 — the highest-frequency new-author error, hit in the first 10 minutes. `let prompt = "..."` was a parse error because `prompt` is a reserved item-starter keyword. Stage 37 lifts the restriction in identifier-binding positions:
+
+- **New `is_soft_keyword(kw)` predicate** ([crates/axon-parser/src/parser.rs](crates/axon-parser/src/parser.rs)) returns true for exactly five keywords: `agent`, `tool`, `model`, `memory`, `prompt`. (`policy` was already a contextual identifier; control-flow words like `if`/`while`/`fn`/`let` stay reserved.)
+- **`parse_pattern_primary`** adds a `Keyword(kw) if is_soft_keyword(kw)` arm that produces a binding pattern with the keyword's text as the name. `let prompt = "x"` now parses.
+- **`parse_atom_expr`** adds the same shape arm in expression position. `print(prompt)`, `ask model { user: prompt }`, `tool.input_schema()` all work.
+- **Item-position dispatch is unchanged.** The lexer continues to emit `Keyword(Prompt)` etc., and `parse_item` still routes those tokens to `parse_prompt_decl` / `parse_agent_decl` / `parse_tool_decl`. The parser disambiguates by context.
+- **Why these five specifically:** every one shadows a high-frequency author vocabulary word. The cut excludes `actor`/`supervisor`/`graph`/`network` (lower-frequency, less common author bindings) to keep the surface change minimal — those can land in a future polish pass without breaking anything.
+
+### §37.B — `parallel { }` arm lift (fast path + general path)
+
+Stage 36 required every arm to be a single `ask` expression, with the error message naming Stage 37 as the lift. Stage 37 delivers:
+
+- **Fast path** (every arm is a *syntactically bare* `ask`): the Stage 36 spawn_blocking dispatcher runs every arm concurrently on the blocking pool. True wall-clock overlap, all the Stage 36 acceptance + replay guarantees preserved.
+- **General path** (any arm is NOT a bare ask, including a function call that internally wraps an ask): every arm runs sequentially on the calling thread, in declaration order. The Interpreter stays `!Send`; true parallelism for multi-step arms is planned for Stage 39's `Arc`-ification of `Value` and `Env`.
+- **Strict split, not "parallelize what you can."** Predictability rule the user applies: "if every arm is a literal `ask m { ... }`, parallel overlap fires." A function call like `research(q)` that wraps an ask runs sequentially in the general path. This is documented as a sharp edge with `parallel_arms_can_be_user_functions_calling_ask` as the canonical regression test.
+- **Tyck change** ([crates/axon-tyck/src/infer.rs](crates/axon-tyck/src/infer.rs)) — `ExprKind::Parallel(arms) => Ty::Dyn` no longer hardcodes LLM+Net effects. Per-arm effects propagate via `self.infer(a, ...)` walks; a pure-arithmetic `parallel { 1+2, 2*5 }` no longer requires the caller to declare LLM/Net.
+- **Eval** ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs) `eval_parallel`) — batch ≤ 64 cap applies to both paths. Fast path retains every §36 invariant (capabilities, replay, budget, record-on-failure-atomic via §36.6 C1). General path is `for arm in arms { self.eval_expr(arm, env)? }` collecting Values into a List in input order.
+
+### §37.C — `select` timeout actually waits
+
+Stage 36's `select { timeout(100) => ... }` fired the timeout body immediately when no Recv was ready — the synchronous interpreter had no way to wait. Stage 37 makes the wait real:
+
+- **Minimum-deadline wins** ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs) `eval_select`): when no Recv arm is ready, walk every Timeout arm, evaluate its duration, pick the *shortest* declared deadline (closer to `Future::race` over timer futures than to tokio's `select!`, which biases toward first-declared on equally-ready branches).
+- **1-hour ceiling** (3,600,000 ms). Above that the select errors before sleeping. Same shape as Stage 36's `with_retry` / `with_timeout` caps.
+- **`std::thread::sleep(ms)`** parks the calling thread; other tokio workers (parallel-arm dispatchers, `flow_parallel_asks` producers) continue. After waking, re-probe Recv arms — a background producer may have pushed during the window.
+- **New `duration_to_ms` file-level helper** accepts both `Value::Duration(ns)` and `Value::Int(ms)` for ergonomics — `timeout(100)` reads as "100ms."
+- **§37.6 verification fix STAGE37-001** — channel expressions in Recv arms are evaluated *exactly once* per `select` execution, even when the timeout fires and we re-probe after waking. Original code evaluated them twice (once before sleep, once after), running effectful constructors twice — a foot-gun for `recv(open_session())` patterns. Fixed by hoisting channel evaluation into a prebuilt `Vec<Option<Rc<RefCell<VecDeque<Value>>>>>` indexed by arm position; the new `try_take_ready_recv_with` helper reads from the prebuilt vec rather than re-evaluating. Regression test `select_channel_expression_evaluated_exactly_once_even_when_timeout_fires` pins the single-eval invariant.
+
+### §37.D — `for await` polls between empty drains
+
+Stage 36's `for await x in chan { ... }` ran the body for every queued value, then exited on the first empty pop. Stage 37 polls briefly so background producers (parallel arms, spawn_blocking tasks) have a window to deliver:
+
+- **New `wait_for_chan_value(q, total_budget_ms, poll_interval_ms)` helper** ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs)) — on an empty drain, polls every 5ms up to 50ms for a new value. If one arrives mid-window, the loop continues; if the 50ms elapses empty, the loop exits cleanly.
+- **The 50ms/5ms choice is a heuristic:** long enough for a parallel-arm producer running on the blocking pool to deliver one more value, short enough that `for await` over an idle channel exits promptly rather than appearing to hang. CPU cost negligible (each iteration is just a refcell borrow).
+- **Stage 38 will replace this with an explicit `closed` flag** on `Value::Chan` plus migration to `axon-async::AsyncMailbox` — so the loop can wait forever on an open channel and exit immediately when it's closed. User-tunable polling parameters are not exposed in Stage 37; the bounded post-drain window is the bridge.
+
+### §37.6 — Adversarial verification round
+
+A 4-reviewer workflow (correctness, integration, docs/honesty, security) ran against the Stage 37 diff. Verdict after synthesis: **fix-then-ship**.
+
+**Major (fixed before merge):**
+- **STAGE37-001** — `select` channel expression evaluated twice when timeout fires. Fixed by prebuilt-queue hoisting in `eval_select`. Regression test pins single-eval.
+
+**Downgraded after reproduction failed:**
+- **STAGE37-002** (parallel propagating `Break`/`Continue`): the submitted repro `parallel { for i in [1,2,3] { break }, 100+200 }` runs cleanly — `eval_for` already catches Break/Continue at the inner-loop boundary, so the break never reaches the parallel arm. Proposed fix (converting Break/Continue at the parallel boundary into errors) would break the legitimate `for x in xs { parallel { ..., if cond { break } } }` pattern.
+- **STAGE37-003** (reserved keywords accepted as parameter names): real at the surface (`fn foo(while: Int)` parses) but pre-Stage-37 behavior in `parse_ident`'s permissive arm. Stage 37's `is_soft_keyword` is an additive RESTRICTION for atom positions; tightening `parse_param` is a clean follow-up, not a Stage 37 blocker. Tracked as should-fix-after.
+
+**Doc polish (applied in the same pass):**
+- **FIND-001** — Misleading tokio comparison in `eval_select`. Comment rewritten to clarify the minimum-deadline rule and how it differs from `tokio::select!` first-declared bias.
+- **FIND-002** — Predictability rule for the parallel fast path was understated. Docstring rewritten to make the "syntactically bare ask" requirement explicit and reference `parallel_arms_can_be_user_functions_calling_ask` as the canonical trap.
+- **FIND-003** — The 50ms post-drain magic number had no rationale. Comment rewritten to explain the heuristic + the Stage 38 plan.
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage37_lifts` | 14 integration tests | contextual-keyword let/expr binding, item-position dispatch preserved, reserved keywords still reject; parallel general path runs non-ask arms, user-fn arms work, all-ask fast path wall-clock still < 700ms, first-arm error short-circuits; select actual wait (>250ms / <1500ms), min-deadline wins, ready-recv wins without wait, 1-hour ceiling; for-await drain-and-exit; **STAGE37-001 channel single-eval regression** |
+| Stage 36 carry-over tests | (updated) | `parallel_arm_must_be_ask_expression_stage36_limitation` and `l2_parallel_non_ask_error_mentions_workaround` rewritten to assert Stage 37 LIFTED behavior |
+| **Workspace total** | **1103 passing**, up from 1089 | +14 net |
+
+### What's NOT in this stage (explicit scope cuts)
+
+- **Stage 38**: explicit `closed` flag on `Value::Chan` + migration to `axon-async::AsyncMailbox` with backpressure. Replaces the §37.D polling-window heuristic with a real wait-on-open-channel semantic. `spawn x` made truly async. `chan.send` on async substrate.
+- **Stage 39**: `Arc`-ification of `Value::{List, Map, Set, Record, Instance, Memory}` and `Env` so `Interpreter` becomes `Send`. Unlocks true parallelism for the §37.B general path (multi-step arms run concurrently, not just sequentially). The "research/summarize" pattern in `parallel_arms_can_be_user_functions_calling_ask` is the canonical motivating use case.
+- **§37.B leftover**: `parallel { ... } with concurrency: N` syntax (user-controllable concurrency cap). Per-arm progress streaming to the tracer. Cancellation semantics (failing arm → cancel siblings).
+- **§37.A leftover**: contextual-keyword extension to `actor`/`supervisor`/`graph`/`network`. The cut to five was deliberate to keep blast radius small; these can land in a polish pass.
+- **STAGE37-003 follow-up**: tighten `parse_ident` in parameter/binding positions to reject reserved keywords (a `parse_binding_ident` helper that only accepts `Ident` and soft keywords).
+- **Explicit non-goals**: no `axon-async::AsyncRuntime` integration for `parallel { }`'s general path (that's Stage 39+); no Send-safe Interpreter (Stage 39+); no per-arm tracer spans for general-path arms (each arm's effects emit their own spans naturally through normal eval).
 
 ---
 
