@@ -355,7 +355,10 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
         List(_) => &["len", "push", "pop", "first", "last", "reverse", "map", "filter"],
         Map(_, _) => &["set", "get", "contains"],
         Set(_) => &["add", "contains"],
-        Chan(_) => &["send", "recv", "len", "is_empty"],
+        Chan(_) => &[
+            "send", "recv", "len", "is_empty",
+            "close", "is_closed", "capacity", "dropped",
+        ],
         Tainted(_) => &["untaint"],
         Memory => &["recall", "store"],
         _ => &[],
@@ -1185,11 +1188,15 @@ impl<'a> Checker<'a> {
             (Ty::Map(_, _), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(t), "add") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
-            // Channels.
+            // Channels. Stage 38 adds close/is_closed/capacity/dropped.
             (Ty::Chan(t), "send") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
             (Ty::Chan(t), "recv") => (Ty::Nullable(t.clone()), EffectRow::pure(), vec![]),
             (Ty::Chan(_), "len") => (Ty::Int, EffectRow::pure(), vec![]),
             (Ty::Chan(_), "is_empty") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::Chan(_), "close") => (Ty::Unit, EffectRow::pure(), vec![]),
+            (Ty::Chan(_), "is_closed") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::Chan(_), "capacity") => (Ty::Nullable(Box::new(Ty::Int)), EffectRow::pure(), vec![]),
+            (Ty::Chan(_), "dropped") => (Ty::Int, EffectRow::pure(), vec![]),
             (Ty::Map(k, v), "get") => (
                 Ty::Nullable(Box::new(*v.clone())),
                 EffectRow::pure(),
