@@ -431,6 +431,11 @@ fn main() uses { Console } {
 
 #[test]
 fn for_await_drains_chan_and_exits_within_window() {
+    // Stage 37 used a 50ms post-drain poll heuristic. Stage 38 replaced
+    // that with closed-flag-aware semantics: open channels wait for new
+    // values up to a 5-minute safety budget, closed-and-empty exits
+    // immediately. The fixture must close the channel so the for-await
+    // exits cleanly under Stage 38's new semantic.
     build_axon();
     let dir = temp_dir("forawait_drain");
     let prog = r#"
@@ -439,6 +444,7 @@ fn main() uses { Console } {
     c.send("alpha")
     c.send("beta")
     c.send("gamma")
+    c.close()
     for await v in c {
         print(v)
     }

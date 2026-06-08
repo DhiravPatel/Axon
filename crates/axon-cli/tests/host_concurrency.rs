@@ -76,6 +76,10 @@ fn main() uses { Console } {
 
 #[test]
 fn for_await_drains_a_chan_until_empty() {
+    // Stage 38 changed the for-await semantic: an OPEN channel waits for
+    // new values up to a 5-minute safety budget. The fixture must close
+    // the channel so the loop exits cleanly. Pre-Stage-38 tests relied on
+    // the §37.D 50ms post-drain poll, which is gone.
     build_axon();
     let dir = temp_dir("for_await_chan");
     let prog = r#"
@@ -85,6 +89,7 @@ fn main() uses { Console } {
     c.send(1)
     c.send(2)
     c.send(3)
+    c.close()
     for await v in c {
         print_int(v)
     }

@@ -1619,23 +1619,93 @@ impl Interpreter {
                 ),
                 span,
             )),
-            // Channels.
-            (Value::Chan(q), "send") => {
+            // Channels (Stage 38 — bounded + backpressure + closed flag).
+            (Value::Chan(c), "send") => {
                 ensure_arity(method, 1, args.len(), span)?;
-                q.borrow_mut().push_back(args[0].clone());
+                if c.closed.get() {
+                    return Err(EvalSignal::error(
+                        "chan.send: channel is closed (Stage 38 — send after close is an error; \
+                         use is_closed() to gate)",
+                        span,
+                    ));
+                }
+                let cap = c.capacity.get();
+                if let Some(n) = cap {
+                    let mut q = c.queue.borrow_mut();
+                    if q.len() >= n {
+                        match c.policy.get() {
+                            crate::value::BackpressurePolicy::Block => {
+                                return Err(EvalSignal::error(
+                                    format!(
+                                        "chan.send: channel is full (capacity {n}, policy block). \
+                                         Stage 38 synchronous-runtime send returns an error rather \
+                                         than parking; Stage 39+ is planned to park on a real scheduler."
+                                    ),
+                                    span,
+                                ));
+                            }
+                            crate::value::BackpressurePolicy::DropOldest => {
+                                // §38.6 verification fix S38-001 — at capacity=0,
+                                // pop_front is a no-op on an empty queue, so the
+                                // original code unconditionally pushed the new
+                                // value, leaving len()=1 on a "zero capacity"
+                                // channel. The capacity contract is "queue length
+                                // never exceeds n"; for n=0 that means we never
+                                // hold a value. The new value is dropped (counted)
+                                // and the queue is left empty.
+                                if n == 0 {
+                                    c.dropped.set(c.dropped.get().saturating_add(1));
+                                    return Ok(Value::Unit);
+                                }
+                                q.pop_front();
+                                c.dropped.set(c.dropped.get().saturating_add(1));
+                                q.push_back(args[0].clone());
+                                return Ok(Value::Unit);
+                            }
+                            crate::value::BackpressurePolicy::DropNew => {
+                                c.dropped.set(c.dropped.get().saturating_add(1));
+                                return Ok(Value::Unit);
+                            }
+                        }
+                    }
+                    q.push_back(args[0].clone());
+                    return Ok(Value::Unit);
+                }
+                c.queue.borrow_mut().push_back(args[0].clone());
                 Ok(Value::Unit)
             }
-            (Value::Chan(q), "recv") => {
+            (Value::Chan(c), "recv") => {
                 ensure_arity(method, 0, args.len(), span)?;
-                Ok(q.borrow_mut().pop_front().unwrap_or(Value::Nil))
+                Ok(c.queue.borrow_mut().pop_front().unwrap_or(Value::Nil))
             }
-            (Value::Chan(q), "len") => {
+            (Value::Chan(c), "len") => {
                 ensure_arity(method, 0, args.len(), span)?;
-                Ok(Value::Int(q.borrow().len() as i64))
+                Ok(Value::Int(c.queue.borrow().len() as i64))
             }
-            (Value::Chan(q), "is_empty") => {
+            (Value::Chan(c), "is_empty") => {
                 ensure_arity(method, 0, args.len(), span)?;
-                Ok(Value::Bool(q.borrow().is_empty()))
+                Ok(Value::Bool(c.queue.borrow().is_empty()))
+            }
+            // Stage 38 — explicit close + introspection.
+            (Value::Chan(c), "close") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                c.closed.set(true);
+                Ok(Value::Unit)
+            }
+            (Value::Chan(c), "is_closed") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.closed.get()))
+            }
+            (Value::Chan(c), "capacity") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(match c.capacity.get() {
+                    Some(n) => Value::Int(n as i64),
+                    None => Value::Nil,
+                })
+            }
+            (Value::Chan(c), "dropped") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(c.dropped.get() as i64))
             }
             // Agents / actors: dispatch the named message handler.
             (Value::Spawned(actor), name) => self.dispatch_handler(actor.clone(), name, args, span),
@@ -1659,6 +1729,29 @@ impl Interpreter {
 
     // ---- Spawn and handler dispatch ----------------------------------
 
+    /// Stage 5.5 synchronous actor dispatch — **NOT yet async** despite
+    /// Stage 36's async eval boundary and Stage 38's channel substrate.
+    ///
+    /// `eval_spawn` evaluates the constructor, initializes state, runs
+    /// `on_start`, and returns a `Value::Spawned` immediately on the
+    /// calling thread. Message dispatch into spawned actors is also
+    /// synchronous (single-threaded, deterministic, replayable). There
+    /// is no `Value::Task` variant and no scheduler hand-off; a `spawn x`
+    /// followed by interactions with the spawned actor happens entirely
+    /// within the calling thread's eval loop.
+    ///
+    /// Truly async spawn (cross-thread task dispatch + `await task`) is
+    /// the **Stage 39** deliverable that closes the async arc. Stage 39
+    /// requires `Arc`-ification of `Value` and `Env` so the actor's
+    /// state can cross the `tokio::spawn_blocking` boundary the same way
+    /// `Value::Model` did in Stage 32. The new task type would carry a
+    /// join handle and an output slot; `await task` would block on the
+    /// handle the same way `with_timeout` blocks on a thunk today.
+    ///
+    /// Until then, `spawn x` looks async at the surface (the type
+    /// signature implies concurrent execution) but observably behaves
+    /// like a synchronous constructor call followed by lazy message
+    /// dispatch. The Stage 39 lift will make the surface honest.
     fn eval_spawn(&mut self, call: &Expr, span: Span, env: &Env) -> EvalResult<Value> {
         // The argument to `spawn` must look like `Agent(arg, arg, name = value, ...)`
         // or just `Agent`. We extract the agent name from the call's callee
@@ -2953,51 +3046,51 @@ impl Interpreter {
         // streams — the surface is correct; backpressure lands when the
         // async scheduler does.
         if is_await {
-            if let Value::Chan(q) = iter_v {
-                // §37 lift: after the channel drains, wait briefly for more
-                // values to arrive (a background producer — e.g., a parallel
-                // arm or a spawn_blocking task — may push asynchronously).
-                // If no new value arrives within the post-drain budget, exit
-                // the loop. Stage 38 is planned to add an explicit `closed`
-                // flag on `Value::Chan` plus migration to
-                // `axon-async::AsyncMailbox` so the loop can wait forever
-                // on an open channel and exit immediately when it's closed.
+            if let Value::Chan(c) = iter_v {
+                // §38 — for-await honors the `closed` flag on the channel.
+                // Replaces the §37.D 50ms poll heuristic with the explicit
+                // wait-on-flag pattern the advisor recommended:
                 //
-                // The 50ms / 5ms numbers are a heuristic balance:
-                //   - 50ms total post-drain budget is long enough for a
-                //     parallel-arm producer running on the blocking pool to
-                //     deliver one more value, short enough that an empty
-                //     `for await` over an idle channel exits promptly rather
-                //     than appearing to hang.
-                //   - 5ms poll interval keeps wake latency under one frame
-                //     while the loop is waiting; CPU cost is negligible
-                //     because each iteration is just a refcell borrow.
-                // Both will be replaced by the Stage 38 closed-flag wait
-                // primitive; user-tunable polling parameters are not
-                // exposed in Stage 37.
-                const POST_DRAIN_WAIT_MS: u64 = 50;
+                //   - If a value is queued: process it.
+                //   - If the queue is empty AND the channel is closed: exit
+                //     the loop (no more values will arrive).
+                //   - If the queue is empty AND the channel is open: poll
+                //     briefly for a new value, then re-check the closed
+                //     flag. A 5-minute total budget prevents an open-and-
+                //     forgotten channel from hanging the process forever;
+                //     a producer that means to keep the loop alive must
+                //     call `c.send(...)` within that window.
+                //
+                // The 5ms poll interval matches §37.D. The total budget
+                // is a safety ceiling, not a "you have 5 minutes" promise
+                // — closed channels exit immediately.
+                const OPEN_WAIT_BUDGET_MS: u64 = 5 * 60 * 1000;
                 const POLL_INTERVAL_MS: u64 = 5;
+                let started = std::time::Instant::now();
+                let budget = std::time::Duration::from_millis(OPEN_WAIT_BUDGET_MS);
+                let step = std::time::Duration::from_millis(POLL_INTERVAL_MS);
                 loop {
-                    let next = {
-                        let mut g = q.borrow_mut();
-                        g.pop_front()
-                    };
+                    let next = c.queue.borrow_mut().pop_front();
                     let item = match next {
                         Some(v) => v,
                         None => {
-                            // Empty drain — give background producers a
-                            // window to push. Poll every POLL_INTERVAL_MS
-                            // up to POST_DRAIN_WAIT_MS so the loop wakes
-                            // promptly when a value arrives mid-window.
-                            let waited = self.wait_for_chan_value(
-                                &q,
-                                POST_DRAIN_WAIT_MS,
-                                POLL_INTERVAL_MS,
-                            );
-                            match waited {
-                                Some(v) => v,
-                                None => break,
+                            if c.closed.get() {
+                                // Closed + drained: clean exit.
+                                break;
                             }
+                            if started.elapsed() >= budget {
+                                return Err(EvalSignal::error(
+                                    format!(
+                                        "for-await: open channel produced no value within the \
+                                         {OPEN_WAIT_BUDGET_MS}ms safety budget. Either close the \
+                                         channel (`c.close()`) when production is done, or break \
+                                         out of the loop on a different signal."
+                                    ),
+                                    span,
+                                ));
+                            }
+                            std::thread::sleep(step);
+                            continue;
                         }
                     };
                     let child = env.child();
@@ -3025,9 +3118,11 @@ impl Interpreter {
                 .map(|(k, v)| Value::Tuple(Rc::new(vec![k, v])))
                 .collect(),
             Value::String(s) => s.chars().map(Value::Char).collect(),
-            Value::Chan(q) => {
+            Value::Chan(c) => {
                 // Plain `for` over a Chan: snapshot + drain in one pass.
-                let mut g = q.borrow_mut();
+                // (Use `for await` if you want closed-flag-aware semantics
+                // that wait for a producer.)
+                let mut g = c.queue.borrow_mut();
                 std::mem::take(&mut *g).into_iter().collect()
             }
             other => {
@@ -3053,18 +3148,24 @@ impl Interpreter {
     /// Evaluate a `select { ... }` block. Stage 37 makes the timeout arm
     /// actually wait for its duration before firing (Stage 36 fired it
     /// immediately because the synchronous interpreter had no way to wait).
+    /// Stage 38 adds the closed-flag fast-fail.
     ///
     /// Semantics:
     ///   1. Walk every `recv(chan)` arm in declaration order; the first
     ///      one whose channel has a value pending wins (no wait).
-    ///   2. If no recv arm is ready AND a `timeout(...)` arm is present:
+    ///   2. **Stage 38 fast-fail.** If every `recv` arm is on a CLOSED-and-
+    ///      EMPTY channel (and at least one `recv` arm exists), no
+    ///      producer can ever satisfy any branch. Skip the timeout sleep
+    ///      entirely and fire the smallest declared timeout body, then
+    ///      the else body, then error.
+    ///   3. If no recv arm is ready AND a `timeout(...)` arm is present:
     ///      sleep for the shortest declared timeout, then re-check the
     ///      channels (a background tokio task — e.g. a parallel arm's
     ///      producer — may have pushed during the wait). If a channel
     ///      became ready, take it. Otherwise the timeout arm fires.
-    ///   3. Else arm (if any) fires as the final fallback when there's no
+    ///   4. Else arm (if any) fires as the final fallback when there's no
     ///      timeout.
-    ///   4. No fallback → runtime error.
+    ///   5. No fallback → runtime error.
     ///
     /// Cap: the sleep is bounded at 1 hour to prevent foot-guns. Larger
     /// timeouts surface a clean error.
@@ -3082,15 +3183,14 @@ impl Interpreter {
         // `recv(open_session())` where the channel comes from an effectful
         // constructor, that ran the side effect twice. Fix: hoist channel
         // evaluation here; pass the prebuilt queues to both probes.
-        let mut recv_queues: Vec<
-            Option<std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Value>>>>,
-        > = Vec::with_capacity(arms.len());
+        let mut recv_chans: Vec<Option<std::rc::Rc<crate::value::ChanCell>>> =
+            Vec::with_capacity(arms.len());
         for arm in arms {
             match &arm.kind {
                 axon_ast::SelectArmKind::Recv { channel, .. } => {
                     let chan_v = self.eval_expr(channel, env)?;
-                    let q = match chan_v {
-                        Value::Chan(q) => q,
+                    let c = match chan_v {
+                        Value::Chan(c) => c,
                         other => {
                             return Err(EvalSignal::error(
                                 format!(
@@ -3101,15 +3201,47 @@ impl Interpreter {
                             ));
                         }
                     };
-                    recv_queues.push(Some(q));
+                    recv_chans.push(Some(c));
                 }
-                _ => recv_queues.push(None),
+                _ => recv_chans.push(None),
             }
         }
 
         // First pass: find a ready Recv (using the prebuilt queues).
-        if let Some(v) = self.try_take_ready_recv_with(arms, &recv_queues, env)? {
+        if let Some(v) = self.try_take_ready_recv_with(arms, &recv_chans, env)? {
             return Ok(v);
+        }
+        // §38 fast-fail: if every Recv arm is on a CLOSED-and-EMPTY
+        // channel, no producer can ever satisfy any of them. Skip the
+        // timeout sleep and go straight to the timeout/else fallback.
+        // This is the "fail-loud-on-closed" semantic the advisor's
+        // Stage 38 plan calls out — without it, a select waiting on an
+        // explicitly-closed producer would still sleep its full timeout
+        // before falling through.
+        let any_recv = recv_chans.iter().any(|c| c.is_some());
+        let all_recv_closed_empty = any_recv
+            && recv_chans.iter().all(|c| match c {
+                Some(cell) => cell.closed.get() && cell.queue.borrow().is_empty(),
+                None => true,
+            });
+        if all_recv_closed_empty {
+            // Take the smallest timeout if any (immediate fire because the
+            // wait is pointless), otherwise the else, otherwise error.
+            for arm in arms {
+                if matches!(&arm.kind, axon_ast::SelectArmKind::Timeout { .. }) {
+                    return self.eval_block(&arm.body, env);
+                }
+            }
+            for arm in arms {
+                if matches!(&arm.kind, axon_ast::SelectArmKind::Else) {
+                    return self.eval_block(&arm.body, env);
+                }
+            }
+            return Err(EvalSignal::error(
+                "select: every `recv(...)` channel is closed and empty, and no \
+                 `timeout`/`else` arm is present — no branch can ever succeed",
+                span,
+            ));
         }
         // Stage 37: if there's a timeout arm, actually wait. Pick the
         // *minimum* declared timeout (shortest deadline fires first).
@@ -3156,7 +3288,7 @@ impl Interpreter {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             // Re-probe the SAME prebuilt queues — no re-evaluation of the
             // channel expressions per STAGE37-001.
-            if let Some(v) = self.try_take_ready_recv_with(arms, &recv_queues, env)? {
+            if let Some(v) = self.try_take_ready_recv_with(arms, &recv_chans, env)? {
                 return Ok(v);
             }
             // Fire the winning timeout arm.
@@ -3178,46 +3310,36 @@ impl Interpreter {
     /// §37 — poll a channel for a new value over a bounded post-drain
     /// window. Returns `Some(v)` if a producer pushed during the window,
     /// `None` if the window elapsed empty. The poll interval is small so
-    /// the loop wakes promptly on arrival without burning CPU.
-    fn wait_for_chan_value(
-        &self,
-        q: &std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Value>>>,
-        total_budget_ms: u64,
-        poll_interval_ms: u64,
-    ) -> Option<Value> {
-        let started = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(total_budget_ms);
-        let step = std::time::Duration::from_millis(poll_interval_ms.max(1));
-        loop {
-            if let Some(v) = q.borrow_mut().pop_front() {
-                return Some(v);
-            }
-            if started.elapsed() >= budget {
-                return None;
-            }
-            std::thread::sleep(step);
-        }
-    }
+    /// §38 — `wait_for_chan_value` was the §37.D poll-heuristic helper.
+    /// Stage 38's `for await` uses the closed-flag wait pattern directly
+    /// instead of polling a budget. The helper has no remaining callers
+    /// and is removed.
 
-    /// Walk Recv arms in declaration order using *prebuilt* channel queues
-    /// (§37.6 STAGE37-001 fix). `recv_queues[i]` is `Some(q)` iff
-    /// `arms[i]` is a Recv arm whose channel resolved to a `Value::Chan(q)`.
-    /// Pre-resolution ensures channel expressions evaluate exactly once
-    /// per `select` execution, even when we re-probe after a timeout sleep.
+    /// Walk Recv arms in declaration order using *prebuilt* channel cells
+    /// (§37.6 STAGE37-001 fix carried into §38). `recv_chans[i]` is `Some(c)`
+    /// iff `arms[i]` is a Recv arm whose channel resolved to a
+    /// `Value::Chan(c)`. Pre-resolution ensures channel expressions
+    /// evaluate exactly once per `select` execution, even when we re-probe
+    /// after a timeout sleep.
+    ///
+    /// §38 addition: a closed-and-empty channel CAN'T win — its arm is
+    /// skipped, never selected even if a Recv would otherwise be eligible.
+    /// If every Recv arm is closed-and-empty, the select falls through to
+    /// the timeout / else fallback (or errors if neither is present).
     fn try_take_ready_recv_with(
         &mut self,
         arms: &[axon_ast::SelectArm],
-        recv_queues: &[Option<std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<Value>>>>],
+        recv_chans: &[Option<std::rc::Rc<crate::value::ChanCell>>],
         env: &Env,
     ) -> EvalResult<Option<Value>> {
         for (i, arm) in arms.iter().enumerate() {
-            let Some(q) = recv_queues.get(i).and_then(|q| q.as_ref()) else {
+            let Some(c) = recv_chans.get(i).and_then(|c| c.as_ref()) else {
                 continue;
             };
             let axon_ast::SelectArmKind::Recv { binding, .. } = &arm.kind else {
                 continue;
             };
-            let popped = q.borrow_mut().pop_front();
+            let popped = c.queue.borrow_mut().pop_front();
             if let Some(v) = popped {
                 let child = env.child();
                 if binding.name != "_" {

@@ -274,7 +274,9 @@ pub fn register_builtins(register: &mut dyn FnMut(&'static str, NativeFn)) {
         NativeFn {
             name: "chan",
             min_arity: 0,
-            max_arity: Some(0),
+            // Stage 38: `chan()` unbounded, `chan(N)` bounded with default
+            // "block" policy, `chan(N, "policy")` bounded + explicit policy.
+            max_arity: Some(2),
             required_caps: &[],
             call: builtin_chan,
         },
@@ -611,8 +613,51 @@ fn builtin_random_float(_args: &[Value]) -> Result<Value, String> {
 // Net (stub)
 // ===========================================================================
 
-fn builtin_chan(_args: &[Value]) -> Result<Value, String> {
-    Ok(Value::Chan(Rc::new(RefCell::new(VecDeque::new()))))
+/// Stage 38 — `chan()` or `chan(capacity)` or `chan(capacity, policy)`.
+///
+/// - `chan()` — unbounded FIFO (the §3 default; preserved for backwards
+///   compatibility with every pre-Stage-38 program).
+/// - `chan(N)` — bounded N-slot FIFO, default policy `"block"`.
+/// - `chan(N, policy)` — bounded with explicit backpressure policy.
+///   Policy strings: `"block"`, `"drop_oldest"`, `"drop_new"`.
+fn builtin_chan(args: &[Value]) -> Result<Value, String> {
+    if args.is_empty() {
+        return Ok(Value::Chan(Rc::new(crate::value::ChanCell::unbounded())));
+    }
+    let cap = match &args[0] {
+        Value::Int(n) if *n >= 0 => *n as usize,
+        Value::Int(n) => {
+            return Err(format!(
+                "chan(capacity): capacity must be non-negative, got {n}"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "chan(capacity): expected Int, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    let policy = match args.get(1) {
+        Some(Value::String(s)) => crate::value::BackpressurePolicy::parse(s.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "chan(capacity, policy): policy must be one of \"block\", \
+                     \"drop_oldest\", \"drop_new\"; got `{}`",
+                    s.as_str()
+                )
+            })?,
+        Some(Value::Nil) | None => crate::value::BackpressurePolicy::Block,
+        Some(other) => {
+            return Err(format!(
+                "chan(capacity, policy): policy must be String, got `{}`",
+                other.type_name()
+            ));
+        }
+    };
+    Ok(Value::Chan(Rc::new(crate::value::ChanCell::bounded(
+        cap, policy,
+    ))))
 }
 
 fn builtin_anthropic(args: &[Value]) -> Result<Value, String> {

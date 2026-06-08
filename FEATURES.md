@@ -1,6 +1,81 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1103 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1120 tests passing** across 30+ crates).
+
+---
+
+## Stage 38 — Channels on the Async Substrate: Closed Flag + Bounded Channels + Backpressure + Honest `for await` & `select`
+
+The second of three planned slices closing the async arc. Stage 36 wired the async eval boundary; Stage 37 lifted the surface promises (`parallel { }` arms, `select` real timeout, `for await` real wait, contextual keywords); Stage 38 turns channels from a single-knob FIFO into a real concurrency primitive. The §37.D 50ms-poll heuristic that bridged from Stage 36 to Stage 38 is replaced by the proper closed-flag wait pattern. Adversarial verification surfaced 1 major (`DropOldest` at capacity=0 violated the capacity invariant) + 1 major (eval_spawn lacked the Stage 5.5/39 docstring) + 4 doc-polish findings; all addressed before merge with regression tests pinning each.
+
+Stage 38 is deliberately **channels + closed-flag + backpressure**, not the spawn-async lift. `spawn x` stays Stage 5.5 synchronous-dispatch — truly async spawn requires `Value` and `Env` `Arc`-ification (Stage 39). The substrate Stage 38 ships unblocks that lift cleanly.
+
+### §38.A — Channel core (`ChanCell` + closed flag + bounded + backpressure)
+
+The Stage 36/37 `Value::Chan(Rc<RefCell<VecDeque<Value>>>)` was a one-knob FIFO with no closed/bounded/policy state. Stage 38 wraps it:
+
+- **New `ChanCell` struct** ([crates/axon-runtime/src/value.rs](crates/axon-runtime/src/value.rs)) with `{ queue: RefCell<VecDeque<Value>>, closed: Cell<bool>, capacity: Cell<Option<usize>>, policy: Cell<BackpressurePolicy>, dropped: Cell<u64> }`. Queue mutates behind RefCell; metadata flags use Cell for cheap toggle. Shared via `Rc` so multiple `Value::Chan` clones point at the same channel.
+- **`Value::Chan(Rc<RefCell<VecDeque<Value>>>)` → `Value::Chan(Rc<ChanCell>)`** — touches every Chan call site (builtin constructor, send/recv/len/is_empty method dispatch, eval_for, eval_select, Display). Net diff: tighter API surface, identical behavior on the unchanged code paths.
+- **`BackpressurePolicy` enum**: `Block` (errors with `chan: full` when at capacity), `DropOldest` (evicts queue front, push new, `dropped++`), `DropNew` (silently drop new value, `dropped++`). Shape matches `axon-async::AsyncMailbox` so Stage 39+ migration is a type-rename, not a semantic change. Policy strings (`"block"` / `"drop_oldest"` / `"drop_new"`) are lowercase-only and case-sensitive — documented in the `parse()` rustdoc.
+- **`chan()` builtin extended** ([crates/axon-runtime/src/builtin.rs](crates/axon-runtime/src/builtin.rs)) to 0/1/2-arg form: `chan()` (unbounded; the §3 default, preserved verbatim), `chan(N)` (bounded N, default `Block` policy), `chan(N, "policy")` (bounded + explicit policy). Capacity must be a non-negative `Int`; unknown policy strings error cleanly listing the three valid options.
+- **Four new method-call sites on `Value::Chan`** ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs)): `close()` marks the channel done, `is_closed()` reads the flag, `capacity()` returns `Some(n)` as `Int` or `nil` for unbounded, `dropped()` returns the lifetime drop count as `Int`. Tyck-registered in [crates/axon-tyck/src/infer.rs](crates/axon-tyck/src/infer.rs) for both the method-call type table and the `builtin_methods_for(Chan(_))` candidate list.
+- **`chan.send` semantics**: errors with "channel is closed" if `closed.get()`. With capacity set: `Block` policy at capacity errors "channel is full"; `DropOldest` evicts the front element and pushes the new one (the post-§38.6 fix correctly handles capacity=0 — never holds a value); `DropNew` increments `dropped` and silently discards the new value. Unbounded path is the §3 push.
+
+### §38.B — `for await` waits on the closed flag
+
+The §37.D heuristic was a 50ms post-drain poll: when the queue emptied, wait briefly for a late producer, then exit. Honest but bounded. Stage 38 replaces it with the proper wait-on-closed pattern:
+
+- **`eval_for` (when `is_await` and iter is `Chan`)** in [crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs) — drain values from the queue; if empty AND closed, exit cleanly; if empty AND open, sleep 5ms and re-check. A 5-minute total safety budget prevents an open-and-forgotten channel from hanging the process forever; the error names the budget and recommends `c.close()` when production is done.
+- **The `wait_for_chan_value` §37.D helper is removed.** No callers remain.
+- **Cumulative budget semantic** (not per-value): the 5-minute window starts at loop entry and counts every empty-drain wait. A producer pushing a value every 100ms keeps the loop alive indefinitely (the queue is never empty long enough to consume budget); a producer that goes silent for 5 minutes triggers the bounded error. This is documented in the inline comment as the deliberate DoS ceiling.
+
+### §38.C — `select` fast-fails on all-closed-empty Recv arms
+
+Stage 37 made `select`'s timeout wait real. Stage 38 adds the corollary: if every `recv(...)` arm is on a channel that's both closed AND empty, no producer can ever satisfy any branch — so the timeout sleep is pointless and is skipped:
+
+- **Pre-prebuilt-queue check** in `eval_select` ([crates/axon-runtime/src/eval.rs](crates/axon-runtime/src/eval.rs)): after the §37.6 STAGE37-001 prebuilt-queue pattern resolves channels exactly once, walk `recv_chans` — if every entry is `closed && queue.is_empty()` AND at least one Recv arm exists, fire the smallest declared `timeout` body immediately, then `else`, then error with `"every recv(...) channel is closed and empty, and no timeout/else arm is present"`.
+- **Open arm preserves wait**: if ANY Recv arm is on an open channel, the fast-fail doesn't fire and the timeout sleeps as usual (Stage 37 contract preserved).
+- **Net effect**: a producer-consumer pipeline whose producer explicitly closes its output channel no longer wastes the consumer's timeout budget — the consumer exits immediately. Pairs with the §38.B for-await closed-aware exit for the natural producer-completes-and-closes shape.
+
+### §38.D — DEFERRED to Stage 39: `spawn x` truly async + `Value::Task` + `await task`
+
+`eval_spawn` is now documented as **Stage 5.5 synchronous actor dispatch** — the surface looks like it might be async but the runtime hands off to a `Value::Spawned` on the calling thread. Cross-thread task dispatch requires `Arc`-ification of `Value` and `Env` (Stage 39 territory) so the actor's state can ride `tokio::spawn_blocking` the same way `Value::Model` did in Stage 32. Stage 38's channel substrate is exactly what Stage 39's task type will use for cross-task communication — that's the load-bearing connection between the two stages.
+
+### §38.6 — Adversarial verification round
+
+A 4-reviewer workflow (correctness, integration, docs/honesty, security) ran against the Stage 38 diff. Verdict after synthesis: **fix-then-ship**.
+
+**Major (fixed before merge):**
+- **S38-001** — `DropOldest` at `capacity=0` violated the capacity invariant. `chan(0, "drop_oldest").send(v)` left `len()=1` and `recv()` returned the value that was supposed to be dropped. Fixed by gating the eviction-and-push branch on `n > 0`; at `n=0` we increment `dropped` and return without touching the queue. Regression: `s38_001_drop_oldest_at_capacity_zero_keeps_queue_empty` + sibling tests pinning `DropNew` and `Block` at `cap=0` so the fix doesn't accidentally drift those.
+- **DOC-003** — `eval_spawn` had no docstring clarifying that `spawn x` stays Stage 5.5 synchronous-dispatch despite Stage 36's async eval boundary and Stage 38's channel substrate. A reader was left unable to tell whether `spawn x` was async or sync from the source. Fixed with a 20-line docstring naming Stage 5.5 / "NOT yet async" / Stage 39 as the lift. Regression: `doc_003_eval_spawn_has_stage5_5_and_stage39_docstring` greps the source for the key honesty terms.
+
+**Should-fix (applied in the same pass):**
+- **STAGE38-DOC-001** — FEATURES.md test count was stale (1103). Bumped to 1120 (matches post-fix sweep).
+- **STAGE38-DOC-002** — FEATURES.md had no Stage 38 section. This entry.
+- **DOC-002-MISSING-STAGE38** — `eval_select` rustdoc didn't document the §38 fast-fail. Added as bullet 2 in the semantics list.
+- **DOC-004-STAGE39-SPECULATIVE** — `chan.send`'s full-channel error message used "Stage 39+ will park" which presented a future plan as a commitment. Softened to "is planned to park" to match the phrasing elsewhere in the codebase.
+
+**Nits (applied):** `sigle-field` → `single-field` typo in `ChanCell` docstring. Case-sensitivity contract on `BackpressurePolicy::parse` documented inline.
+
+**Reviewer findings that did NOT survive synthesis:**
+- The 5-minute cumulative wait budget for for-await was flagged as a potential DoS but downgraded after the reviewer's own analysis confirmed it's the deliberate ceiling documented in the design comment. Not a bug; could move to nit-level docs.
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage38_channels` | 13 integration tests | close marks closed, send-after-close errors, recv-on-closed-empty returns nil, Block/DropOldest/DropNew at capacity, capacity()+dropped() introspection, unknown-policy error, for-await closed-aware exit + value-then-close ordering, select fast-fail on all-closed-empty, select with one open arm still waits |
+| `axon-cli::stage38_verify_fixes` | 4 regression tests | S38-001 DropOldest cap=0 keeps len=0; sibling DropNew + Block at cap=0; DOC-003 eval_spawn docstring grep |
+| Stage 37 / Stage 19 carryover (updated) | 2 tests | for-await fixtures now `c.close()` before iterating so the loop exits cleanly under Stage 38's new wait-on-closed semantic |
+| **Workspace total** | **1120 passing**, up from 1103 | +17 net (13 acceptance + 4 verify-fix) |
+
+### What's NOT in this stage (explicit scope cuts)
+
+- **Stage 39**: `Arc`-ification of `Value::{List, Map, Set, Record, Instance, Memory}` and `Env` so `Interpreter` becomes `Send`. Unlocks: true parallelism for §37.B's general path (multi-step `parallel { research(q), summarize(q) }` actually overlaps); truly async `spawn x` + `Value::Task` + `await task`; cross-thread actor message dispatch. The Stage 38 channel substrate (closed flag + bounded + backpressure) is the natural backbone for the Stage 39 task communication.
+- **`axon-async::AsyncMailbox` integration**: the substrate has been sitting in `axon-async` since Stage 31 unused; Stage 38's `BackpressurePolicy` enum shape matches it deliberately so Stage 39's `Send`-safe channel migration is a type-shape rename. Stage 38 stays in `Rc<ChanCell>` because `Interpreter` is still `!Send`.
+- **Tunable for-await budget**: the 5-minute safety ceiling and 5ms poll interval are hardcoded constants. Stage 39's task migration will likely replace the polling loop with a real reactor wake, at which point the cumulative-budget semantic becomes moot.
+- **Recording of close/drop events**: closed flag changes and dropped-counter increments are purely in-process — they do not produce `RecordedEvent` entries. Record/replay byte-identity is preserved because no new non-determinism was introduced; channels remain single-threaded in observable semantics.
+- **`spawn x` async lift, `Value::Task`, `await task`** — Stage 39, with the channel substrate as the communication backbone.
 
 ---
 

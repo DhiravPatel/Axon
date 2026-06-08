@@ -5,7 +5,7 @@
 //! list too — Axon's value semantics match Python's in this respect). Scalar
 //! values are by-value `Copy` types where possible.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt;
@@ -16,6 +16,81 @@ use axon_diag::Span;
 
 use crate::actor::Actor;
 use crate::env::Env;
+
+/// Stage 38 — backpressure policy for bounded channels. Matches the
+/// shapes in `axon-async::AsyncMailbox` so Stage 39+ migration is a
+/// type-shape rename, not a semantic change.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BackpressurePolicy {
+    /// Send errors with `chan: full` when the queue is at capacity.
+    /// Synchronous-runtime proxy for a true blocking send (no scheduler
+    /// to park on yet).
+    Block,
+    /// Eject the oldest buffered value and push the new one. Counter
+    /// `dropped` increments. Same semantics as `axon-async::AsyncMailbox`.
+    DropOldest,
+    /// Silently drop the new value when full.
+    DropNew,
+}
+
+impl BackpressurePolicy {
+    /// Policy strings are case-sensitive and lowercase: `"block"`,
+    /// `"drop_oldest"`, `"drop_new"`. Anything else returns None and the
+    /// caller surfaces the named error listing the three valid options.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "block" => Some(BackpressurePolicy::Block),
+            "drop_oldest" => Some(BackpressurePolicy::DropOldest),
+            "drop_new" => Some(BackpressurePolicy::DropNew),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackpressurePolicy::Block => "block",
+            BackpressurePolicy::DropOldest => "drop_oldest",
+            BackpressurePolicy::DropNew => "drop_new",
+        }
+    }
+}
+
+/// Stage 38 — internal channel state. The queue is mutable behind a
+/// `RefCell`; closed/capacity/policy/dropped are all single-field flags
+/// behind `Cell`. The cell is shared via `Rc` so multiple `Value::Chan`
+/// clones point at the same channel (and observe each other's sends,
+/// closes, and drops).
+pub struct ChanCell {
+    pub queue: RefCell<VecDeque<Value>>,
+    pub closed: Cell<bool>,
+    /// `None` means unbounded (the §3 default). `Some(n)` is the
+    /// declared backpressure capacity.
+    pub capacity: Cell<Option<usize>>,
+    pub policy: Cell<BackpressurePolicy>,
+    /// Telemetry: total values dropped by `DropOldest` / `DropNew` over
+    /// this channel's lifetime. Exposed to programs via `c.dropped()`.
+    pub dropped: Cell<u64>,
+}
+
+impl ChanCell {
+    pub fn unbounded() -> Self {
+        Self {
+            queue: RefCell::new(VecDeque::new()),
+            closed: Cell::new(false),
+            capacity: Cell::new(None),
+            policy: Cell::new(BackpressurePolicy::Block),
+            dropped: Cell::new(0),
+        }
+    }
+    pub fn bounded(capacity: usize, policy: BackpressurePolicy) -> Self {
+        Self {
+            queue: RefCell::new(VecDeque::new()),
+            closed: Cell::new(false),
+            capacity: Cell::new(Some(capacity)),
+            policy: Cell::new(policy),
+            dropped: Cell::new(0),
+        }
+    }
+}
 
 /// A runtime value. Cheap to clone for scalars; container variants share
 /// underlying storage through `Rc`.
@@ -101,11 +176,13 @@ pub enum Value {
     /// to a handler in `Actor.def.handlers`.
     Spawned(Rc<Actor>),
 
-    /// A FIFO channel. `.send(v)` enqueues, `.recv()` dequeues. With the
-    /// synchronous-dispatch scheduler there's no blocking on empty — an
-    /// empty `.recv()` simply returns `Nil`. Stays FIFO when the eventual
-    /// cooperative scheduler arrives.
-    Chan(Rc<RefCell<VecDeque<Value>>>),
+    /// A FIFO channel. `.send(v)` enqueues, `.recv()` dequeues, `.close()`
+    /// marks it done (Stage 38). With the synchronous-dispatch scheduler
+    /// there's no blocking on empty — an empty `.recv()` returns `Nil`.
+    /// `for await x in c` now waits properly for new values on an OPEN
+    /// channel and exits the moment a CLOSED channel drains (Stage 38
+    /// replaces the §37.D 50ms poll heuristic).
+    Chan(Rc<ChanCell>),
 
     /// A handle to a model provider. `ask` / `generate<S>` / `plan` consume
     /// this; the runtime calls `provider.complete(...)` under the hood.
@@ -557,7 +634,10 @@ impl fmt::Display for Value {
             Value::Native(n) => write!(f, "<native {}>", n.name),
             Value::NativeExt(n) => write!(f, "<native {}>", n.name),
             Value::Spawned(a) => write!(f, "<{} #{}>", a.type_name, a.id),
-            Value::Chan(q) => write!(f, "<chan len={}>", q.borrow().len()),
+            Value::Chan(c) => {
+                let closed = if c.closed.get() { " closed" } else { "" };
+                write!(f, "<chan len={}{closed}>", c.queue.borrow().len())
+            }
             Value::Model(m) => write!(f, "<model {}>", m.name()),
             Value::Memory(m) => write!(f, "<memory len={}>", m.borrow().len()),
             Value::Tool(t) => write!(f, "<tool {}>", t.name),
