@@ -27,11 +27,15 @@ export function ChapterView({
   return (
     <>
       <Breadcrumbs items={crumbs} />
-      <header className="mb-8 max-w-3xl">
-        <p className="font-mono text-xs uppercase tracking-[0.2em] text-copper-400">
-          {eyebrow} · {idx + 1} of {all.length}
-        </p>
-        <h1 className="mt-2 font-display text-3xl font-semibold tracking-tight text-white sm:text-4xl">
+      <header className="mb-9 max-w-3xl">
+        <div className="inline-flex items-center gap-2 rounded-full border border-copper-700/40 bg-copper-950/40 px-3 py-1 font-mono text-[11px] uppercase tracking-[0.14em] text-copper-300">
+          <span>{eyebrow}</span>
+          <span className="text-copper-500/60">·</span>
+          <span className="text-copper-200/80">
+            {idx + 1} / {all.length}
+          </span>
+        </div>
+        <h1 className="mt-4 font-display text-3xl font-semibold tracking-tight text-white sm:text-[2.5rem] sm:leading-tight">
           {chapter.title}
         </h1>
         {chapter.blurb ? (

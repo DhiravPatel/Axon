@@ -169,7 +169,7 @@ function extractToc(html: string): TocEntry[] {
   const re = /<h(3)[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/h\1>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
-    const text = stripTags(m[3]).trim();
+    const text = decodeEntities(stripTags(m[3])).trim();
     if (!text) continue;
     out.push({ id: m[2], text, depth: 3 });
   }
@@ -178,4 +178,23 @@ function extractToc(html: string): TocEntry[] {
 
 function stripTags(html: string): string {
   return html.replace(/<[^>]+>/g, "");
+}
+
+/**
+ * Decode the small set of HTML entities the markdown renderer emits in
+ * heading text (`&`, `<`, `>`, quotes) plus any numeric escape, so TOC
+ * labels read as plain text instead of `&#x26;` / `&#x3C;`.
+ */
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+      String.fromCodePoint(parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
 }

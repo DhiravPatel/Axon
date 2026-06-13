@@ -12,6 +12,11 @@ axon-models = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 tokio      = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Stage 39a — parking_lot::Mutex for container interiors. Replaces the
+# pre-Stage-39 `RefCell` so `Value` containers are `Send + Sync` and
+# `Interpreter` is `Send`. parking_lot picked over `std::sync::Mutex`
+# for infallible `.lock()` (no poisoning) and faster uncontended path.
+parking_lot = "0.12"
 
 [dev-dependencies]
 axon-parser = { workspace = true }

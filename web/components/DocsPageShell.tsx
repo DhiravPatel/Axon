@@ -19,7 +19,7 @@ export function DocsPageShell({
   return (
     <>
       <DocsSidebar groups={sidebar} activeHref={activeHref} />
-      <article className="flex-1 min-w-0 py-8 lg:px-8">{children}</article>
+      <article className="min-w-0 flex-1 py-10 lg:px-10">{children}</article>
       <TableOfContents entries={toc ?? []} />
     </>
   );

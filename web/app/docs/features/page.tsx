@@ -44,10 +44,10 @@ export default async function FeaturesIndexPage() {
           <li key={c.slug}>
             <Link
               href={`/docs/features/${c.slug}`}
-              className="group flex h-full flex-col rounded-xl border border-ink-800 bg-ink-900/30 p-5 transition-colors hover:border-copper-700/60 hover:bg-ink-900/60"
+              className="card-glow group flex h-full flex-col rounded-2xl border border-ink-800 bg-ink-900/30 p-5"
             >
               <div className="mb-2 flex items-center gap-2">
-                <span className="rounded bg-copper-950/40 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-copper-300">
+                <span className="rounded bg-copper-950/40 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-copper-300 ring-1 ring-inset ring-copper-800/40">
                   {c.title.match(/^Stage\s+\d+(?:\.\d+)?/i)?.[0] ?? "entry"}
                 </span>
               </div>
@@ -59,8 +59,11 @@ export default async function FeaturesIndexPage() {
                   {c.blurb}
                 </p>
               ) : null}
-              <span className="mt-4 text-sm text-copper-400 group-hover:underline">
-                Open →
+              <span className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-copper-400">
+                Open
+                <span className="transition-transform group-hover:translate-x-1">
+                  →
+                </span>
               </span>
             </Link>
           </li>
