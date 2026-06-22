@@ -1,0 +1,56 @@
+// stage39_ergonomics.ax — a tour of the Stage 39 ease-of-use papercut fixes.
+//
+// Run with:  axon run examples/stage39_ergonomics.ax
+//
+// Everything below used to require a workaround (an index `while` loop, a
+// `str_*` free function, a Rust-side timer, explicit concat parens, or a
+// named schema). Stage 39 makes the natural spelling Just Work.
+
+// P7 — inline record types parse inside generics, no named schema required.
+fn label_widths(rows: List<{ name: String, width: Int }>) -> Int uses {} {
+    var total = 0
+    for row in rows {
+        total = total + row.width
+    }
+    total
+}
+
+fn main() uses { Console } {
+    // P4 — `for x in` iterates a String by Char (no while + index).
+    var vowels = 0
+    for ch in "automaton" {
+        if ch == 'a' || ch == 'o' { vowels = vowels + 1 }
+    }
+    print("vowels = {vowels}")
+
+    // P10 — String methods: .replace / .repeat / .trim_start.
+    let slug = "Hello World".to_lower().replace(" ", "-")
+    let rule = "=".repeat(12)
+    print("slug  = {slug}")
+    print("rule  = {rule}")
+
+    // P3a — a trailing operator continues the expression onto the next line,
+    // so multi-line prompt strings don't need wrapping parens.
+    let banner = "axon " +
+                 "stage 39 " +
+                 "ergonomics"
+    print("banner= {banner}")
+
+    // P9 — read a Duration out in whatever unit you want.
+    let t0 = time_now()
+    var spin = 0
+    for _ in 0..1000 { spin = spin + 1 }
+    let elapsed = time_now() - t0
+    print("counted {spin} in {elapsed.as_micros()}us (= {elapsed.as_ns()}ns)")
+
+    // P8 — the gradual escape hatch accepts `Dyn`, `dyn`, or `Any`.
+    let bag: List<Any> = []
+    print("bag_len = {list_len(bag)}")
+
+    // P7 again — call through the inline-record-typed function.
+    let widths = label_widths([
+        { name: "id", width: 4 },
+        { name: "status", width: 8 },
+    ])
+    print("widths = {widths}")
+}

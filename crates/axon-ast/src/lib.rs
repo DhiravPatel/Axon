@@ -223,6 +223,10 @@ pub enum TypeKind {
     },
     Set(Box<Type>),
     Tuple(Vec<Type>),
+    /// Anonymous inline record type, e.g. `{ target: Model, user: String }`,
+    /// usable inside generics like `List<{ target: Model, user: String }>`.
+    /// Mirrors `TypeDeclBody::Record` but without a name. P7.
+    Record(Vec<Field>),
     /// `()`
     Unit,
     Ref {

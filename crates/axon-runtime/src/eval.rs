@@ -1475,6 +1475,42 @@ impl Interpreter {
                     ))
                 }
             }
+            (Value::String(s), "replace") => {
+                ensure_arity(method, 2, args.len(), span)?;
+                match (&args[0], &args[1]) {
+                    (Value::String(from), Value::String(to)) => Ok(Value::String(Rc::new(
+                        s.replace(from.as_str(), to.as_str()),
+                    ))),
+                    _ => Err(EvalSignal::error(
+                        "`String.replace` expects two String arguments (from, to)".to_string(),
+                        span,
+                    )),
+                }
+            }
+            (Value::String(s), "trim_start") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::String(Rc::new(s.trim_start().to_string())))
+            }
+            (Value::String(s), "trim_end") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::String(Rc::new(s.trim_end().to_string())))
+            }
+            (Value::String(s), "repeat") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                match &args[0] {
+                    Value::Int(n) if *n >= 0 => {
+                        Ok(Value::String(Rc::new(s.repeat(*n as usize))))
+                    }
+                    Value::Int(_) => Err(EvalSignal::error(
+                        "`String.repeat` expects a non-negative count".to_string(),
+                        span,
+                    )),
+                    _ => Err(EvalSignal::error(
+                        "`String.repeat` expects an Int count".to_string(),
+                        span,
+                    )),
+                }
+            }
             (Value::String(_), "tainted") => {
                 ensure_arity(method, 0, args.len(), span)?;
                 Ok(Value::Tainted(Rc::new(recv.clone())))
@@ -1609,6 +1645,30 @@ impl Interpreter {
             (Value::Memory(log), "len") => {
                 ensure_arity(method, 0, args.len(), span)?;
                 Ok(Value::Int(log.borrow().len() as i64))
+            }
+            // Durations — read a `Duration` (stored as i64 nanoseconds) out as
+            // an integer count of a coarser unit, so an agent can answer "how
+            // long did that take?" without dropping to Rust. Divisors match
+            // `axon-std`'s `dur_*` free functions. P9.
+            (Value::Duration(ns), "as_ns") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(*ns))
+            }
+            (Value::Duration(ns), "as_micros") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(*ns / 1_000))
+            }
+            (Value::Duration(ns), "as_ms") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(*ns / 1_000_000))
+            }
+            (Value::Duration(ns), "as_secs") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(*ns / 1_000_000_000))
+            }
+            (Value::Duration(ns), "as_secs_f64") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(*ns as f64 / 1_000_000_000.0))
             }
             // Models — calling `.complete` directly is the low-level path,
             // bypassing the prompt-slot machinery. Users typically write

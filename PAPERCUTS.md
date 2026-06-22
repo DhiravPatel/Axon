@@ -8,6 +8,30 @@ The list is roughly ordered by frequency. The highest-frequency items are also t
 
 ---
 
+## Resolution status
+
+The UX cleanup the list called for landed across **Stage 37** (P2) and **Stage 39** (the rest). Current state:
+
+| Item | Status | Where |
+| --- | --- | --- |
+| P1 — `let mut` | ✅ Fixed | Stage 39 — single `P0001` error + Safe `axon fix` → `var` |
+| P2 — contextual keywords | ✅ Fixed | Stage 37 §37.A |
+| P3 — multi-line strings / continuation | ✅ Fixed | `"""…"""` (pre-39) + Stage 39 trailing-operator continuation |
+| P4 — `for x in List<T>` | ✅ Fixed | already worked for List/Set/Map; Stage 39 adds String iteration |
+| P5 — keyed mock | ✅ Fixed | Stage 39 — `mock_model("keyed", [[k, v], …])` |
+| P6 — `axon replay <dir>` | ✅ Fixed | Stage 39 — routes a directory through `LoadedProject` |
+| P7 — inline record types | ✅ Fixed | Stage 39 — `List<{ a: T, b: U }>` parses |
+| P8 — `Dyn` / `Any` casing | ✅ Fixed | Stage 39 — all three spellings resolve |
+| P9 — `Duration.as_ms()` etc. | ✅ Fixed | Stage 39 — `as_ns/as_micros/as_ms/as_secs/as_secs_f64` |
+| P10 — `String.split/trim/replace` | ✅ Fixed | `split`/`trim` (pre-39) + Stage 39 `.replace`/`.repeat`/`.trim_start`/`.trim_end` |
+| P13 — double E0203 | ✅ Fixed | Stage 39 — span-deduped to one report |
+| P11 — in-process human gate | ⏳ Deferred | needs the async substrate (Stage 39+) |
+| P12 — `audit_*` host bindings | ⏳ Deferred | low severity; prototype workaround via `local_memory` |
+
+The remaining notes below are kept as the original first-build record.
+
+---
+
 ## P1 — `let mut` doesn't work; you have to remember `var`
 
 ```axon

@@ -488,6 +488,13 @@ fn render_type(t: &axon_ast::Type) -> String {
         List(inner) => format!("[{}]", render_type(inner)),
         Map { key, value } => format!("{{{}: {}}}", render_type(key), render_type(value)),
         Set(inner) => format!("{{{}}}", render_type(inner)),
+        Record(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name.name, render_type(&f.ty)))
+                .collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
         Tuple(xs) => {
             let parts: Vec<String> = xs.iter().map(render_type).collect();
             format!("({})", parts.join(", "))

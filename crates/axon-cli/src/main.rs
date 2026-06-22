@@ -3287,7 +3287,7 @@ fn cmd_replay(args: &[String]) -> ExitCode {
     let (rec, src) = match (recording_path, source_path) {
         (Some(r), Some(s)) => (r, s),
         _ => {
-            eprintln!("usage: axon replay <recording.json> <source.ax> [--patch]");
+            eprintln!("usage: axon replay <recording.json> <source.ax | project-dir> [--patch]");
             return ExitCode::from(2);
         }
     };
@@ -3313,21 +3313,46 @@ fn cmd_replay(args: &[String]) -> ExitCode {
         }
     };
 
-    let text = match std::fs::read_to_string(src) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("axon replay: cannot read source `{src}`: {e}");
+    // `src` may be a single `.ax` file or a project directory. The `run`
+    // command already accepts both; `axon replay` now matches it so a
+    // recording made from `axon run <dir> --record` can be replayed against
+    // the same `<dir>`. P6.
+    let (program, source) = if std::path::Path::new(src).is_dir() {
+        let project = match axon_project::LoadedProject::load(std::path::Path::new(src)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("axon replay: cannot load project `{src}`: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if !project.diagnostics.is_empty() {
+            emit_project_diagnostics_via_registry(&project.diagnostics, &project.sources);
             return ExitCode::from(1);
         }
-    };
-    let source = SourceFile::new(src, &text);
-    let (program, diags) = axon_parser::parse(&source);
-    if !diags.is_empty() {
-        for d in &diags {
-            eprintln!("{}", axon_diag::render(d, &source, true));
+        let source = project
+            .modules
+            .first()
+            .map(|m| m.source.clone())
+            .unwrap_or_else(|| SourceFile::new("<empty>", String::new()));
+        (project.merged.clone(), source)
+    } else {
+        let text = match std::fs::read_to_string(src) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("axon replay: cannot read source `{src}`: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let source = SourceFile::new(src, &text);
+        let (program, diags) = axon_parser::parse(&source);
+        if !diags.is_empty() {
+            for d in &diags {
+                eprintln!("{}", axon_diag::render(d, &source, true));
+            }
+            return ExitCode::from(1);
         }
-        return ExitCode::from(1);
-    }
+        (program, source)
+    };
 
     let interp = axon_runtime::Interpreter::new();
     host::install(&interp);

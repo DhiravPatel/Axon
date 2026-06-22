@@ -48,6 +48,11 @@ pub(crate) struct Checker<'a> {
     pub(crate) source: &'a SourceFile,
     pub(crate) ctx: Ctx,
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// Type-annotation spans that have already produced an "unknown type"
+    /// error. `lower_type` runs in both the register pass and the body pass,
+    /// so the same `fn f(x: Bogus)` param would otherwise report E0203 twice.
+    /// We dedup by span (not name) so two distinct typos still both report. P13.
+    pub(crate) errored_type_spans: std::collections::HashSet<axon_diag::Span>,
     /// Fresh-id counter for unification variables (reserved for the future
     /// HM inference path).
     #[allow(dead_code)]
@@ -60,6 +65,7 @@ impl<'a> Checker<'a> {
             source,
             ctx: Ctx::new(),
             diagnostics: Vec::new(),
+            errored_type_spans: std::collections::HashSet::new(),
             next_var: 0,
         }
     }

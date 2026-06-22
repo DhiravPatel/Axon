@@ -7,6 +7,11 @@
 //!   * `Echo` — return the concatenation of the request's user-message text.
 //!   * `Fixed(text)` — always return the same text.
 //!   * `Script(items)` — round-robin through a list of canned text strings.
+//!   * `Keyed(pairs)` — content-addressed: return the response whose key is a
+//!     substring of the request's user text. Unlike `Script`, this is robust
+//!     to call order, so reordering fixtures or skipping requests (e.g. a
+//!     policy that only drafts replies for some tickets) never desyncs the
+//!     responses from the inputs.
 //!   * `Turns(turns)` — most-faithful: each successive call returns the
 //!     next [`MockTurn`], which can be either text or a sequence of tool
 //!     calls. Lets tests drive a full multi-turn tool-use loop
@@ -33,6 +38,11 @@ pub enum MockBehavior {
     Echo,
     Fixed(String),
     Script(Vec<String>),
+    /// `(key, response)` pairs. `complete` returns the response for the first
+    /// key found as a substring of the request's user text — order-independent,
+    /// so callers key by content (a ticket id, a customer name) instead of by
+    /// call index. Falls back to empty text when no key matches.
+    Keyed(Vec<(String, String)>),
     /// Sequence of full turns — each call to `complete` returns the next
     /// one in order, looping back to the start when exhausted.
     Turns(Vec<MockTurn>),
@@ -96,6 +106,26 @@ impl ModelProvider for MockProvider {
             MockBehavior::Script(items) => {
                 let i = self.counter.fetch_add(1, Ordering::SeqCst);
                 let s = items.get(i % items.len()).cloned().unwrap_or_default();
+                (
+                    s.clone(),
+                    Vec::new(),
+                    vec![ContentBlock::Text(s)],
+                    StopReason::EndTurn,
+                )
+            }
+            MockBehavior::Keyed(pairs) => {
+                let user = req
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m.role, Role::User))
+                    .map(|m| m.text())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let s = pairs
+                    .iter()
+                    .find(|(key, _)| user.contains(key.as_str()))
+                    .map(|(_, resp)| resp.clone())
+                    .unwrap_or_default();
                 (
                     s.clone(),
                     Vec::new(),
