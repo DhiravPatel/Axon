@@ -20,7 +20,7 @@
 //!   passes can still walk it.
 
 use axon_ast::*;
-use axon_diag::{Diagnostic, SourceFile, Span};
+use axon_diag::{Diagnostic, Fix, FixEdit, SourceFile, Span};
 use axon_lexer::{
     self as lex, AddrLitKind, Keyword as Kw, StringKind as LexStringKind, StringPart as LexStringPart,
     Token, TokenKind, Tz,
@@ -1065,15 +1065,48 @@ impl<'a> Parser<'a> {
                 let kind = if matches!(self.peek(), TokenKind::Colon) {
                     self.bump();
                     let value = self.parse_type();
-                    TypeKind::Map {
-                        key: Box::new(first),
-                        value: Box::new(value),
+                    // `{ k: v }` is a Map; `{ name: T, ... }` (a comma after the
+                    // first pair) is an inline record type — maps only ever hold
+                    // a single key/value pair. P7.
+                    if matches!(self.peek(), TokenKind::Comma) {
+                        let mut fields = Vec::new();
+                        if let Some(field) = self.type_pair_to_field(&first, value) {
+                            fields.push(field);
+                        }
+                        while matches!(self.peek(), TokenKind::Comma) {
+                            self.bump();
+                            if matches!(self.peek(), TokenKind::RBrace) {
+                                break; // trailing comma
+                            }
+                            let fstart = self.peek_span();
+                            let name = self.parse_ident();
+                            self.expect(&TokenKind::Colon, "`:` after record field name");
+                            let fty = self.parse_type();
+                            fields.push(Field {
+                                doc: None,
+                                name,
+                                ty: fty,
+                                refinements: Vec::new(),
+                                default: None,
+                                span: Span::in_file(
+                                    fstart.start as usize,
+                                    self.prev_end(),
+                                    self.file_id,
+                                ),
+                            });
+                        }
+                        TypeKind::Record(fields)
+                    } else {
+                        TypeKind::Map {
+                            key: Box::new(first),
+                            value: Box::new(value),
+                        }
                     }
                 } else {
                     TypeKind::Set(Box::new(first))
                 };
                 self.paren_depth = self.paren_depth.saturating_sub(1);
-                self.expect(&TokenKind::RBrace, "`}` to close map/set type");
+                self.expect(&TokenKind::RBrace, "`}` to close map/set/record type");
                 Type {
                     span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
                     kind,
@@ -1163,6 +1196,35 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+    }
+
+    /// Convert the first `name: T` pair of an inline record type into a
+    /// `Field`. The key was parsed as a `Type`, so for a record it must be a
+    /// bare single-segment identifier path. P7.
+    fn type_pair_to_field(&mut self, key: &Type, value: Type) -> Option<Field> {
+        if let TypeKind::Path { path, generics } = &key.kind {
+            if generics.is_empty() && path.segments.len() == 1 {
+                let name = path.segments[0].clone();
+                let span = Span::in_file(
+                    key.span.start as usize,
+                    value.span.end as usize,
+                    self.file_id,
+                );
+                return Some(Field {
+                    doc: None,
+                    name,
+                    ty: value,
+                    refinements: Vec::new(),
+                    default: None,
+                    span,
+                });
+            }
+        }
+        self.error(
+            "inline record field name must be a bare identifier",
+            key.span,
+        );
+        None
     }
 
     // ---- Type / schema declarations ------------------------------------
@@ -2118,6 +2180,51 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             TokenKind::Keyword(Kw::Let) => {
                 self.bump();
+                // `let mut x = ...` is a Rust/Swift habit Axon doesn't share —
+                // mutable bindings use `var`. Rather than dying on the `mut`
+                // pattern with a confusing cascade, recover by treating it as a
+                // `var` binding and attach a Safe `axon fix` that rewrites
+                // `let mut` → `var`. P1.
+                if matches!(self.peek(), TokenKind::Keyword(Kw::Mut)) {
+                    let mut_tok = self.bump();
+                    let name = self.parse_ident();
+                    let ty = if matches!(self.peek(), TokenKind::Colon) {
+                        self.bump();
+                        Some(self.parse_type())
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::Eq, "`=` after var binding");
+                    let value = self.parse_expr();
+                    // One edit: replace `let mut ` (up to the name) with `var `.
+                    let fix = Fix::new("replace `let mut` with `var`")
+                        .with_edit(FixEdit {
+                            span: Span::in_file(
+                                start.start as usize,
+                                name.span.start as usize,
+                                self.file_id,
+                            ),
+                            replacement: "var ".to_string(),
+                        })
+                        .safe();
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "`let mut` is not valid Axon — use `var` for a mutable binding",
+                            mut_tok.span,
+                        )
+                        .with_code("P0001")
+                        .with_primary_label("drop `mut`; `var` is already mutable")
+                        .with_note("Axon has two binding forms: `let` (immutable) and `var` (mutable). Run `axon fix` to apply.")
+                        .with_fix(fix),
+                    );
+                    self.last_error_pos = Some(self.pos);
+                    return Stmt::Var {
+                        name,
+                        ty,
+                        value,
+                        span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+                    };
+                }
                 let pattern = self.parse_pattern();
                 let ty = if matches!(self.peek(), TokenKind::Colon) {
                     self.bump();
@@ -2396,6 +2503,12 @@ impl<'a> Parser<'a> {
             }
             let is_pipeline = matches!(self.peek(), TokenKind::Pipeline);
             self.bump();
+            // A binary operator at end-of-line continues onto the next line
+            // (the §9.2 rule the parser doc promises): `let s = "a " +\n "b "`
+            // joins instead of erroring on the newline. Only fires once an
+            // operator has actually been consumed, so a bare newline after a
+            // complete statement still terminates it. P3(a).
+            self.eat_newlines();
             let rhs = self.parse_expr_bp(r_bp);
             let span = Span::in_file(start.start as usize, self.prev_end(), self.file_id);
             lhs = if is_pipeline {

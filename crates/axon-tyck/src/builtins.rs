@@ -24,7 +24,10 @@ pub fn builtin_type(name: &str) -> Option<Ty> {
         "Bytes" => Ty::Bytes,
         "Unit" => Ty::Unit,
         "Never" => Ty::Never,
-        "dyn" => Ty::Dyn,
+        // The gradual escape hatch accepts every natural spelling: lowercase
+        // `dyn` (Rust trait-object habit), capitalized `Dyn` (consistent with
+        // every other type name), and the friendly alias `Any`. P8.
+        "dyn" | "Dyn" | "Any" => Ty::Dyn,
         "Model" => Ty::Model,
         "Memory" => Ty::Memory,
         "ContentHash" => Ty::ContentHash,
@@ -32,6 +35,16 @@ pub fn builtin_type(name: &str) -> Option<Ty> {
         _ => return None,
     })
 }
+
+/// Surface names of the built-in types, used to seed the "did you mean …?"
+/// suggestion pool for an unresolved type so a near-miss of a primitive (e.g.
+/// `Strng`) suggests `String` rather than an unrelated user item. P8.
+pub const BUILTIN_TYPE_NAMES: &[&str] = &[
+    "Int", "Float", "Decimal", "Money", "Duration", "Date", "DateTime", "Time",
+    "Bool", "Char", "String", "Bytes", "Unit", "Never", "Dyn", "Any", "Model",
+    "Memory", "ContentHash", "AgentAddr", "Option", "List", "Map", "Set",
+    "Tool", "Stream", "Chan", "Secret", "Tainted", "Result",
+];
 
 /// True if `name` is the name of a *parametric* built-in container — the
 /// type-lowering pass routes these through dedicated arms in `lower.rs`.

@@ -349,9 +349,11 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
     use Ty::*;
     let names: &[&str] = match recv_ty {
         String => &[
-            "tainted", "len", "to_upper", "to_lower", "trim",
-            "contains", "starts_with", "ends_with", "split",
+            "tainted", "len", "to_upper", "to_lower", "trim", "trim_start",
+            "trim_end", "contains", "starts_with", "ends_with", "split",
+            "replace", "repeat",
         ],
+        Duration => &["as_ns", "as_micros", "as_ms", "as_secs", "as_secs_f64"],
         List(_) => &["len", "push", "pop", "first", "last", "reverse", "map", "filter"],
         Map(_, _) => &["set", "get", "contains"],
         Set(_) => &["add", "contains"],
@@ -730,8 +732,11 @@ impl<'a> Checker<'a> {
             ExprKind::For { pat, iter, body, .. } => {
                 let iter_ty = self.infer(iter, scope, params, used);
                 let elem_ty = match iter_ty {
-                    Ty::List(t) | Ty::Set(t) | Ty::Stream(t) => *t,
+                    Ty::List(t) | Ty::Set(t) | Ty::Stream(t) | Ty::Chan(t) => *t,
                     Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+                    // A `String` iterates by `Char`, matching the runtime
+                    // (`eval_for` yields `Value::Char` for each scalar). P4.
+                    Ty::String => Ty::Char,
                     // `Dyn` is the gradual escape hatch: any value at
                     // runtime might be iterable (List / Chan / Stream).
                     // Stage 12 relaxed field access on Dyn for the same
@@ -1161,15 +1166,32 @@ impl<'a> Checker<'a> {
         let (ret, effects, expected_args): (Ty, EffectRow, Vec<Ty>) = match (&recv_ty, method.name.as_str()) {
             (Ty::String, "tainted") => (Ty::Tainted(Box::new(Ty::String)), EffectRow::pure(), vec![]),
             (Ty::String, "len") => (Ty::Int, EffectRow::pure(), vec![]),
-            (Ty::String, "to_upper") | (Ty::String, "to_lower") | (Ty::String, "trim") => {
-                (Ty::String, EffectRow::pure(), vec![])
-            }
+            (Ty::String, "to_upper")
+            | (Ty::String, "to_lower")
+            | (Ty::String, "trim")
+            | (Ty::String, "trim_start")
+            | (Ty::String, "trim_end") => (Ty::String, EffectRow::pure(), vec![]),
             (Ty::String, "contains")
             | (Ty::String, "starts_with")
             | (Ty::String, "ends_with") => (Ty::Bool, EffectRow::pure(), vec![Ty::String]),
             (Ty::String, "split") => {
                 (Ty::List(Box::new(Ty::String)), EffectRow::pure(), vec![Ty::String])
             }
+            // P10 — `.replace(from, to)` and `.repeat(n)` round out the String
+            // method surface so common text munging doesn't fall back to the
+            // verbose `str_*` free functions.
+            (Ty::String, "replace") => {
+                (Ty::String, EffectRow::pure(), vec![Ty::String, Ty::String])
+            }
+            (Ty::String, "repeat") => (Ty::String, EffectRow::pure(), vec![Ty::Int]),
+            // P9 — read a Duration out as an integer count of a coarser unit
+            // (`as_secs_f64` as a Float). Fires when the receiver is statically
+            // `Duration`; `time_now()` returns `Dyn` so the Dyn path also works.
+            (Ty::Duration, "as_ns")
+            | (Ty::Duration, "as_micros")
+            | (Ty::Duration, "as_ms")
+            | (Ty::Duration, "as_secs") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Duration, "as_secs_f64") => (Ty::Float, EffectRow::pure(), vec![]),
             (Ty::List(_), "len") => (Ty::Int, EffectRow::pure(), vec![]),
             (Ty::List(t), "push") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
             (Ty::List(t), "pop") => (Ty::Nullable(t.clone()), EffectRow::pure(), vec![]),
