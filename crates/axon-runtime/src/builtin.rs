@@ -748,10 +748,47 @@ fn builtin_mock_model(args: &[Value]) -> Result<Value, String> {
                 }
                 axon_models::MockBehavior::Script(out)
             }
+            (Value::String(s), Some(Value::List(items))) if s.as_str() == "keyed" => {
+                // Each element is a 2-element [key, response] list of Strings.
+                let mut out: Vec<(String, String)> = Vec::with_capacity(items.borrow().len());
+                for v in items.borrow().iter() {
+                    let pair = match v {
+                        Value::List(inner) => inner.borrow().clone(),
+                        Value::Tuple(inner) => (**inner).clone(),
+                        _ => {
+                            return Err(format!(
+                                "`mock_model(\"keyed\", [...])` expects a list of [key, response] \
+                                 String pairs, got {}",
+                                v.type_name()
+                            ));
+                        }
+                    };
+                    match (pair.first(), pair.get(1)) {
+                        (Some(Value::String(k)), Some(Value::String(r))) if pair.len() == 2 => {
+                            if k.is_empty() {
+                                return Err(
+                                    "`mock_model(\"keyed\", [...])` keys must be non-empty"
+                                        .to_string(),
+                                );
+                            }
+                            out.push((k.as_str().to_owned(), r.as_str().to_owned()));
+                        }
+                        _ => {
+                            return Err(
+                                "`mock_model(\"keyed\", [...])` expects each element to be a \
+                                 2-element [key, response] list of Strings"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                axon_models::MockBehavior::Keyed(out)
+            }
             (Value::String(_), _) => {
                 return Err(
                     "mock_model(<kind>): kind must be \"echo\" (no extra arg), \
-                     \"fixed\" (+ a String), or \"script\" (+ a List<String>)"
+                     \"fixed\" (+ a String), \"script\" (+ a List<String>), or \
+                     \"keyed\" (+ a List<[String, String]>)"
                         .to_string(),
                 );
             }

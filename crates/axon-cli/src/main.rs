@@ -3265,9 +3265,36 @@ fn cmd_replay(args: &[String]) -> ExitCode {
     let mut recording_path: Option<&str> = None;
     let mut source_path: Option<&str> = None;
     let mut patch = false;
-    for arg in args {
-        match arg.as_str() {
-            "--patch" => patch = true,
+    // Feature flags must match what `axon run --record` used, or a project
+    // built with different `[features]` produces a different event stream and
+    // replay desyncs. P6 follow-up (Stage 39 verification).
+    let mut features: Vec<String> = Vec::new();
+    let mut enable_default_features = true;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        match arg {
+            "--patch" => {
+                patch = true;
+                idx += 1;
+            }
+            "--no-default-features" => {
+                enable_default_features = false;
+                idx += 1;
+            }
+            "--features" => {
+                idx += 1;
+                if idx >= args.len() {
+                    eprintln!("axon replay: --features requires a comma-separated list");
+                    return ExitCode::from(2);
+                }
+                features.extend(parse_caps_to_vec(&args[idx]));
+                idx += 1;
+            }
+            other if other.starts_with("--features=") => {
+                features.extend(parse_caps_to_vec(&other["--features=".len()..]));
+                idx += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("axon replay: unknown flag `{other}`");
                 return ExitCode::from(2);
@@ -3281,13 +3308,17 @@ fn cmd_replay(args: &[String]) -> ExitCode {
                     eprintln!("axon replay: unexpected extra argument `{other}`");
                     return ExitCode::from(2);
                 }
+                idx += 1;
             }
         }
     }
     let (rec, src) = match (recording_path, source_path) {
         (Some(r), Some(s)) => (r, s),
         _ => {
-            eprintln!("usage: axon replay <recording.json> <source.ax> [--patch]");
+            eprintln!(
+                "usage: axon replay <recording.json> <source.ax | project-dir> [--patch] \
+                 [--features X,Y] [--no-default-features]"
+            );
             return ExitCode::from(2);
         }
     };
@@ -3313,21 +3344,50 @@ fn cmd_replay(args: &[String]) -> ExitCode {
         }
     };
 
-    let text = match std::fs::read_to_string(src) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("axon replay: cannot read source `{src}`: {e}");
+    // `src` may be a single `.ax` file or a project directory. The `run`
+    // command already accepts both; `axon replay` now matches it so a
+    // recording made from `axon run <dir> --record` can be replayed against
+    // the same `<dir>`. P6.
+    let (program, source) = if std::path::Path::new(src).is_dir() {
+        let project = match axon_project::LoadedProject::load_with_features(
+            std::path::Path::new(src),
+            &features,
+            enable_default_features,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("axon replay: cannot load project `{src}`: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if !project.diagnostics.is_empty() {
+            emit_project_diagnostics_via_registry(&project.diagnostics, &project.sources);
             return ExitCode::from(1);
         }
-    };
-    let source = SourceFile::new(src, &text);
-    let (program, diags) = axon_parser::parse(&source);
-    if !diags.is_empty() {
-        for d in &diags {
-            eprintln!("{}", axon_diag::render(d, &source, true));
+        let source = project
+            .modules
+            .first()
+            .map(|m| m.source.clone())
+            .unwrap_or_else(|| SourceFile::new("<empty>", String::new()));
+        (project.merged.clone(), source)
+    } else {
+        let text = match std::fs::read_to_string(src) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("axon replay: cannot read source `{src}`: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let source = SourceFile::new(src, &text);
+        let (program, diags) = axon_parser::parse(&source);
+        if !diags.is_empty() {
+            for d in &diags {
+                eprintln!("{}", axon_diag::render(d, &source, true));
+            }
+            return ExitCode::from(1);
         }
-        return ExitCode::from(1);
-    }
+        (program, source)
+    };
 
     let interp = axon_runtime::Interpreter::new();
     host::install(&interp);

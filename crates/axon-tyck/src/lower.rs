@@ -44,6 +44,16 @@ impl<'a> Checker<'a> {
             TypeKind::Tuple(xs) => {
                 Ty::Tuple(xs.iter().map(|t| self.lower_type(t, params)).collect())
             }
+            // Inline record types lower to `Dyn` — the same way record *value*
+            // literals (`{ a: 1, b: 2 }`) already infer — so an annotation and
+            // its literal unify with no new structural `Ty` variant. We still
+            // lower each field type so errors inside them surface. P7.
+            TypeKind::Record(fields) => {
+                for f in fields {
+                    let _ = self.lower_type(&f.ty, params);
+                }
+                Ty::Dyn
+            }
             TypeKind::Ref { is_mut, inner } => Ty::Ref {
                 mutable: *is_mut,
                 inner: Box::new(self.lower_type(inner, params)),
@@ -197,10 +207,19 @@ impl<'a> Checker<'a> {
                     };
                 }
             }
-            let candidates = self.ctx.item_names();
-            self.report(errors::type_not_found_with_candidates(
-                span, name, &candidates,
-            ));
+            // Only report once per annotation span: `lower_type` runs in both
+            // the register pass and the body pass. P13.
+            if self.errored_type_spans.insert(span) {
+                let mut candidates = self.ctx.item_names();
+                candidates.extend(
+                    crate::builtins::BUILTIN_TYPE_NAMES
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+                self.report(errors::type_not_found_with_candidates(
+                    span, name, &candidates,
+                ));
+            }
             return Ty::Error;
         }
         // Dotted paths (e.g. `std.io.Reader`) are not yet routed through a

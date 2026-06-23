@@ -65,12 +65,39 @@
       "Bash(awk -F\"[ ;]+\" '{p+=$4; f+=$6} END{print \"TOTAL passed=\" p \" failed=\" f}')",
       "Read(//Users/dhiravpatel/Documents/Project\\\\ 2/Axon/crates/axon-runtime/src/**)",
       "Bash(tee /tmp/axon_stage36_post2.log)",
-      "Bash(tee /tmp/axon_stage36_final.log)"
+      "Bash(tee /tmp/axon_stage36_final.log)",
+      "Bash(git --no-pager diff 3f0292f..91bc0b6 -- crates/axon-parser/src/parser.rs crates/axon-ast/src/lib.rs)",
+      "Bash(git --no-pager diff 3f0292f..91bc0b6 -- crates/axon-tyck/src/lower.rs crates/axon-tyck/src/lib.rs crates/axon-tyck/src/builtins.rs crates/axon-tyck/src/gbnf.rs crates/axon-doc/src/lib.rs)",
+      "Bash(git --no-pager show 3f0292f:crates/axon-cli/src/main.rs)",
+      "Bash(cd \"/Users/dhiravpatel/Documents/Project 2/Axon\" && rm -f crates/axon-lexer/tests/p3b_probe.rs crates/axon-parser/tests/p3b_probe.rs /tmp/p3b_parse_probe.rs && git status --short)",
+      "Bash(git --no-pager diff 3f0292f..91bc0b6 -- crates/axon-tyck/src/infer.rs)",
+      "Bash(git --no-pager log --oneline -5)",
+      "Bash(cp /tmp/parser_backup.rs crates/axon-parser/src/parser.rs)",
+      "Bash(git --no-pager diff --stat -- crates/axon-parser/src/parser.rs)",
+      "Bash(git --no-pager diff -- crates/axon-parser/src/parser.rs)",
+      "Bash(git --no-pager diff -- crates/axon-tyck/src/infer.rs)",
+      "Bash(git --no-pager diff -- crates/axon-lexer/src/lexer.rs)",
+      "Bash(git --no-pager log --oneline -15)",
+      "Bash(git --no-pager log --oneline -10)",
+      "Bash(git --no-pager show 91bc0b6 -- crates/axon-parser/src/parser.rs)",
+      "Bash(git --no-pager diff 3f0292f..91bc0b6 -- crates/axon-parser/src/parser.rs)",
+      "Bash(var)",
+      "Bash(grep -n \"let mut\\\\` is not valid\\\\|let mut_tok\\\\|with `var`\\\\|fn parse_stmt\\\\|fn parse_ident\\\\|fn parse_var\\\\|TokenKind::Var\" crates/axon-parser/src/parser.rs)",
+      "Bash(echo \"=== EXIT: $? ===\")",
+      "Bash(git --no-pager diff -- crates/axon-cli/src/main.rs)",
+      "Bash(git --no-pager diff -- crates/axon-models/src/mock.rs)",
+      "Bash(git --no-pager diff HEAD~1 -- crates/axon-cli/src/main.rs)",
+      "Bash(cp crates/axon-parser/src/parser.rs /tmp/parser_backup.rs)",
+      "Bash(perl -0pi -e 's/\\(\\\\n\\\\s*\\)\\(self\\\\.eat_newlines\\\\\\(\\\\\\);\\\\n\\\\s*let rhs = self\\\\.parse_expr_bp\\\\\\(r_bp\\\\\\);\\)/\\\\1\\\\/\\\\/ DISABLED FOR TEST: self.eat_newlines\\(\\);\\\\1let rhs = self.parse_expr_bp\\(r_bp\\);/' crates/axon-parser/src/parser.rs)",
+      "Bash(git --no-pager diff --cached --stat)",
+      "Bash(git --no-pager diff HEAD --stat)",
+      "Bash(perl -0pi -e 's/fields = vec!\\\\[self\\\\.parse_record_field\\\\\\(\\\\\\)\\\\]/fields = vec![self.parse_inline_record_field\\(\\)]/g; s/fields\\\\.push\\\\\\(self\\\\.parse_record_field\\\\\\(\\\\\\)\\\\\\)/fields.push\\(self.parse_inline_record_field\\(\\)\\)/g' crates/axon-parser/src/parser.rs)"
     ],
     "additionalDirectories": [
       "/Users/dhiravpatel/Documents/Project 2/Axon/web/app/docs/spec",
       "/tmp/axon_repro",
-      "/private/tmp/axon_repro"
+      "/private/tmp/axon_repro",
+      "/private/tmp"
     ]
   }
 }

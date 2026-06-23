@@ -349,10 +349,18 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
     use Ty::*;
     let names: &[&str] = match recv_ty {
         String => &[
-            "tainted", "len", "to_upper", "to_lower", "trim",
-            "contains", "starts_with", "ends_with", "split",
+            "tainted", "len", "to_upper", "to_lower", "trim", "trim_start",
+            "trim_end", "contains", "starts_with", "ends_with", "split",
+            "split_once", "split_lines", "index_of", "substring", "chars",
+            "replace", "repeat",
         ],
-        List(_) => &["len", "push", "pop", "first", "last", "reverse", "map", "filter"],
+        Duration => &["as_ns", "as_micros", "as_ms", "as_secs", "as_secs_f64"],
+        Int => &["abs", "to_string", "to_float", "min", "max", "pow"],
+        Float => &["abs", "round", "floor", "ceil", "sqrt", "to_int", "to_string"],
+        List(_) => &[
+            "len", "push", "pop", "first", "last", "reverse", "map", "filter",
+            "is_empty", "contains", "index_of", "sum", "join", "sort", "fold",
+        ],
         Map(_, _) => &["set", "get", "contains"],
         Set(_) => &["add", "contains"],
         Chan(_) => &[
@@ -730,8 +738,11 @@ impl<'a> Checker<'a> {
             ExprKind::For { pat, iter, body, .. } => {
                 let iter_ty = self.infer(iter, scope, params, used);
                 let elem_ty = match iter_ty {
-                    Ty::List(t) | Ty::Set(t) | Ty::Stream(t) => *t,
+                    Ty::List(t) | Ty::Set(t) | Ty::Stream(t) | Ty::Chan(t) => *t,
                     Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+                    // A `String` iterates by `Char`, matching the runtime
+                    // (`eval_for` yields `Value::Char` for each scalar). P4.
+                    Ty::String => Ty::Char,
                     // `Dyn` is the gradual escape hatch: any value at
                     // runtime might be iterable (List / Chan / Stream).
                     // Stage 12 relaxed field access on Dyn for the same
@@ -1161,15 +1172,60 @@ impl<'a> Checker<'a> {
         let (ret, effects, expected_args): (Ty, EffectRow, Vec<Ty>) = match (&recv_ty, method.name.as_str()) {
             (Ty::String, "tainted") => (Ty::Tainted(Box::new(Ty::String)), EffectRow::pure(), vec![]),
             (Ty::String, "len") => (Ty::Int, EffectRow::pure(), vec![]),
-            (Ty::String, "to_upper") | (Ty::String, "to_lower") | (Ty::String, "trim") => {
-                (Ty::String, EffectRow::pure(), vec![])
-            }
+            (Ty::String, "to_upper")
+            | (Ty::String, "to_lower")
+            | (Ty::String, "trim")
+            | (Ty::String, "trim_start")
+            | (Ty::String, "trim_end") => (Ty::String, EffectRow::pure(), vec![]),
             (Ty::String, "contains")
             | (Ty::String, "starts_with")
             | (Ty::String, "ends_with") => (Ty::Bool, EffectRow::pure(), vec![Ty::String]),
             (Ty::String, "split") => {
                 (Ty::List(Box::new(Ty::String)), EffectRow::pure(), vec![Ty::String])
             }
+            // P10 — `.replace(from, to)` and `.repeat(n)` round out the String
+            // method surface so common text munging doesn't fall back to the
+            // verbose `str_*` free functions.
+            (Ty::String, "replace") => {
+                (Ty::String, EffectRow::pure(), vec![Ty::String, Ty::String])
+            }
+            (Ty::String, "repeat") => (Ty::String, EffectRow::pure(), vec![Ty::Int]),
+            // Wave 2 — round out the String method surface (parity with the
+            // `str_*` free functions).
+            (Ty::String, "split_lines") => {
+                (Ty::List(Box::new(Ty::String)), EffectRow::pure(), vec![])
+            }
+            (Ty::String, "split_once") => {
+                (Ty::List(Box::new(Ty::String)), EffectRow::pure(), vec![Ty::String])
+            }
+            (Ty::String, "index_of") => (Ty::Int, EffectRow::pure(), vec![Ty::String]),
+            (Ty::String, "substring") => {
+                (Ty::String, EffectRow::pure(), vec![Ty::Int, Ty::Int])
+            }
+            (Ty::String, "chars") => {
+                (Ty::List(Box::new(Ty::Char)), EffectRow::pure(), vec![])
+            }
+            // Wave 2 — numeric method surface for Int and Float.
+            (Ty::Int, "abs") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Int, "to_string") => (Ty::String, EffectRow::pure(), vec![]),
+            (Ty::Int, "to_float") => (Ty::Float, EffectRow::pure(), vec![]),
+            (Ty::Int, "min") | (Ty::Int, "max") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
+            (Ty::Int, "pow") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
+            (Ty::Float, "abs")
+            | (Ty::Float, "round")
+            | (Ty::Float, "floor")
+            | (Ty::Float, "ceil")
+            | (Ty::Float, "sqrt") => (Ty::Float, EffectRow::pure(), vec![]),
+            (Ty::Float, "to_int") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Float, "to_string") => (Ty::String, EffectRow::pure(), vec![]),
+            // P9 — read a Duration out as an integer count of a coarser unit
+            // (`as_secs_f64` as a Float). Fires when the receiver is statically
+            // `Duration`; `time_now()` returns `Dyn` so the Dyn path also works.
+            (Ty::Duration, "as_ns")
+            | (Ty::Duration, "as_micros")
+            | (Ty::Duration, "as_ms")
+            | (Ty::Duration, "as_secs") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Duration, "as_secs_f64") => (Ty::Float, EffectRow::pure(), vec![]),
             (Ty::List(_), "len") => (Ty::Int, EffectRow::pure(), vec![]),
             (Ty::List(t), "push") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
             (Ty::List(t), "pop") => (Ty::Nullable(t.clone()), EffectRow::pure(), vec![]),
@@ -1184,6 +1240,14 @@ impl<'a> Checker<'a> {
                 (Ty::List(Box::new(Ty::Dyn)), EffectRow::pure(), vec![Ty::Dyn])
             }
             (Ty::List(t), "filter") => (Ty::List(t.clone()), EffectRow::pure(), vec![Ty::Dyn]),
+            // Wave 2 — round out the List method surface.
+            (Ty::List(_), "is_empty") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::List(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
+            (Ty::List(_), "index_of") => (Ty::Int, EffectRow::pure(), vec![Ty::Dyn]),
+            (Ty::List(_), "sum") => (Ty::Dyn, EffectRow::pure(), vec![]),
+            (Ty::List(_), "join") => (Ty::String, EffectRow::pure(), vec![Ty::String]),
+            (Ty::List(t), "sort") => (Ty::List(t.clone()), EffectRow::pure(), vec![]),
+            (Ty::List(_), "fold") => (Ty::Dyn, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
             (Ty::Map(_, _), "set") => (Ty::Unit, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
             (Ty::Map(_, _), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),

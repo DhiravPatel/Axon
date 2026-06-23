@@ -20,7 +20,7 @@
 //!   passes can still walk it.
 
 use axon_ast::*;
-use axon_diag::{Diagnostic, SourceFile, Span};
+use axon_diag::{Diagnostic, Fix, FixEdit, SourceFile, Span};
 use axon_lexer::{
     self as lex, AddrLitKind, Keyword as Kw, StringKind as LexStringKind, StringPart as LexStringPart,
     Token, TokenKind, Tz,
@@ -1061,19 +1061,55 @@ impl<'a> Parser<'a> {
             TokenKind::LBrace => {
                 self.bump();
                 self.paren_depth += 1;
-                let first = self.parse_type();
-                let kind = if matches!(self.peek(), TokenKind::Colon) {
-                    self.bump();
-                    let value = self.parse_type();
-                    TypeKind::Map {
-                        key: Box::new(first),
-                        value: Box::new(value),
+                // A soft keyword (`model`/`prompt`/`memory`/`tool`/`agent`) as
+                // the first token inside `{...}` in TYPE position can only be a
+                // record field name — soft keywords aren't types, so this can
+                // be neither a map key nor a set element. `parse_type` would
+                // reject it, so commit to record parsing directly. P7 + §37.A.
+                let kind = if matches!(self.peek(), TokenKind::Keyword(kw) if Self::is_soft_keyword(*kw))
+                {
+                    let mut fields = vec![self.parse_inline_record_field()];
+                    while matches!(self.peek(), TokenKind::Comma) {
+                        self.bump();
+                        if matches!(self.peek(), TokenKind::RBrace) {
+                            break; // trailing comma
+                        }
+                        fields.push(self.parse_inline_record_field());
                     }
+                    TypeKind::Record(fields)
                 } else {
-                    TypeKind::Set(Box::new(first))
+                    let first = self.parse_type();
+                    if matches!(self.peek(), TokenKind::Colon) {
+                        self.bump();
+                        let value = self.parse_type();
+                        // `{ k: v }` is a Map; `{ name: T, ... }` (a comma after
+                        // the first pair) is an inline record — maps only ever
+                        // hold a single key/value pair. P7.
+                        if matches!(self.peek(), TokenKind::Comma) {
+                            let mut fields = Vec::new();
+                            if let Some(field) = self.type_pair_to_field(&first, value) {
+                                fields.push(field);
+                            }
+                            while matches!(self.peek(), TokenKind::Comma) {
+                                self.bump();
+                                if matches!(self.peek(), TokenKind::RBrace) {
+                                    break; // trailing comma
+                                }
+                                fields.push(self.parse_inline_record_field());
+                            }
+                            TypeKind::Record(fields)
+                        } else {
+                            TypeKind::Map {
+                                key: Box::new(first),
+                                value: Box::new(value),
+                            }
+                        }
+                    } else {
+                        TypeKind::Set(Box::new(first))
+                    }
                 };
                 self.paren_depth = self.paren_depth.saturating_sub(1);
-                self.expect(&TokenKind::RBrace, "`}` to close map/set type");
+                self.expect(&TokenKind::RBrace, "`}` to close map/set/record type");
                 Type {
                     span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
                     kind,
@@ -1163,6 +1199,53 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+    }
+
+    /// Parse one `name: Type` field of an inline record type. The field name
+    /// uses `parse_ident`, which accepts contextual keywords (`model`, etc.)
+    /// as names — so `{ model: Model }` works the same as a regular field. P7.
+    fn parse_inline_record_field(&mut self) -> Field {
+        let fstart = self.peek_span();
+        let name = self.parse_ident();
+        self.expect(&TokenKind::Colon, "`:` after record field name");
+        let ty = self.parse_type();
+        Field {
+            doc: None,
+            name,
+            ty,
+            refinements: Vec::new(),
+            default: None,
+            span: Span::in_file(fstart.start as usize, self.prev_end(), self.file_id),
+        }
+    }
+
+    /// Convert the first `name: T` pair of an inline record type into a
+    /// `Field`. The key was parsed as a `Type`, so for a record it must be a
+    /// bare single-segment identifier path. P7.
+    fn type_pair_to_field(&mut self, key: &Type, value: Type) -> Option<Field> {
+        if let TypeKind::Path { path, generics } = &key.kind {
+            if generics.is_empty() && path.segments.len() == 1 {
+                let name = path.segments[0].clone();
+                let span = Span::in_file(
+                    key.span.start as usize,
+                    value.span.end as usize,
+                    self.file_id,
+                );
+                return Some(Field {
+                    doc: None,
+                    name,
+                    ty: value,
+                    refinements: Vec::new(),
+                    default: None,
+                    span,
+                });
+            }
+        }
+        self.error(
+            "inline record field name must be a bare identifier",
+            key.span,
+        );
+        None
     }
 
     // ---- Type / schema declarations ------------------------------------
@@ -2118,6 +2201,61 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             TokenKind::Keyword(Kw::Let) => {
                 self.bump();
+                // `let mut x = ...` is a Rust/Swift habit Axon doesn't share —
+                // mutable bindings use `var`. Rather than dying on the `mut`
+                // pattern with a confusing cascade, recover by treating it as a
+                // `var` binding and attach a Safe `axon fix` that rewrites
+                // `let mut` → `var`. P1.
+                if matches!(self.peek(), TokenKind::Keyword(Kw::Mut)) {
+                    let mut_tok = self.bump();
+                    // Only offer the auto-fix when a real binding name follows.
+                    // `let mut (a, b) = …` (destructuring) has no `var` form, so
+                    // a Safe rewrite would just produce different invalid code.
+                    let name_follows = matches!(
+                        self.peek(),
+                        TokenKind::Ident(_) | TokenKind::Keyword(_)
+                    );
+                    let name = self.parse_ident();
+                    let ty = if matches!(self.peek(), TokenKind::Colon) {
+                        self.bump();
+                        Some(self.parse_type())
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::Eq, "`=` after var binding");
+                    let value = self.parse_expr();
+                    let mut diag = Diagnostic::error(
+                        "`let mut` is not valid Axon — use `var` for a mutable binding",
+                        mut_tok.span,
+                    )
+                    .with_code("P0001")
+                    .with_primary_label("drop `mut`; `var` is already mutable")
+                    .with_note("Axon has two binding forms: `let` (immutable) and `var` (mutable). Run `axon fix` to apply.");
+                    if name_follows {
+                        // Replace exactly the `let mut` keywords with `var`,
+                        // preserving any trivia (and the name) after `mut`.
+                        diag = diag.with_fix(
+                            Fix::new("replace `let mut` with `var`")
+                                .with_edit(FixEdit {
+                                    span: Span::in_file(
+                                        start.start as usize,
+                                        mut_tok.span.end as usize,
+                                        self.file_id,
+                                    ),
+                                    replacement: "var".to_string(),
+                                })
+                                .safe(),
+                        );
+                    }
+                    self.diagnostics.push(diag);
+                    self.last_error_pos = Some(self.pos);
+                    return Stmt::Var {
+                        name,
+                        ty,
+                        value,
+                        span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+                    };
+                }
                 let pattern = self.parse_pattern();
                 let ty = if matches!(self.peek(), TokenKind::Colon) {
                     self.bump();

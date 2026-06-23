@@ -128,6 +128,8 @@ impl Emitter {
                     inner.join(" ws \",\" ws ")
                 )
             }
+            // Inline record type → a JSON object with exactly these fields. P7.
+            TypeKind::Record(fields) => self.emit_object(fields),
             TypeKind::Unit => "\"null\"".to_string(),
             TypeKind::Fn { .. } => "string".to_string(),
             // Union types serialize as one-of alternation.
