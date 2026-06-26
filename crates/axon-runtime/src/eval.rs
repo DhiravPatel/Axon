@@ -730,6 +730,7 @@ impl Interpreter {
                 is_await,
             } => self.eval_for(pat, iter, body, *is_await, env, expr.span),
             ExprKind::While { cond, body } => self.eval_while(cond, body, env),
+            ExprKind::Loop { body } => self.eval_loop(body, env),
             ExprKind::Select(arms) => self.eval_select(arms, env, expr.span),
             ExprKind::Parallel(arms) => self.eval_parallel(arms, env, expr.span),
             ExprKind::Ask { target, slots } => self.eval_ask(target, slots, expr.span, env),
@@ -793,9 +794,16 @@ impl Interpreter {
                 };
                 Err(EvalSignal::Return(v))
             }
-            ExprKind::Break(label) => Err(EvalSignal::Break {
-                label: label.as_ref().map(|i| i.name.clone()),
-            }),
+            ExprKind::Break(label, value) => {
+                let v = match value {
+                    Some(e) => self.eval_expr(e, env)?,
+                    None => Value::Unit,
+                };
+                Err(EvalSignal::Break {
+                    label: label.as_ref().map(|i| i.name.clone()),
+                    value: v,
+                })
+            }
             ExprKind::Continue(label) => Err(EvalSignal::Continue {
                 label: label.as_ref().map(|i| i.name.clone()),
             }),
@@ -1511,6 +1519,79 @@ impl Interpreter {
                     )),
                 }
             }
+            (Value::String(s), "split_lines") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let parts: Vec<Value> = s
+                    .lines()
+                    .map(|p| Value::String(Rc::new(p.to_string())))
+                    .collect();
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(parts))))
+            }
+            (Value::String(s), "split_once") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::String(sep) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        "`String.split_once` expects a String separator".to_string(),
+                        span,
+                    ));
+                };
+                if sep.is_empty() {
+                    return Err(EvalSignal::error(
+                        "`String.split_once` separator must not be empty".to_string(),
+                        span,
+                    ));
+                }
+                let parts: Vec<Value> = match s.split_once(sep.as_str()) {
+                    Some((head, tail)) => vec![
+                        Value::String(Rc::new(head.to_string())),
+                        Value::String(Rc::new(tail.to_string())),
+                    ],
+                    None => vec![Value::String(s.clone())],
+                };
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(parts))))
+            }
+            (Value::String(s), "index_of") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::String(needle) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        "`String.index_of` expects a String".to_string(),
+                        span,
+                    ));
+                };
+                Ok(match s.find(needle.as_str()) {
+                    Some(byte_idx) => Value::Int(s[..byte_idx].chars().count() as i64),
+                    None => Value::Int(-1),
+                })
+            }
+            (Value::String(s), "substring") => {
+                ensure_arity(method, 2, args.len(), span)?;
+                let (start, end) = match (&args[0], &args[1]) {
+                    (Value::Int(a), Value::Int(b)) if *a >= 0 && *b >= 0 => {
+                        (*a as usize, *b as usize)
+                    }
+                    _ => {
+                        return Err(EvalSignal::error(
+                            "`String.substring` expects two non-negative Int indices".to_string(),
+                            span,
+                        ));
+                    }
+                };
+                let total = s.chars().count();
+                let end_c = end.min(total);
+                let start_c = start.min(end_c);
+                let out: String = s
+                    .chars()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= start_c && *i < end_c)
+                    .map(|(_, c)| c)
+                    .collect();
+                Ok(Value::String(Rc::new(out)))
+            }
+            (Value::String(s), "chars") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let chars: Vec<Value> = s.chars().map(Value::Char).collect();
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(chars))))
+            }
             (Value::String(_), "tainted") => {
                 ensure_arity(method, 0, args.len(), span)?;
                 Ok(Value::Tainted(Rc::new(recv.clone())))
@@ -1518,6 +1599,74 @@ impl Interpreter {
             (Value::Tainted(inner), "untaint") => {
                 ensure_arity(method, 0, args.len(), span)?;
                 Ok((**inner).clone())
+            }
+            // Numbers — small ergonomic surface so common arithmetic helpers
+            // read as methods (`n.abs()`, `x.round()`) instead of `math_*`
+            // free functions. Wave 2.
+            (Value::Int(n), "abs") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                // wrapping_abs avoids a panic on i64::MIN (whose true abs is
+                // unrepresentable); it returns i64::MIN, matching Rust.
+                Ok(Value::Int(n.wrapping_abs()))
+            }
+            (Value::Int(n), "to_string") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::String(Rc::new(n.to_string())))
+            }
+            (Value::Int(n), "to_float") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(*n as f64))
+            }
+            (Value::Int(n), "min") | (Value::Int(n), "max") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::Int(m) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        format!("`Int.{method}` expects an Int argument"),
+                        span,
+                    ));
+                };
+                Ok(Value::Int(if method == "min" { *n.min(m) } else { *n.max(m) }))
+            }
+            (Value::Int(n), "pow") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                match &args[0] {
+                    Value::Int(e) if *e >= 0 && *e <= u32::MAX as i64 => n
+                        .checked_pow(*e as u32)
+                        .map(Value::Int)
+                        .ok_or_else(|| EvalSignal::error("`Int.pow` overflowed", span)),
+                    _ => Err(EvalSignal::error(
+                        "`Int.pow` expects a non-negative Int exponent".to_string(),
+                        span,
+                    )),
+                }
+            }
+            (Value::Float(x), "abs") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(x.abs()))
+            }
+            (Value::Float(x), "round") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(x.round()))
+            }
+            (Value::Float(x), "floor") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(x.floor()))
+            }
+            (Value::Float(x), "ceil") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(x.ceil()))
+            }
+            (Value::Float(x), "sqrt") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Float(x.sqrt()))
+            }
+            (Value::Float(x), "to_int") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(*x as i64))
+            }
+            (Value::Float(x), "to_string") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::String(Rc::new(x.to_string())))
             }
             (Value::List(xs), "len") => {
                 ensure_arity(method, 0, args.len(), span)?;
@@ -1568,6 +1717,102 @@ impl Interpreter {
                     }
                 }
                 Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
+            }
+            (Value::List(xs), "is_empty") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(xs.borrow().is_empty()))
+            }
+            (Value::List(xs), "contains") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                Ok(Value::Bool(xs.borrow().iter().any(|v| v == &args[0])))
+            }
+            (Value::List(xs), "index_of") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let pos = xs.borrow().iter().position(|v| v == &args[0]);
+                Ok(Value::Int(pos.map(|i| i as i64).unwrap_or(-1)))
+            }
+            (Value::List(xs), "sum") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let items = xs.borrow();
+                let mut int_acc: i64 = 0;
+                let mut float_acc: f64 = 0.0;
+                let mut is_float = false;
+                for v in items.iter() {
+                    match v {
+                        Value::Int(i) => {
+                            int_acc = int_acc.wrapping_add(*i);
+                            float_acc += *i as f64;
+                        }
+                        Value::Float(f) => {
+                            is_float = true;
+                            float_acc += *f;
+                        }
+                        other => {
+                            return Err(EvalSignal::error(
+                                format!("`List.sum` expects numbers, found `{}`", other.type_name()),
+                                span,
+                            ));
+                        }
+                    }
+                }
+                Ok(if is_float { Value::Float(float_acc) } else { Value::Int(int_acc) })
+            }
+            (Value::List(xs), "join") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::String(sep) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        "`List.join` expects a String separator".to_string(),
+                        span,
+                    ));
+                };
+                let items = xs.borrow();
+                let mut pieces = Vec::with_capacity(items.len());
+                for v in items.iter() {
+                    match v {
+                        Value::String(s) => pieces.push(s.as_str().to_string()),
+                        other => {
+                            return Err(EvalSignal::error(
+                                format!("`List.join` expects List<String>, found `{}`", other.type_name()),
+                                span,
+                            ));
+                        }
+                    }
+                }
+                Ok(Value::String(Rc::new(pieces.join(sep.as_str()))))
+            }
+            (Value::List(xs), "sort") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let mut out = xs.borrow().clone();
+                let mut err: Option<String> = None;
+                out.sort_by(|a, b| match a.cmp(b) {
+                    Some(o) => o,
+                    None => {
+                        if err.is_none() {
+                            err = Some(format!(
+                                "`List.sort`: cannot compare `{}` and `{}`",
+                                a.type_name(),
+                                b.type_name()
+                            ));
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(EvalSignal::error(e, span));
+                }
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
+            }
+            (Value::List(xs), "fold") => {
+                // fold(init, f): acc starts at `init`, then `acc = f(acc, x)`
+                // for each element. The reducer is any callable, like `.map`.
+                ensure_arity(method, 2, args.len(), span)?;
+                let mut acc = args[0].clone();
+                let f = &args[1];
+                let items = xs.borrow().clone();
+                for v in items {
+                    acc = self.call_value(f, &[acc, v], span)?;
+                }
+                Ok(acc)
             }
             (Value::Map(entries), "get") => {
                 ensure_arity(method, 1, args.len(), span)?;
@@ -3426,6 +3671,19 @@ impl Interpreter {
         }
         Ok(Value::Unit)
     }
+
+    /// `loop { ... }` — runs until a `break`. Evaluates to the `break`'s value
+    /// (or `Unit`), so `let x = loop { … break v }` binds `v`.
+    fn eval_loop(&mut self, body: &Block, env: &Env) -> EvalResult<Value> {
+        loop {
+            match self.eval_block(body, env) {
+                Ok(_) => {}
+                Err(EvalSignal::Break { value, .. }) => return Ok(value),
+                Err(EvalSignal::Continue { .. }) => continue,
+                Err(other) => return Err(other),
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -3614,7 +3872,8 @@ impl Interpreter {
                 return Ok(l);
             }
             Assign => return self.eval_assign(lhs, rhs, env, span),
-            AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
+            AddAssign | SubAssign | MulAssign | DivAssign | RemAssign | BitAndAssign
+            | BitOrAssign | BitXorAssign | ShlAssign | ShrAssign => {
                 return self.eval_compound_assign(op, lhs, rhs, env, span);
             }
             _ => {}
@@ -3727,7 +3986,7 @@ impl Interpreter {
                 _ => return Err(bad()),
             },
             And | Or | Coalesce | Assign | AddAssign | SubAssign | MulAssign | DivAssign
-            | RemAssign => {
+            | RemAssign | BitAndAssign | BitOrAssign | BitXorAssign | ShlAssign | ShrAssign => {
                 unreachable!("handled above")
             }
         })
@@ -3869,6 +4128,11 @@ impl Interpreter {
             MulAssign => Mul,
             DivAssign => Div,
             RemAssign => Rem,
+            BitAndAssign => BitAnd,
+            BitOrAssign => BitOr,
+            BitXorAssign => BitXor,
+            ShlAssign => Shl,
+            ShrAssign => Shr,
             _ => unreachable!(),
         };
         // Re-read the current value of lhs and combine.
@@ -3943,6 +4207,26 @@ impl Interpreter {
                 (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a % b)),
                 _ => Err(EvalSignal::error("type error in `%=`", span)),
             },
+            BitAnd => match (l, r) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a & b)),
+                _ => Err(EvalSignal::error("type error in `&=`", span)),
+            },
+            BitOr => match (l, r) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a | b)),
+                _ => Err(EvalSignal::error("type error in `|=`", span)),
+            },
+            BitXor => match (l, r) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+                _ => Err(EvalSignal::error("type error in `^=`", span)),
+            },
+            Shl => match (l, r) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_shl(*b as u32))),
+                _ => Err(EvalSignal::error("type error in `<<=`", span)),
+            },
+            Shr => match (l, r) {
+                (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_shr(*b as u32))),
+                _ => Err(EvalSignal::error("type error in `>>=`", span)),
+            },
             _ => Err(EvalSignal::error(
                 "internal: bad base op in compound assign",
                 span,
@@ -3978,6 +4262,11 @@ fn op_str(op: axon_ast::BinOp) -> &'static str {
         MulAssign => "*=",
         DivAssign => "/=",
         RemAssign => "%=",
+        BitAndAssign => "&=",
+        BitOrAssign => "|=",
+        BitXorAssign => "^=",
+        ShlAssign => "<<=",
+        ShrAssign => ">>=",
         Range => "..",
         RangeInclusive => "..=",
         Coalesce => "??",

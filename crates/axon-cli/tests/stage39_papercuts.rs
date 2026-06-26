@@ -143,38 +143,25 @@ fn p1_axon_fix_rewrites_let_mut_to_var_and_runs() {
 }
 
 // =========================================================================
-// P3a — a trailing binary operator continues onto the next line
+// P3 — multi-line string concatenation works via parentheses; the
+// prompt use-case is served by `"""..."""` (see stage39_methods). A bare
+// trailing-operator continuation was evaluated and deliberately NOT shipped
+// (it silently fused statements — see the Stage 39 verification notes).
 // =========================================================================
 
 #[test]
-fn p3a_trailing_operator_continues_line() {
+fn p3_parenthesized_multiline_concat() {
     build_axon();
-    let dir = temp_dir("p3a");
+    let dir = temp_dir("p3");
     let out = run_src(
         &dir,
         "fn main() uses { Console } {\n\
-         \x20   let s = \"a \" +\n            \"b \" +\n            \"c\"\n\
+         \x20   let s = (\"a \" +\n            \"b \" +\n            \"c\")\n\
          \x20   print(s)\n\
-         \x20   let n = 1 +\n            2 +\n            3\n\
-         \x20   print(\"n = {n}\")\n\
          }\n",
     );
     assert!(out.status.success(), "{:?}", out);
-    let lines = stdout_lines(&out);
-    assert_eq!(lines, ["a b c", "n = 6"], "got: {lines:?}");
-}
-
-#[test]
-fn p3a_separate_statements_are_not_merged() {
-    build_axon();
-    let dir = temp_dir("p3a_reg");
-    // No trailing operator: the two assignments stay independent statements.
-    let out = run_src(
-        &dir,
-        "fn main() uses { Console } {\n    var a = 10\n    a = a + 1\n    print(\"a = {a}\")\n}\n",
-    );
-    assert!(out.status.success(), "{:?}", out);
-    assert_eq!(stdout_lines(&out), ["a = 11"]);
+    assert_eq!(stdout_lines(&out), ["a b c"], "got: {:?}", stdout_lines(&out));
 }
 
 // =========================================================================
@@ -241,6 +228,23 @@ fn p5_keyed_mock_is_order_independent() {
         "keyed mock should match by content, got: {:?}",
         stdout_lines(&out)
     );
+}
+
+#[test]
+fn p5_keyed_mock_prefers_longest_key() {
+    build_axon();
+    let dir = temp_dir("p5_long");
+    // A short key must not shadow a more specific one (verification finding #9).
+    let out = run_src(
+        &dir,
+        r#"fn main() uses { Console, LLM, Net } {
+    let m = mock_model("keyed", [["1", "short"], ["ticket-12", "long"]])
+    print(ask m { user: "please resolve ticket-12 now" })
+}
+"#,
+    );
+    assert!(out.status.success(), "{:?}", out);
+    assert_eq!(stdout_lines(&out), ["long"], "got: {:?}", stdout_lines(&out));
 }
 
 // =========================================================================
@@ -412,6 +416,25 @@ fn p7_inline_record_type_in_generics() {
     assert!(
         out.status.success(),
         "inline record type in a generic should type-check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn p7_inline_record_first_field_may_be_contextual_keyword() {
+    build_axon();
+    let dir = temp_dir("p7_kw");
+    // A contextual keyword (`model`/`prompt`/…) as the FIRST field name must
+    // parse — and be order-independent (verification finding #3).
+    let out = check_src(
+        &dir,
+        "fn a() -> List<{ model: Model, user: String }> uses { LLM } { [] }\n\
+         fn b() -> List<{ prompt: String, model: Model }> uses { LLM } { [] }\n\
+         fn main() {}\n",
+    );
+    assert!(
+        out.status.success(),
+        "contextual-keyword record fields should type-check: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

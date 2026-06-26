@@ -16,9 +16,11 @@ pub type EvalResult<T> = Result<T, EvalSignal>;
 pub enum EvalSignal {
     /// A normal `return [expr]` from a function.
     Return(Value),
-    /// `break [label]`. The optional value is `Unit` for an unvalued break.
+    /// `break [label] [value]`. `value` is `Unit` for an unvalued break; a
+    /// `loop` evaluates to it.
     Break {
         label: Option<String>,
+        value: Value,
     },
     /// `continue [label]`.
     Continue {
@@ -61,8 +63,9 @@ impl EvalSignal {
         match self {
             EvalSignal::Error(e) => EvalSignal::Error(e.clone()),
             EvalSignal::Return(v) => EvalSignal::Return(v.clone()),
-            EvalSignal::Break { label } => EvalSignal::Break {
+            EvalSignal::Break { label, value } => EvalSignal::Break {
                 label: label.clone(),
+                value: value.clone(),
             },
             EvalSignal::Continue { label } => EvalSignal::Continue {
                 label: label.clone(),

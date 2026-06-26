@@ -730,6 +730,11 @@ pub enum ExprKind {
         cond: Expr,
         body: Block,
     },
+    /// `loop { ... }` — an unconditional loop that runs until a `break`. As an
+    /// expression it evaluates to the value carried by its `break` (or `Unit`).
+    Loop {
+        body: Block,
+    },
     Select(Vec<SelectArm>),
     /// `parallel { ask m1 { ... }, ask m2 { ... }, ... }` — Stage 36.
     ///
@@ -788,9 +793,11 @@ pub enum ExprKind {
         expr: Expr,
         target: IsTarget,
     },
-    /// `return [expr]`, `break [label]`, `continue [label]`, `yield expr`.
+    /// `return [expr]`, `break [label] [value]`, `continue [label]`, `yield expr`.
     Return(Option<Expr>),
-    Break(Option<Ident>),
+    /// `break` with an optional label and an optional value. The value lets a
+    /// `loop` evaluate to it: `let x = loop { break 42 }`.
+    Break(Option<Ident>, Option<Expr>),
     Continue(Option<Ident>),
     Yield(Expr),
     /// `defer expr` — only valid in statement position; we still model as expr.
@@ -898,6 +905,11 @@ pub enum BinOp {
     MulAssign,
     DivAssign,
     RemAssign,
+    BitAndAssign,
+    BitOrAssign,
+    BitXorAssign,
+    ShlAssign,
+    ShrAssign,
     Range,
     RangeInclusive,
     /// `??` — null-coalescing: `a ?? b` is `a` if `a` is non-nil, else `b`.

@@ -689,6 +689,7 @@ impl Compiler {
                 self.compile_for(pat, iter, body, expr.span)
             }
             ExprKind::While { cond, body } => self.compile_while(cond, body, expr.span),
+            ExprKind::Loop { body } => self.compile_loop(body, expr.span),
             ExprKind::Select(_) => self.emit_unsupported(
                 "select requires the actor runtime (stage 5.5)",
                 expr.span,
@@ -751,7 +752,7 @@ impl Compiler {
                 // marker. The VM never actually executes past Return.
                 self.emit(Op::LoadNil, expr.span);
             }
-            ExprKind::Break(_label) => {
+            ExprKind::Break(_label, _value) => {
                 if self.loops.is_empty() {
                     self.error("`break` outside of a loop", expr.span);
                     self.emit(Op::LoadUnit, expr.span);
@@ -1039,6 +1040,25 @@ impl Compiler {
         self.emit(Op::LoadUnit, span);
     }
 
+    /// `loop { ... }` — like `compile_while` but with no condition; the only
+    /// exits are `break` jumps. (The VM's `break` yields `Unit`; break-with-a-
+    /// value is an interpreter feature.)
+    fn compile_loop(&mut self, body: &axon_ast::Block, span: Span) {
+        let loop_start = self.here();
+        self.loops.push(LoopCtx {
+            continue_target: loop_start,
+            break_jumps: Vec::new(),
+        });
+        self.compile_block(body);
+        self.emit(Op::Pop, body.span); // discard tail value
+        self.emit_back_jump(loop_start, span);
+        let loop_ctx = self.loops.pop().unwrap();
+        for bj in loop_ctx.break_jumps {
+            self.patch_jump_here(bj);
+        }
+        self.emit(Op::LoadUnit, span);
+    }
+
     fn compile_for(
         &mut self,
         pat: &Pattern,
@@ -1291,7 +1311,8 @@ impl Compiler {
                 self.patch_jump_here(short);
             }
             Assign => self.compile_assign(lhs, rhs, span),
-            AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
+            AddAssign | SubAssign | MulAssign | DivAssign | RemAssign | BitAndAssign
+            | BitOrAssign | BitXorAssign | ShlAssign | ShrAssign => {
                 self.compile_compound_assign(op, lhs, rhs, span);
             }
             Coalesce => self.emit_unsupported(
@@ -1343,6 +1364,11 @@ impl Compiler {
             MulAssign => Mul,
             DivAssign => Div,
             RemAssign => Rem,
+            BitAndAssign => BitAnd,
+            BitOrAssign => BitOr,
+            BitXorAssign => BitXor,
+            ShlAssign => Shl,
+            ShrAssign => Shr,
             _ => unreachable!(),
         };
         match &*lhs.kind {
@@ -1386,7 +1412,7 @@ fn binary_op_simple(op: BinOp) -> Op {
         Shr => Op::Shr,
         Range | RangeInclusive => Op::Add, // see TODO below
         And | Or | Coalesce | Assign | AddAssign | SubAssign | MulAssign | DivAssign
-        | RemAssign => {
+        | RemAssign | BitAndAssign | BitOrAssign | BitXorAssign | ShlAssign | ShrAssign => {
             unreachable!("handled in compile_binary")
         }
     }

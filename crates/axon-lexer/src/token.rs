@@ -150,6 +150,11 @@ pub enum TokenKind {
     StarEq,
     SlashEq,
     PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
 
     Eof,
 }
@@ -259,6 +264,7 @@ keywords! {
     In => "in",
     Is => "is",
     Let => "let",
+    Loop => "loop",
     Match => "match",
     Memory => "memory",
     Model => "model",
