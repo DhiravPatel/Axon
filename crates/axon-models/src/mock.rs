@@ -121,9 +121,13 @@ impl ModelProvider for MockProvider {
                     .map(|m| m.text())
                     .collect::<Vec<_>>()
                     .join("\n");
+                // Prefer the LONGEST matching key so a short key can't shadow a
+                // more specific one (e.g. "1" vs "ticket-12"). Empty keys are
+                // ignored so a `["", …]` pair can't swallow every request.
                 let s = pairs
                     .iter()
-                    .find(|(key, _)| user.contains(key.as_str()))
+                    .filter(|(key, _)| !key.is_empty() && user.contains(key.as_str()))
+                    .max_by_key(|(key, _)| key.len())
                     .map(|(_, resp)| resp.clone())
                     .unwrap_or_default();
                 (

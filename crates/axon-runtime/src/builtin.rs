@@ -765,6 +765,12 @@ fn builtin_mock_model(args: &[Value]) -> Result<Value, String> {
                     };
                     match (pair.first(), pair.get(1)) {
                         (Some(Value::String(k)), Some(Value::String(r))) if pair.len() == 2 => {
+                            if k.is_empty() {
+                                return Err(
+                                    "`mock_model(\"keyed\", [...])` keys must be non-empty"
+                                        .to_string(),
+                                );
+                            }
                             out.push((k.as_str().to_owned(), r.as_str().to_owned()));
                         }
                         _ => {

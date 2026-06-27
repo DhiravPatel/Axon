@@ -249,6 +249,11 @@ fn emit_token(out: &mut String, kind: &TokenKind) {
         StarEq => out.push_str("*="),
         SlashEq => out.push_str("/="),
         PercentEq => out.push_str("%="),
+        AmpEq => out.push_str("&="),
+        PipeEq => out.push_str("|="),
+        CaretEq => out.push_str("^="),
+        ShlEq => out.push_str("<<="),
+        ShrEq => out.push_str(">>="),
 
         // Already handled above:
         Newline | LineComment | BlockComment | DocComment(_) | ModDocComment(_) | Eof => {}

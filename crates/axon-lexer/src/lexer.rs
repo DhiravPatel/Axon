@@ -900,30 +900,103 @@ impl<'a> Lexer<'a> {
         let text_start = self.pos;
         loop {
             if self.starts_with("\"\"\"") {
-                let raw = &self.src[text_start..self.pos];
+                let raw = self.src[text_start..self.pos].to_string();
                 self.pos += 3;
-                let dedented = dedent_multiline(raw);
+                let dedented = dedent_multiline(&raw);
+                let span = self.span_from(start);
+                // P3b — `"""...{expr}..."""` and `prompt"""...{expr}..."""`
+                // interpolate just like single-line strings. We dedent first
+                // (so the common-indent calc sees the whole body) then split.
+                let parts = self.split_multiline_interps(&dedented, span);
                 return Token {
-                    kind: TokenKind::String {
-                        kind,
-                        parts: vec![StringPart::Text(dedented)],
-                    },
-                    span: self.span_from(start),
+                    kind: TokenKind::String { kind, parts },
+                    span,
                 };
             }
             if self.peek_byte().is_none() {
                 self.error("unterminated multi-line string", self.span_from(start));
-                let raw = &self.src[text_start..self.pos];
+                let raw = self.src[text_start..self.pos].to_string();
+                let span = self.span_from(start);
+                let parts = self.split_multiline_interps(&dedent_multiline(&raw), span);
                 return Token {
-                    kind: TokenKind::String {
-                        kind,
-                        parts: vec![StringPart::Text(dedent_multiline(raw))],
-                    },
-                    span: self.span_from(start),
+                    kind: TokenKind::String { kind, parts },
+                    span,
                 };
             }
             let _ = self.bump_char();
         }
+    }
+
+    /// Split a (already-dedented) multi-line string body into `Text` and
+    /// `Interp` parts, honoring `{{`/`}}` escapes and `{expr}` interpolation.
+    /// Brace matching is depth-based (not string-aware), matching the
+    /// single-line `scan_string` behavior. The interp `span` points at the
+    /// whole literal — the parser re-lexes the interp `text` as its own
+    /// source, so the span is only used for diagnostics. P3b.
+    fn split_multiline_interps(&mut self, s: &str, lit_span: Span) -> Vec<StringPart> {
+        let mut parts: Vec<StringPart> = Vec::new();
+        let mut buf = String::new();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' if bytes.get(i + 1) == Some(&b'{') => {
+                    buf.push('{');
+                    i += 2;
+                }
+                b'{' => {
+                    if !buf.is_empty() {
+                        parts.push(StringPart::Text(std::mem::take(&mut buf)));
+                    }
+                    i += 1; // opening `{`
+                    let interp_start = i;
+                    let mut depth = 1usize;
+                    while i < bytes.len() && depth > 0 {
+                        match bytes[i] {
+                            b'{' => {
+                                depth += 1;
+                                i += 1;
+                            }
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    if depth != 0 {
+                        self.error("unterminated interpolation in string", lit_span);
+                    }
+                    parts.push(StringPart::Interp {
+                        text: s[interp_start..i].to_string(),
+                        span: lit_span,
+                    });
+                    if i < bytes.len() && bytes[i] == b'}' {
+                        i += 1; // closing `}`
+                    }
+                }
+                b'}' if bytes.get(i + 1) == Some(&b'}') => {
+                    buf.push('}');
+                    i += 2;
+                }
+                _ => {
+                    // Copy one full UTF-8 scalar.
+                    let ch = s[i..].chars().next().unwrap();
+                    buf.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        if !buf.is_empty() {
+            parts.push(StringPart::Text(buf));
+        }
+        if parts.is_empty() {
+            parts.push(StringPart::Text(String::new()));
+        }
+        parts
     }
 
     fn scan_char(&mut self, start: usize) -> Token {
@@ -1088,7 +1161,13 @@ impl<'a> Lexer<'a> {
             b':' => Colon,
             b'\\' => Backslash,
             b'~' => Tilde,
-            b'^' => Caret,
+            b'^' => {
+                if self.bump_if(b'=') {
+                    CaretEq
+                } else {
+                    Caret
+                }
+            }
             b'?' => {
                 if self.bump_if(b'?') {
                     QuestionQuestion
@@ -1166,7 +1245,11 @@ impl<'a> Lexer<'a> {
                 if self.bump_if(b'=') {
                     LtEq
                 } else if self.bump_if(b'<') {
-                    Shl
+                    if self.bump_if(b'=') {
+                        ShlEq
+                    } else {
+                        Shl
+                    }
                 } else {
                     Lt
                 }
@@ -1175,7 +1258,11 @@ impl<'a> Lexer<'a> {
                 if self.bump_if(b'=') {
                     GtEq
                 } else if self.bump_if(b'>') {
-                    Shr
+                    if self.bump_if(b'=') {
+                        ShrEq
+                    } else {
+                        Shr
+                    }
                 } else {
                     Gt
                 }
@@ -1183,6 +1270,8 @@ impl<'a> Lexer<'a> {
             b'&' => {
                 if self.bump_if(b'&') {
                     AmpAmp
+                } else if self.bump_if(b'=') {
+                    AmpEq
                 } else {
                     Amp
                 }
@@ -1192,6 +1281,8 @@ impl<'a> Lexer<'a> {
                     PipePipe
                 } else if self.bump_if(b'>') {
                     Pipeline
+                } else if self.bump_if(b'=') {
+                    PipeEq
                 } else {
                     Pipe
                 }

@@ -15,7 +15,7 @@ fn label_widths(rows: List<{ name: String, width: Int }>) -> Int uses {} {
     total
 }
 
-fn main() uses { Console } {
+fn main() uses { Console, Time } {
     // P4 — `for x in` iterates a String by Char (no while + index).
     var vowels = 0
     for ch in "automaton" {
@@ -29,11 +29,11 @@ fn main() uses { Console } {
     print("slug  = {slug}")
     print("rule  = {rule}")
 
-    // P3a — a trailing operator continues the expression onto the next line,
-    // so multi-line prompt strings don't need wrapping parens.
-    let banner = "axon " +
-                 "stage 39 " +
-                 "ergonomics"
+    // Multi-line concatenation inside parentheses (the prompt use-case is
+    // better served by the `"""..."""` interpolation shown below).
+    let banner = ("axon " +
+                  "stage 39 " +
+                  "ergonomics")
     print("banner= {banner}")
 
     // P9 — read a Duration out in whatever unit you want.
@@ -53,4 +53,24 @@ fn main() uses { Console } {
         { name: "status", width: 8 },
     ])
     print("widths = {widths}")
+
+    // Wave 2 — method surface: numbers, lists, and strings read as methods.
+    let nums = [5, 3, 8, 1]
+    let sorted = nums.sort()
+    print("max  = {nums.fold(0, |a, x| a.max(x))}  sum = {nums.sum()}")
+    print("first2 = {list_get(sorted, 0)},{list_get(sorted, 1)}  has8 = {nums.contains(8)}")
+    let csv = "alice,bob,carol"
+    let names = csv.split(",")
+    let pretty = names.join(" | ")
+    print("names = {pretty}  n = {list_len(names)}")
+
+    // Wave 2 — multi-line prompt with {interpolation}.
+    let role = "support agent"
+    let topic = "refunds"
+    let sys = prompt"""
+        You are a {role}.
+        Answer questions about {topic} only.
+        Decline politely otherwise.
+    """
+    print(sys.trim())
 }

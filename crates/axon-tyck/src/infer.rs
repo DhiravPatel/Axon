@@ -351,10 +351,16 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
         String => &[
             "tainted", "len", "to_upper", "to_lower", "trim", "trim_start",
             "trim_end", "contains", "starts_with", "ends_with", "split",
+            "split_once", "split_lines", "index_of", "substring", "chars",
             "replace", "repeat",
         ],
         Duration => &["as_ns", "as_micros", "as_ms", "as_secs", "as_secs_f64"],
-        List(_) => &["len", "push", "pop", "first", "last", "reverse", "map", "filter"],
+        Int => &["abs", "to_string", "to_float", "min", "max", "pow"],
+        Float => &["abs", "round", "floor", "ceil", "sqrt", "to_int", "to_string"],
+        List(_) => &[
+            "len", "push", "pop", "first", "last", "reverse", "map", "filter",
+            "is_empty", "contains", "index_of", "sum", "join", "sort", "fold",
+        ],
         Map(_, _) => &["set", "get", "contains"],
         Set(_) => &["add", "contains"],
         Chan(_) => &[
@@ -767,6 +773,12 @@ impl<'a> Checker<'a> {
                 let _ = self.check_block(body, &Ty::Unit, scope, params, used);
                 Ty::Unit
             }
+            ExprKind::Loop { body } => {
+                // The body runs for effect; a `loop` evaluates to its `break`
+                // value, whose static type we leave gradual (`Dyn`).
+                let _ = self.check_block(body, &Ty::Unit, scope, params, used);
+                Ty::Dyn
+            }
             ExprKind::Select(_) => Ty::Dyn,
             ExprKind::Parallel(arms) => {
                 // Stage 37 lifts the §36 single-ask-per-arm restriction.
@@ -879,7 +891,12 @@ impl<'a> Checker<'a> {
                 Ty::Never
             }
             ExprKind::Return(None) => Ty::Never,
-            ExprKind::Break(_) => Ty::Never,
+            ExprKind::Break(_, value) => {
+                if let Some(v) = value {
+                    self.infer(v, scope, params, used);
+                }
+                Ty::Never
+            }
             ExprKind::Continue(_) => Ty::Never,
             ExprKind::Yield(e) => {
                 self.infer(e, scope, params, used);
@@ -1184,6 +1201,34 @@ impl<'a> Checker<'a> {
                 (Ty::String, EffectRow::pure(), vec![Ty::String, Ty::String])
             }
             (Ty::String, "repeat") => (Ty::String, EffectRow::pure(), vec![Ty::Int]),
+            // Wave 2 — round out the String method surface (parity with the
+            // `str_*` free functions).
+            (Ty::String, "split_lines") => {
+                (Ty::List(Box::new(Ty::String)), EffectRow::pure(), vec![])
+            }
+            (Ty::String, "split_once") => {
+                (Ty::List(Box::new(Ty::String)), EffectRow::pure(), vec![Ty::String])
+            }
+            (Ty::String, "index_of") => (Ty::Int, EffectRow::pure(), vec![Ty::String]),
+            (Ty::String, "substring") => {
+                (Ty::String, EffectRow::pure(), vec![Ty::Int, Ty::Int])
+            }
+            (Ty::String, "chars") => {
+                (Ty::List(Box::new(Ty::Char)), EffectRow::pure(), vec![])
+            }
+            // Wave 2 — numeric method surface for Int and Float.
+            (Ty::Int, "abs") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Int, "to_string") => (Ty::String, EffectRow::pure(), vec![]),
+            (Ty::Int, "to_float") => (Ty::Float, EffectRow::pure(), vec![]),
+            (Ty::Int, "min") | (Ty::Int, "max") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
+            (Ty::Int, "pow") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
+            (Ty::Float, "abs")
+            | (Ty::Float, "round")
+            | (Ty::Float, "floor")
+            | (Ty::Float, "ceil")
+            | (Ty::Float, "sqrt") => (Ty::Float, EffectRow::pure(), vec![]),
+            (Ty::Float, "to_int") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Float, "to_string") => (Ty::String, EffectRow::pure(), vec![]),
             // P9 — read a Duration out as an integer count of a coarser unit
             // (`as_secs_f64` as a Float). Fires when the receiver is statically
             // `Duration`; `time_now()` returns `Dyn` so the Dyn path also works.
@@ -1206,6 +1251,14 @@ impl<'a> Checker<'a> {
                 (Ty::List(Box::new(Ty::Dyn)), EffectRow::pure(), vec![Ty::Dyn])
             }
             (Ty::List(t), "filter") => (Ty::List(t.clone()), EffectRow::pure(), vec![Ty::Dyn]),
+            // Wave 2 — round out the List method surface.
+            (Ty::List(_), "is_empty") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::List(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
+            (Ty::List(_), "index_of") => (Ty::Int, EffectRow::pure(), vec![Ty::Dyn]),
+            (Ty::List(_), "sum") => (Ty::Dyn, EffectRow::pure(), vec![]),
+            (Ty::List(_), "join") => (Ty::String, EffectRow::pure(), vec![Ty::String]),
+            (Ty::List(t), "sort") => (Ty::List(t.clone()), EffectRow::pure(), vec![]),
+            (Ty::List(_), "fold") => (Ty::Dyn, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
             (Ty::Map(_, _), "set") => (Ty::Unit, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
             (Ty::Map(_, _), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
@@ -1560,7 +1613,8 @@ impl<'a> Checker<'a> {
                     Ty::Error
                 }
             },
-            Assign | AddAssign | SubAssign | MulAssign | DivAssign | RemAssign => {
+            Assign | AddAssign | SubAssign | MulAssign | DivAssign | RemAssign
+            | BitAndAssign | BitOrAssign | BitXorAssign | ShlAssign | ShrAssign => {
                 if !is_assignable(&rt, &lt) {
                     self.report(errors::type_mismatch(span, &lt, &rt));
                 }
@@ -1664,6 +1718,11 @@ fn op_str(op: BinOp) -> &'static str {
         MulAssign => "*=",
         DivAssign => "/=",
         RemAssign => "%=",
+        BitAndAssign => "&=",
+        BitOrAssign => "|=",
+        BitXorAssign => "^=",
+        ShlAssign => "<<=",
+        ShrAssign => ">>=",
         Range => "..",
         RangeInclusive => "..=",
         Coalesce => "??",

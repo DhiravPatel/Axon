@@ -1061,49 +1061,52 @@ impl<'a> Parser<'a> {
             TokenKind::LBrace => {
                 self.bump();
                 self.paren_depth += 1;
-                let first = self.parse_type();
-                let kind = if matches!(self.peek(), TokenKind::Colon) {
-                    self.bump();
-                    let value = self.parse_type();
-                    // `{ k: v }` is a Map; `{ name: T, ... }` (a comma after the
-                    // first pair) is an inline record type — maps only ever hold
-                    // a single key/value pair. P7.
-                    if matches!(self.peek(), TokenKind::Comma) {
-                        let mut fields = Vec::new();
-                        if let Some(field) = self.type_pair_to_field(&first, value) {
-                            fields.push(field);
+                // A soft keyword (`model`/`prompt`/`memory`/`tool`/`agent`) as
+                // the first token inside `{...}` in TYPE position can only be a
+                // record field name — soft keywords aren't types, so this can
+                // be neither a map key nor a set element. `parse_type` would
+                // reject it, so commit to record parsing directly. P7 + §37.A.
+                let kind = if matches!(self.peek(), TokenKind::Keyword(kw) if Self::is_soft_keyword(*kw))
+                {
+                    let mut fields = vec![self.parse_inline_record_field()];
+                    while matches!(self.peek(), TokenKind::Comma) {
+                        self.bump();
+                        if matches!(self.peek(), TokenKind::RBrace) {
+                            break; // trailing comma
                         }
-                        while matches!(self.peek(), TokenKind::Comma) {
-                            self.bump();
-                            if matches!(self.peek(), TokenKind::RBrace) {
-                                break; // trailing comma
-                            }
-                            let fstart = self.peek_span();
-                            let name = self.parse_ident();
-                            self.expect(&TokenKind::Colon, "`:` after record field name");
-                            let fty = self.parse_type();
-                            fields.push(Field {
-                                doc: None,
-                                name,
-                                ty: fty,
-                                refinements: Vec::new(),
-                                default: None,
-                                span: Span::in_file(
-                                    fstart.start as usize,
-                                    self.prev_end(),
-                                    self.file_id,
-                                ),
-                            });
-                        }
-                        TypeKind::Record(fields)
-                    } else {
-                        TypeKind::Map {
-                            key: Box::new(first),
-                            value: Box::new(value),
-                        }
+                        fields.push(self.parse_inline_record_field());
                     }
+                    TypeKind::Record(fields)
                 } else {
-                    TypeKind::Set(Box::new(first))
+                    let first = self.parse_type();
+                    if matches!(self.peek(), TokenKind::Colon) {
+                        self.bump();
+                        let value = self.parse_type();
+                        // `{ k: v }` is a Map; `{ name: T, ... }` (a comma after
+                        // the first pair) is an inline record — maps only ever
+                        // hold a single key/value pair. P7.
+                        if matches!(self.peek(), TokenKind::Comma) {
+                            let mut fields = Vec::new();
+                            if let Some(field) = self.type_pair_to_field(&first, value) {
+                                fields.push(field);
+                            }
+                            while matches!(self.peek(), TokenKind::Comma) {
+                                self.bump();
+                                if matches!(self.peek(), TokenKind::RBrace) {
+                                    break; // trailing comma
+                                }
+                                fields.push(self.parse_inline_record_field());
+                            }
+                            TypeKind::Record(fields)
+                        } else {
+                            TypeKind::Map {
+                                key: Box::new(first),
+                                value: Box::new(value),
+                            }
+                        }
+                    } else {
+                        TypeKind::Set(Box::new(first))
+                    }
                 };
                 self.paren_depth = self.paren_depth.saturating_sub(1);
                 self.expect(&TokenKind::RBrace, "`}` to close map/set/record type");
@@ -1195,6 +1198,24 @@ impl<'a> Parser<'a> {
                     kind: TypeKind::Unit,
                 }
             }
+        }
+    }
+
+    /// Parse one `name: Type` field of an inline record type. The field name
+    /// uses `parse_ident`, which accepts contextual keywords (`model`, etc.)
+    /// as names — so `{ model: Model }` works the same as a regular field. P7.
+    fn parse_inline_record_field(&mut self) -> Field {
+        let fstart = self.peek_span();
+        let name = self.parse_ident();
+        self.expect(&TokenKind::Colon, "`:` after record field name");
+        let ty = self.parse_type();
+        Field {
+            doc: None,
+            name,
+            ty,
+            refinements: Vec::new(),
+            default: None,
+            span: Span::in_file(fstart.start as usize, self.prev_end(), self.file_id),
         }
     }
 
@@ -2187,6 +2208,13 @@ impl<'a> Parser<'a> {
                 // `let mut` → `var`. P1.
                 if matches!(self.peek(), TokenKind::Keyword(Kw::Mut)) {
                     let mut_tok = self.bump();
+                    // Only offer the auto-fix when a real binding name follows.
+                    // `let mut (a, b) = …` (destructuring) has no `var` form, so
+                    // a Safe rewrite would just produce different invalid code.
+                    let name_follows = matches!(
+                        self.peek(),
+                        TokenKind::Ident(_) | TokenKind::Keyword(_)
+                    );
                     let name = self.parse_ident();
                     let ty = if matches!(self.peek(), TokenKind::Colon) {
                         self.bump();
@@ -2196,27 +2224,30 @@ impl<'a> Parser<'a> {
                     };
                     self.expect(&TokenKind::Eq, "`=` after var binding");
                     let value = self.parse_expr();
-                    // One edit: replace `let mut ` (up to the name) with `var `.
-                    let fix = Fix::new("replace `let mut` with `var`")
-                        .with_edit(FixEdit {
-                            span: Span::in_file(
-                                start.start as usize,
-                                name.span.start as usize,
-                                self.file_id,
-                            ),
-                            replacement: "var ".to_string(),
-                        })
-                        .safe();
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "`let mut` is not valid Axon — use `var` for a mutable binding",
-                            mut_tok.span,
-                        )
-                        .with_code("P0001")
-                        .with_primary_label("drop `mut`; `var` is already mutable")
-                        .with_note("Axon has two binding forms: `let` (immutable) and `var` (mutable). Run `axon fix` to apply.")
-                        .with_fix(fix),
-                    );
+                    let mut diag = Diagnostic::error(
+                        "`let mut` is not valid Axon — use `var` for a mutable binding",
+                        mut_tok.span,
+                    )
+                    .with_code("P0001")
+                    .with_primary_label("drop `mut`; `var` is already mutable")
+                    .with_note("Axon has two binding forms: `let` (immutable) and `var` (mutable). Run `axon fix` to apply.");
+                    if name_follows {
+                        // Replace exactly the `let mut` keywords with `var`,
+                        // preserving any trivia (and the name) after `mut`.
+                        diag = diag.with_fix(
+                            Fix::new("replace `let mut` with `var`")
+                                .with_edit(FixEdit {
+                                    span: Span::in_file(
+                                        start.start as usize,
+                                        mut_tok.span.end as usize,
+                                        self.file_id,
+                                    ),
+                                    replacement: "var".to_string(),
+                                })
+                                .safe(),
+                        );
+                    }
+                    self.diagnostics.push(diag);
                     self.last_error_pos = Some(self.pos);
                     return Stmt::Var {
                         name,
@@ -2472,6 +2503,11 @@ impl<'a> Parser<'a> {
                 TokenKind::StarEq => (BinOp::MulAssign, 1, 2),
                 TokenKind::SlashEq => (BinOp::DivAssign, 1, 2),
                 TokenKind::PercentEq => (BinOp::RemAssign, 1, 2),
+                TokenKind::AmpEq => (BinOp::BitAndAssign, 1, 2),
+                TokenKind::PipeEq => (BinOp::BitOrAssign, 1, 2),
+                TokenKind::CaretEq => (BinOp::BitXorAssign, 1, 2),
+                TokenKind::ShlEq => (BinOp::ShlAssign, 1, 2),
+                TokenKind::ShrEq => (BinOp::ShrAssign, 1, 2),
                 TokenKind::Pipeline => (BinOp::Or /* placeholder */, 3, 4),
                 // `??` binds looser than `||` so `a || b ?? c` groups as
                 // `(a || b) ?? c` — the coalesce wraps the whole boolean.
@@ -2503,12 +2539,6 @@ impl<'a> Parser<'a> {
             }
             let is_pipeline = matches!(self.peek(), TokenKind::Pipeline);
             self.bump();
-            // A binary operator at end-of-line continues onto the next line
-            // (the §9.2 rule the parser doc promises): `let s = "a " +\n "b "`
-            // joins instead of erroring on the newline. Only fires once an
-            // operator has actually been consumed, so a bare newline after a
-            // complete statement still terminates it. P3(a).
-            self.eat_newlines();
             let rhs = self.parse_expr_bp(r_bp);
             let span = Span::in_file(start.start as usize, self.prev_end(), self.file_id);
             lhs = if is_pipeline {
@@ -2710,6 +2740,7 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Kw::When) => self.parse_when_expr(),
             TokenKind::Keyword(Kw::For) => self.parse_for_expr(),
             TokenKind::Keyword(Kw::While) => self.parse_while_expr(),
+            TokenKind::Keyword(Kw::Loop) => self.parse_loop_expr(),
             TokenKind::Keyword(Kw::Select) => self.parse_select_expr(),
             TokenKind::Keyword(Kw::Parallel) => self.parse_parallel_expr(),
             TokenKind::Keyword(Kw::Ask) => self.parse_ask_expr(),
@@ -2746,14 +2777,17 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Keyword(Kw::Break) => {
                 self.bump();
-                let label = if let TokenKind::Ident(_) = self.peek() {
-                    Some(self.parse_ident())
+                // `break [value]` — the optional value lets a `loop` evaluate to
+                // it. Decided the same way `return [value]` is: a value is
+                // present unless the next token ends the statement/block.
+                let value = if self.expr_can_start() {
+                    Some(self.parse_expr())
                 } else {
                     None
                 };
                 Expr {
                     span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
-                    kind: Box::new(ExprKind::Break(label)),
+                    kind: Box::new(ExprKind::Break(None, value)),
                 }
             }
             TokenKind::Keyword(Kw::Continue) => {
@@ -2969,6 +3003,16 @@ impl<'a> Parser<'a> {
         Expr {
             span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
             kind: Box::new(ExprKind::While { cond, body }),
+        }
+    }
+
+    fn parse_loop_expr(&mut self) -> Expr {
+        let start = self.peek_span();
+        self.bump();
+        let body = self.parse_block();
+        Expr {
+            span: Span::in_file(start.start as usize, self.prev_end(), self.file_id),
+            kind: Box::new(ExprKind::Loop { body }),
         }
     }
 

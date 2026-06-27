@@ -225,7 +225,13 @@ fn check_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
                 check_expr(e, diags);
             }
         }
-        ExprKind::Break(_) | ExprKind::Continue(_) => {
+        ExprKind::Loop { .. } => {
+            diags.push(unsupported(
+                "`loop` isn't yet wired through the WASM target",
+                e.span,
+            ));
+        }
+        ExprKind::Break(_, _) | ExprKind::Continue(_) => {
             diags.push(unsupported(
                 "`break` / `continue` aren't yet wired through the WASM target",
                 e.span,
@@ -252,7 +258,8 @@ fn check_binary_op(op: BinOp, span: Span, diags: &mut Vec<Diagnostic>) {
     match op {
         Add | Sub | Mul | Div | Rem | Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or
         | BitAnd | BitOr | BitXor | Shl | Shr | Assign | AddAssign | SubAssign | MulAssign
-        | DivAssign | RemAssign => {}
+        | DivAssign | RemAssign | BitAndAssign | BitOrAssign | BitXorAssign | ShlAssign
+        | ShrAssign => {}
         Range | RangeInclusive => diags.push(unsupported(
             "range expressions need a list-producing heap",
             span,

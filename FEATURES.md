@@ -1,6 +1,104 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1120 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1141 tests passing** across 30+ crates).
+
+---
+
+## Stage 40 — Fundamental Control Flow: `loop`, `break <value>`, and Bitwise Compound Assignment
+
+A completeness pass over the basics every language is expected to have. An audit confirmed Axon already had the full operator set (arithmetic, comparison, logical, bitwise `& | ^ << >>`, `??`, ranges), `if`/`while`/`for`/`match` with guards, hex/octal/binary integer literals, and `+= -= *= /= %=`. Three genuine gaps remained:
+
+### §40.1 — `loop { }` + `break <value>`
+
+`loop { ... }` is an unconditional loop that runs until a `break` — clearer intent than `while true`. Crucially it is an **expression**: `break <value>` carries a value out, so a loop can produce a result.
+
+```axon
+var i = 0
+let first = loop {
+    i += 1
+    if i > 5 && i % 2 == 0 { break i }   // -> 6
+}
+```
+
+`break` now takes an optional value (parsed the same way `return <value>` is — present unless the line ends), so `ExprKind::Break` and `EvalSignal::Break` carry it and `eval_loop` ([eval.rs](crates/axon-runtime/src/eval.rs)) returns it (or `Unit`). `loop`'s static type is gradual (`Dyn`). Wired through the lexer keyword, parser, tyck, the tree-walking interpreter, and the AxVM bytecode compiler ([axon-vm](crates/axon-vm/src/compiler.rs)); the WASM subset reports it as not-yet-supported.
+
+### §40.2 — Bitwise & shift compound assignment
+
+`&=`, `|=`, `^=`, `<<=`, `>>=` join the existing `+= -= *= /= %=`. New lexer tokens (multi-char scan handles `<<=`/`>>=`), `BinOp::{BitAndAssign, BitOrAssign, BitXorAssign, ShlAssign, ShrAssign}`, and the compound-assign evaluator's base-op map.
+
+```axon
+var flags = 0
+flags |= 5      // 5
+flags &= 6      // 4
+flags ^= 1      // 5
+var s = 1
+s <<= 4         // 16
+s >>= 1         // 8
+```
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage40_fundamentals` | 3 | `loop` + `break <value>` as an expression, plain `loop` with `break`/`continue`, the five bitwise/shift compound assignments |
+| **Workspace total** | **1141 passing**, up from 1138 | +3 |
+
+---
+
+## Stage 39 — Ease-of-Use: Papercut Cleanup + Method-Surface Completeness
+
+A UX-focused stage that walks [PAPERCUTS.md](PAPERCUTS.md) top to bottom — the friction a third-party developer hits in the first hour. Each item was verified against live source first (several were already shipped: P2 contextual keywords in Stage 37; `"""` strings, `for` over List/Set/Map, and `str_split`/`str_trim` pre-39), then the genuinely-open ones were closed. The stage has two waves: the papercut fixes, and a method-surface pass that lifts common `math_*`/`list_*`/`str_*` free functions to method syntax.
+
+### §39.1 — `let mut` → `var` (P1)
+
+`let mut x = 0` (the first thing every Rust/Swift author types) used to die on a two-error cascade (`expected a pattern` + `expected an expression, got Colon`). The [parser](crates/axon-parser/src/parser.rs) `parse_stmt` Let-arm now detects `mut`, recovers by parsing a mutable binding, and emits **one** `P0001` error carrying a `Confidence::Safe` `axon fix` that rewrites `let mut` → `var`. The fix flows through the existing §32.2 `cmd_fix` machinery unchanged — `axon fix --apply` produces `var x = 0`.
+
+### §39.2 — Multi-line string interpolation (P3)
+
+The papercut wanted relief for multi-line prompt strings. Two approaches were on the table: a bare *trailing-operator continuation* and *triple-quoted strings*. The trailing-operator form was prototyped and **deliberately dropped** — adversarial review showed it silently fused two statements when a line ended in an operator (`x = x +\n print(...)` parsed as `x = x + print(...)`, type-checking "successfully" and failing only at runtime), which is exactly the class of silent error a typed language should not introduce. Multi-line concatenation inside parentheses already works (`("a " +\n "b ")`).
+
+The shipped solution is **multi-line string interpolation**:
+
+`"""...{expr}..."""` and `prompt"""...{expr}..."""` now interpolate — previously the body was emitted verbatim, so `{name}` printed literally (a footgun for the canonical agent prompt). [`scan_multiline_string`](crates/axon-lexer/src/lexer.rs) dedents the body, then splits it into `Text`/`Interp` parts honoring `{{`/`}}` escapes, the same shape single-line strings use.
+
+### §39.4 — `for` over String + inline record types (P4, P7)
+
+- **P4**: `for ch in "abc"` now type-checks ([infer.rs](crates/axon-tyck/src/infer.rs) binds the loop var as `Char`), matching the runtime which already iterated strings. The `for` arm also mirrors `Chan` iteration.
+- **P7**: inline record types parse inside generics — `List<{ target: Model, user: String }>` — and as bare annotations. A new `TypeKind::Record` ([axon-ast](crates/axon-ast/src/lib.rs)) lowers to `Dyn` (the same way record *value* literals already infer), with the parser disambiguating record-vs-map by the presence of a comma after the first `key: value` pair.
+
+### §39.5 — `Dyn`/`Any` + single E0203 (P8, P13)
+
+- **P8**: `Dyn` and `Any` resolve as the gradual type alongside lowercase `dyn` ([builtins.rs](crates/axon-tyck/src/builtins.rs)); built-in type names seed the E0203 "did you mean…?" pool so a near-miss of a primitive suggests the real type.
+- **P13**: an unknown-type typo reports `E0203` once. `lower_type` runs in both the register and body passes; a span-set on the `Checker` ([lib.rs](crates/axon-tyck/src/lib.rs)) suppresses the duplicate, deduping by span so two distinct typos still both report.
+
+### §39.6 — Keyed mocks + replay on a directory (P5, P6)
+
+- **P5**: `mock_model("keyed", [[key, response], …])` backed by a new `MockBehavior::Keyed` ([mock.rs](crates/axon-models/src/mock.rs)) returns the response whose key is a substring of the request's user text — order-independent, so reordering fixtures or skipping requests never desyncs the mock. The **longest** matching key wins (so `"1"` can't shadow `"ticket-12"`) and empty keys are rejected.
+- **P6**: `axon replay <dir>` accepts a project directory (parity with `axon run`), routing it through `LoadedProject` instead of `read_to_string` ([main.rs](crates/axon-cli/src/main.rs)). It takes the same `--features`/`--no-default-features` flags as `run` so a recording made from a non-default-feature build replays against the matching program.
+
+### §39.7 — Method-surface completeness (wave 2)
+
+Common helpers that only existed as free functions now also read as methods (dispatch in [eval.rs](crates/axon-runtime/src/eval.rs) `call_method`, typed in [infer.rs](crates/axon-tyck/src/infer.rs) `method_call_ty`, with the did-you-mean lists in `builtin_methods_for` kept in sync):
+
+- **Duration** (P9): `as_ns` / `as_micros` / `as_ms` / `as_secs` / `as_secs_f64` — so an agent can answer "how long did that take?" without dropping to Rust.
+- **String** (P10 + wave 2): `replace` / `repeat` / `trim_start` / `trim_end` / `split_once` / `split_lines` / `index_of` / `substring` / `chars`.
+- **List**: `is_empty` / `contains` / `index_of` / `sum` / `join` / `sort` / `fold`.
+- **Int**: `abs` / `to_string` / `to_float` / `min` / `max` / `pow`. **Float**: `abs` / `round` / `floor` / `ceil` / `sqrt` / `to_int` / `to_string`.
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage39_papercuts` | 14 | P1 single-error + `axon fix` (comment-preserving), P3 parenthesized concat, P4 for-over-String/List/Range, P5 keyed mock (order-independent + longest-key), P6 replay on a dir, P7 inline record in generics + contextual-keyword fields, P8 Dyn/Any, P9 Duration units, P10 replace/repeat, P13 one-vs-two E0203 |
+| `axon-cli::stage39_methods` | 4 | numeric methods, List methods, String methods, multi-line `{interpolation}` |
+| **Workspace total** | **1138 passing**, up from 1120 | +18 |
+
+### What's NOT in this stage (explicit scope cuts)
+
+- **P11 — in-process human gate**: a truly blocking `human_decision`/`await` needs the async substrate (Stage 39+); the synchronous resolve-now form was deferred.
+- **P12 — `audit_*` host bindings**: low severity; the `local_memory` workaround is adequate for prototypes.
+- **Duration + Int arithmetic**: `dt + 0` stays a type error (ambiguous unit); use `dt.as_ms() + n`.
+- **Display canonicalization for `dyn`**: `Dyn`/`Any` are accepted on input but the printed form stays lowercase `dyn` to avoid churning golden output.
 
 ---
 
