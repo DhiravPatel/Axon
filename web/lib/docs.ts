@@ -110,12 +110,22 @@ async function highlightFencedBlocks(html: string): Promise<string> {
 }
 
 function decodeHtml(s: string): string {
-  return s
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
+  return (
+    s
+      // Numeric escapes first — rehype-stringify emits `<` as `&#x3C;` and
+      // `&` as `&#x26;`, which would otherwise reach Shiki verbatim and show
+      // up literally inside code blocks (`Option&#x3C;T>`).
+      .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+        String.fromCodePoint(parseInt(hex, 16))
+      )
+      .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      // `&amp;` last so an already-decoded `&` from above isn't re-touched.
+      .replace(/&amp;/g, "&")
+  );
 }
 
 export interface ExampleEntry {

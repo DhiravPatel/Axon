@@ -38,11 +38,6 @@ export function ChapterView({
         <h1 className="mt-4 font-display text-3xl font-semibold tracking-tight text-white sm:text-[2.5rem] sm:leading-tight">
           {chapter.title}
         </h1>
-        {chapter.blurb ? (
-          <p className="mt-4 text-lg leading-relaxed text-ink-300">
-            {chapter.blurb}
-          </p>
-        ) : null}
       </header>
 
       {/* `dangerouslySetInnerHTML` is fed by remark + Shiki running

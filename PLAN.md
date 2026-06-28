@@ -220,7 +220,7 @@ per project and hoped-for in review. A full comparison table is in
 
 ## 3. Design principles & goals
 
-### 3..1 Principles
+### 3.1 Principles
 
 **P1 — Agents are first-class.** An agent is declared with a keyword, has a type, a
 lifecycle, a mailbox, an address; it can be spawned, supervised, snapshotted, replayed.
@@ -261,7 +261,7 @@ incrementally). Effects have an `unsafe` escape hatch. Concurrency is structured
 default but unstructured `spawn` exists. The language scales from a 5-line script to a
 500k-line system.
 
-### 3..2 Goals
+### 3.2 Goals
 
 | # | Goal | Description |
 |---|---|---|
@@ -347,7 +347,7 @@ Axon ships as a single self-contained binary, `axon`, containing the compiler, t
 the package manager, the formatter, the linter, the language server, the test/eval
 runner, the profiler, and the trace/replay viewer.
 
-### 5..1 Install
+### 5.1 Install
 
 ```sh
 # macOS / Linux / WSL
@@ -370,7 +370,7 @@ git clone https://github.com/axon-lang/axon && cd axon
 Also available via `brew install axon-lang/tap/axon`, `apt install axon`, `nix profile
 install nixpkgs#axon`, and `docker run --rm -it ghcr.io/axon-lang/axon:1.0 axon repl`.
 
-### 5..2 Verify
+### 5.2 Verify
 
 ```sh
 $ axon --version
@@ -386,7 +386,7 @@ $ axon doctor
 ⚠ no default model bound — set [models] in axon.toml or pass --model
 ```
 
-### 5..3 The toolchain at a glance
+### 5.3 The toolchain at a glance
 
 | Tool | Command | Purpose |
 |---|---|---|
@@ -403,7 +403,7 @@ $ axon doctor
 | LSP server | `axon lsp` | Editor integration |
 | Doc generator | `axon doc` | HTML/Markdown API docs from `///` comments |
 
-### 5..4 Editor support
+### 5.4 Editor support
 
 First-party extensions exist for VS Code, Neovim, Zed, Helix, Emacs, and the JetBrains
 family; all share the `axon lsp` server: type & effect inference on hover, completion,
@@ -426,7 +426,7 @@ channel = "1.0.0"
 
 ## 6. Quick start — hello, agent
 
-### 6..1 The smallest program
+### 6.1 The smallest program
 
 ```axon
 // hello.ax
@@ -443,7 +443,7 @@ Hello, Axon
 `main` declares `uses { Console }` because `print` writes to the console. Effects
 propagate up the call tree and the compiler enforces them — this is visible from line one.
 
-### 6..2 The smallest agent
+### 6.2 The smallest agent
 
 ```axon
 use std.io
@@ -477,7 +477,7 @@ wavelengths far more than longer ones — Rayleigh scattering…
 The footer (wall time, tokens, cost, model) is printed by the runtime — you added no
 logging to get it (**P7**).
 
-### 6..3 An agent that uses a tool — capability security in action
+### 6.3 An agent that uses a tool — capability security in action
 
 ```axon
 use std.io
@@ -513,7 +513,7 @@ fn main() uses { Spawn, LLM, Net, Console } {
 because that capability was passed into its constructor. Remove it and the program does
 not type-check. This is **P5 (capability security)**: no ambient authority.
 
-### 6..4 Record once, replay forever
+### 6.4 Record once, replay forever
 
 ```sh
 axon run --record runs/first.axj      # capture every model/tool/clock/rand effect
@@ -551,7 +551,7 @@ support-bot/
     └── axon.service.toml      # runtime/deploy configuration
 ```
 
-### 7..1 `axon.toml`
+### 7.1 `axon.toml`
 
 ```toml
 [package]
@@ -701,7 +701,7 @@ That is essentially the whole language. The rest is precision.
 
 ## 9. Lexical structure
 
-### 9..1 Source & comments
+### 9.1 Source & comments
 
 Source is UTF-8 (identifiers normalized to NFC). Style: `snake_case` for values/functions,
 `PascalCase` for types/agents/traits/schemas.
@@ -713,13 +713,13 @@ Source is UTF-8 (identifiers normalized to NFC). Style: `snake_case` for values/
 //! module doc comment
 ```
 
-### 9..2 Newlines & semicolons
+### 9.2 Newlines & semicolons
 
 Axon is newline-significant but bracket-tolerant: a statement ends at a newline unless the
 line ends with an open bracket, a binary operator, `|>`, or a `\` continuation.
 Semicolons are legal but never required; `axon fmt` removes them.
 
-### 9..3 Keywords
+### 9.3 Keywords
 
 ```
 agent   actor   and     as      ask     async   await   break   case
@@ -735,7 +735,7 @@ The keywords that distinguish Axon from a conventional language: `agent`, `actor
 `model`, `tool`, `memory`, `prompt`, `supervisor`, `graph`, `ask`, `generate`, `plan`,
 `effect`, `uses`, `on`, `state`, `replay`, `stream`, `chan`.
 
-### 9..4 Literals
+### 9.4 Literals
 
 ```axon
 42   0xFF   0o17   0b1010   1_000_000                       // Int
@@ -762,7 +762,7 @@ agent-address literals are built into the lexer because agent systems use them c
 and getting them wrong (floating-point money, naïve durations) is a classic production
 defect.
 
-### 9..5 String interpolation
+### 9.5 String interpolation
 
 `"{expr}"` interpolates any expression; `"{expr:spec}"` applies a format spec
 (`{x:.2f}`, `{n:,}`, `{d:%Y-%m-%d}`); `"{{"`/`"}}"` are literal braces. Interpolation is
@@ -778,7 +778,7 @@ Axon's type system is **gradual, structural-where-it-helps, nominal-where-it-mat
 with an effect row**. A prototype can be written with almost no annotations and hardened
 section by section without rewrites.
 
-### 10..1 Three layers
+### 10.1 Three layers
 
 1. **Static layer.** Fully annotated/inferred code is checked at compile time with no
    runtime type cost.
@@ -789,7 +789,7 @@ section by section without rewrites.
    runtime-validatable description used for model-constrained generation and external
    data ingestion.
 
-### 10..2 Type syntax
+### 10.2 Type syntax
 
 ```axon
 Int  Float  Decimal  Money  Bool  String  Char  Bytes  Unit  Never  dyn
@@ -809,7 +809,7 @@ Model  Tool<I,O>  Memory // the agent-domain interface types
 Secret<T>                // a redaction-aware secret (§40)
 ```
 
-### 10..3 Inference
+### 10.3 Inference
 
 Bidirectional inference with let-generalization. Local bindings, lambda parameters, and
 return types are inferred. **Public** function signatures, agent/actor message
@@ -822,14 +822,14 @@ pub fn process(xs: [Int]) -> Int { xs.sum() }   // OK
 let f = |xs| xs.sum()                           // OK: local closure inferred
 ```
 
-### 10..4 Subtyping & variance
+### 10.4 Subtyping & variance
 
 Axon avoids deep subtyping. Relations: `Never <: T <: dyn`; `T <: T?`; width/depth
 subtyping on **records and schemas only** (unless `@nominal`); declared generic variance
 (`+T` covariant, `-T` contravariant, invariant default). Effect rows have their own
 subsumption lattice ([§20.4](#204-effect-rows-inference--subsumption)).
 
-### 10..5 Refinement & constraint types
+### 10.5 Refinement & constraint types
 
 Refinements are checked statically where decidable and as runtime contracts otherwise.
 
@@ -843,7 +843,7 @@ fn discount(p: Percent, price: Decimal) -> Decimal { price * (1.0dec - p/100.0) 
 discount(150.0, 9.99dec)                       // compile error: 150.0 violates @range
 ```
 
-### 10..6 `Tainted<T>` — untrusted data as a type
+### 10.6 `Tainted<T>` — untrusted data as a type
 
 All data originating outside the program — user input, tool output, recalled memory,
 HTTP bodies — has type `Tainted<T>`. It is a *distinct* type: you cannot use a
@@ -865,7 +865,7 @@ Consequences enforced by the compiler/runtime:
 * This makes prompt-injection and SSRF/path-traversal classes a **type property**, not a
   code-review hope ([§42](#42-security--sandboxing-model)).
 
-### 10..7 The "never parse model output by hand" guarantee
+### 10.7 The "never parse model output by hand" guarantee
 
 For any `schema S`, the type `S` is *inhabited only by validated values*. The only ways
 to obtain an `S` from outside the program (a model, a file, an HTTP body) are validating
@@ -964,7 +964,7 @@ Functions are values. The function type **includes its effect row** (§20): a
 `(Int) -> Int` and a `(Int) -> Int uses { LLM }` are different types and not
 interchangeable — you cannot pass a model-calling function where a pure one is required.
 
-### 13..1 Function attributes
+### 13.1 Function attributes
 
 ```axon
 @pure                                          // compiler verifies no effects; memoizable
@@ -1052,7 +1052,7 @@ Patterns also appear in `let` (irrefutable only), `for`, and function parameters
 
 ## 16. Composite & user-defined types
 
-### 16..1 Records (product types)
+### 16.1 Records (product types)
 
 ```axon
 type User {
@@ -1070,7 +1070,7 @@ let u2 = User { ..u, name: "Ada L." }       // functional update (copy with chan
 Records are value types with structural equality; width/depth subtyping applies unless
 declared `@nominal`.
 
-### 16..2 Enums / sum types (ADTs)
+### 16.2 Enums / sum types (ADTs)
 
 ```axon
 type Json = Null | Bool(Bool) | Num(Float) | Str(String) | Arr([Json]) | Obj({String: Json})
@@ -1081,7 +1081,7 @@ type Option<T>    = Some(T) | None        // `T?` is sugar over this
 Variants carry positional or named payloads; recursive and generic enums are first-class
 (the compiler boxes recursively).
 
-### 16..3 Methods & associated functions
+### 16.3 Methods & associated functions
 
 ```axon
 type Vec2 { x: Float, y: Float }
@@ -1093,7 +1093,7 @@ impl Vec2 {
 Vec2.zero().length()                                          // 0.0
 ```
 
-### 16..4 Newtypes & aliases
+### 16.4 Newtypes & aliases
 
 ```axon
 type alias Headers = {String: String}        // transparent alias
@@ -1138,7 +1138,7 @@ One declaration gives you:
    JSON-Schema function definition to the model.
 5. **Docs** — field doc comments become the descriptions models see, improving extraction.
 
-### 17..1 Schema evolution & migration
+### 17.1 Schema evolution & migration
 
 Long-lived agents and stored memories must not break when a schema changes. Versioned
 migrations are part of the type:
@@ -1157,7 +1157,7 @@ schema Profile @version(3) {
 `Profile.parse` transparently upgrades older payloads through the migration chain.
 `axon schema migrate` ([§36](#36-the-axon-cli-reference)) runs migrations over a store.
 
-### 17..2 Field attributes (selection)
+### 17.2 Field attributes (selection)
 
 | Attribute | Meaning |
 |---|---|
@@ -1175,7 +1175,7 @@ schema Profile @version(3) {
 
 ## 18. Traits & generics
 
-### 18..1 Generics
+### 18.1 Generics
 
 ```axon
 fn first<T>(xs: [T]) -> T? { if xs.is_empty() { nil } else { xs[0] } }
@@ -1183,7 +1183,7 @@ type Cache<K, V> { inner: {K: V} }
 impl<K, V> Cache<K, V> { fn get(self, k: K) -> V? { self.inner.get(k) } }
 ```
 
-### 18..2 Traits (interfaces / type classes)
+### 18.2 Traits (interfaces / type classes)
 
 ```axon
 trait Serialize { fn to_json(self) -> Json }
@@ -1213,7 +1213,7 @@ Traits support associated types, generic methods, and conditional impls
 `Display`, `Iterator`, `From<T>/Into<T>` are stdlib traits the compiler desugars
 operators and conversions to.
 
-### 18..3 Effect polymorphism
+### 18.3 Effect polymorphism
 
 Higher-order functions are polymorphic over **effect-row variables**, so one definition
 is effect-correct for pure and effectful callbacks alike (see
@@ -1234,7 +1234,7 @@ Axon has **no exceptions for ordinary failures**. Recoverable failure is a value
 (`Result`); unrecoverable failure is a `panic` that unwinds and can be `recover`ed at
 supervision boundaries.
 
-### 19..1 `Result`, `Option`, `?`
+### 19.1 `Result`, `Option`, `?`
 
 ```axon
 fn read_config(path: String) -> Result<Config, ConfigError> uses { Fs } {
@@ -1251,7 +1251,7 @@ fn read_config(path: String) -> Result<Config, ConfigError> uses { Fs } {
 * `expr ?? default` — null-coalescing. `expr!` — assert-unwrap (panics; linted outside
   tests/`main`).
 
-### 19..2 Typed error enums
+### 19.2 Typed error enums
 
 ```axon
 type ApiError =
@@ -1262,7 +1262,7 @@ type ApiError =
     | Decode(ValidationError)
 ```
 
-### 19..3 `try` / `recover` / context
+### 19.3 `try` / `recover` / context
 
 ```axon
 fn risky() -> Int {
@@ -1288,14 +1288,14 @@ This is the spine of the language and the mechanism behind **P2, P3, P5, P7**. E
 function has an **effect row** describing what it may do to the world. The compiler
 infers and checks effects exactly as it infers and checks types.
 
-### 20..1 Why
+### 20.1 Why
 
 In ordinary languages you cannot tell from a signature whether a function calls an LLM,
 spends money, touches the network, reads a file, or invokes a tool. In Axon you always
 can, the compiler enforces it, and the runtime uses the row for sandboxing, budgeting,
 tracing, and replay.
 
-### 20..2 Declaring effects
+### 20.2 Declaring effects
 
 ```axon
 fn add(a: Int, b: Int) -> Int { a + b }                  // pure: empty row
@@ -1310,7 +1310,7 @@ functions must annotate it (interface stability). This is why many small example
 document omit `uses {}` — they are local/private and the row is inferred — while public
 APIs and agent handlers state it explicitly.
 
-### 20..3 Built-in effects
+### 20.3 Built-in effects
 
 | Effect | Granted capability | Runtime consequence |
 |---|---|---|
@@ -1341,7 +1341,7 @@ fn transfer(from: Acct, to: Acct, amt: Money) uses { Audit, Memory } {
 }
 ```
 
-### 20..4 Effect rows, inference & subsumption
+### 20.4 Effect rows, inference & subsumption
 
 * Rows are sets; order is irrelevant; duplicates collapse.
 * Calling `g` from `f` requires `effects(g) ⊆ effects(f)` (or `f` opens a handler for the
@@ -1356,7 +1356,7 @@ fn pipeline<e>(stages: [(In) -> Out uses e], x: In) -> Out uses e {
 }
 ```
 
-### 20..5 Budgets ride the effect row (P3)
+### 20.5 Budgets ride the effect row (P3)
 
 The `LLM`, `Net`, and `Tool` effects carry an ambient **budget** that composes down the
 call tree. Budgets are hierarchical: an inner `with budget` cannot exceed its parent.
@@ -1379,7 +1379,7 @@ with budget(usd = 25.00 / 1h, scope = Global) on_exceeded |b| {
 
 `axon prof --cost` shows per-call-site spend.
 
-### 20..6 The `unsafe` escape hatch (P10)
+### 20.6 The `unsafe` escape hatch (P10)
 
 `unsafe { ... }` admits FFI, raw pointers, and effect erasure. It is greppable,
 lint-flagged, and requires a `// SAFETY:` comment that the linter enforces.
@@ -1392,7 +1392,7 @@ Axon's concurrency model is **structured-by-default async with an actor substrat
 Agents ([§22](#22-agents--the-core-abstraction)) are a specialization of actors with
 model/tool/memory affordances; plain `actor`s are available for non-AI concurrency.
 
-### 21..1 Tasks & structured concurrency
+### 21.1 Tasks & structured concurrency
 
 ```axon
 fn gather() -> [Page] uses { Net, Spawn, Async } {
@@ -1413,7 +1413,7 @@ let some  = await all_settled([t1, t2, t3])    // [Result<…>]; never fails
 Cancellation is cooperative and propagates down the scope tree; `defer` blocks still run
 on cancel.
 
-### 21..2 Channels
+### 21.2 Channels
 
 ```axon
 let ch = chan<Int>(cap = 32)                   // bounded (backpressure)
@@ -1426,7 +1426,7 @@ let rendezvous = chan<()>(cap = 0)             // synchronous handoff
 
 `select` (§14) multiplexes channel sends/receives, timeouts, and task completion.
 
-### 21..3 Actors
+### 21.3 Actors
 
 An actor is an isolated unit of state with a mailbox, processing one message at a time
 (no data races by construction). Actor references are typed by their **protocol** (the
@@ -1457,7 +1457,7 @@ An **agent** is the keystone of Axon (**P1**). It is an actor that additionally 
 structured access to models, tools, and memory, plus a planning/turn loop, built-in
 observability, replay, and supervision.
 
-### 22..1 Anatomy
+### 22.1 Anatomy
 
 ```axon
 agent ResearchAgent(
@@ -1518,7 +1518,7 @@ schema Report {
 }
 ```
 
-### 22..2 The `plan` block — the agentic loop as a language construct
+### 22.2 The `plan` block — the agentic loop as a language construct
 
 `plan with model { ... } await` is to agents what `for` is to iteration. It runs the
 **think → act → observe** loop:
@@ -1536,7 +1536,7 @@ the token counting, or the trace emission. They are the *semantics* of `plan`. C
 with `ask` (single turn) and `generate` (single turn, structured) in
 [§26](#26-structured-generation-ask-vs-generate-vs-plan).
 
-### 22..3 Spawning, addressing, supervising, registry
+### 22.3 Spawning, addressing, supervising, registry
 
 ```axon
 let a = spawn ResearchAgent(model = brain, tools = tk, mem = longterm)
@@ -1557,7 +1557,7 @@ let one  = pool.any.Research(t) await           // load-balanced
 Agents spawned under a `supervisor` ([§29.7](#297-supervisors)) are restarted per policy;
 durable state and memory survive; in-flight `@idempotent` messages are retried.
 
-### 22..4 Agent composition (multi-agent)
+### 22.4 Agent composition (multi-agent)
 
 Agents call other agents simply by holding their address — the same `await` syntax. This
 expresses planner/worker, debate, and hierarchical-team patterns without a framework:
@@ -1574,7 +1574,7 @@ agent Orchestrator(planner: Agent<PlannerAgent>, workers: [Agent<WorkerAgent>]) 
 }
 ```
 
-### 22..5 Identity & introspection
+### 22.5 Identity & introspection
 
 Every agent has `self.id` (stable ULID), `self.spawned_at`, `self.parent`, `self.trace`
 (current span), and `self.budget.spent` — first-class values queryable for routing,
@@ -1589,7 +1589,7 @@ trait; vendors are **drivers** behind it (**P2**). In code you bind models by **
 name** (resolved from `axon.toml [models]`); switching providers is a manifest change and
 a redeploy, never a call-site change.
 
-### 23..1 Declaring models
+### 23.1 Declaring models
 
 ```axon
 model brain = anthropic("claude-opus-4") {
@@ -1620,7 +1620,7 @@ trait Driver {
 The compiler rejects code using a capability the bound model lacks (e.g. `vision` on a
 text-only model), checked against `capabilities()`.
 
-### 23..2 Calling a model: `ask`
+### 23.2 Calling a model: `ask`
 
 `ask` is a single-turn call; the block is a structured prompt
 ([§24](#24-prompts)).
@@ -1639,7 +1639,7 @@ value if an `output:` schema is given (then it is exactly `generate`,
 [§26](#26-structured-generation-ask-vs-generate-vs-plan)). Every `ask` is one `LLM`
 effect, automatically traced and cost-accounted.
 
-### 23..3 Model combinators — fallback, ensemble, cascade, route
+### 23.3 Model combinators — fallback, ensemble, cascade, route
 
 These production patterns are stdlib combinators returning `Model`, so they slot in
 anywhere a model is expected (and a logical name in `axon.toml` can be bound to one):
@@ -1664,7 +1664,7 @@ driver or combinator ([§32](#32-determinism-record--replay)).
 Prompts are a first-class data type, not strings glued together. A `prompt` literal is
 type-checked, composable, lintable, and versionable.
 
-### 24..1 Literals & blocks
+### 24.1 Literals & blocks
 
 ```axon
 let p: Prompt = prompt"""
@@ -1693,7 +1693,7 @@ let request = {
 * `+` — composition with provenance retained.
 * `@version("v3")` and A/B variants for prompt experiments (`axon test --eval`, §39).
 
-### 24..2 Prompt safety
+### 24.2 Prompt safety
 
 The compiler distinguishes **trusted** fragments (literals, your code) from **tainted**
 fragments (`Tainted<T>`: tool output, user input, recalled memory). Tainted text is
@@ -1709,7 +1709,7 @@ ask brain {
 }
 ```
 
-### 24..3 Prompt registry
+### 24.3 Prompt registry
 
 `axon pkg` can publish prompts as versioned, reviewable package assets so prompt changes
 go through the same review/CI as code, with eval gates ([§39.4](#394-evals-quality-gates)).
@@ -1723,7 +1723,7 @@ encode **P5**: there is **no ambient authority** — code cannot reach the netwo
 shell, or any external system unless it was *handed a capability for it* and the
 corresponding effect is in its row.
 
-### 25..1 Declaring a tool
+### 25.1 Declaring a tool
 
 ```axon
 /// Search the web. Returns ranked results.
@@ -1740,7 +1740,7 @@ Because I/O are typed (and schemas), Axon auto-generates the model-facing functi
 definition (name, JSON-Schema parameters, description from the doc comment). You never
 hand-write a tool JSON spec.
 
-### 25..2 Capabilities are values, granted explicitly, attenuable
+### 25.2 Capabilities are values, granted explicitly, attenuable
 
 A `tool` value is a capability token. An agent only has the tools passed to its
 constructor; there is no global registry it can pull from.
@@ -1770,7 +1770,7 @@ This is *capability attenuation* and it composes with `policy` blocks
 ([§30](#30-guardrails-policies--safety)): capabilities are compile-time least privilege;
 policies are runtime-enforced guardrails. Both apply.
 
-### 25..3 Built-in tool catalog (`std.tool`)
+### 25.3 Built-in tool catalog (`std.tool`)
 
 ```axon
 web.search(q, k=10)  web.fetch(url)  web.post(url, body)  web.scrape(url, sel)
@@ -1784,7 +1784,7 @@ image.generate(prompt)  image.analyze(bytes)  image.edit(bytes, instruction)
 Each is a capability gated by both the manifest `[effects]` policy and any agent `policy`
 block; declaring is necessary but not sufficient — the policy must also grant it.
 
-### 25..4 Invocation paths
+### 25.4 Invocation paths
 
 1. **Direct call** — an ordinary typed function call: `let r = web_search("axon") await`.
 2. **By a model inside `ask`/`plan`** — listed in `tools:`; the runtime mediates:
@@ -1792,7 +1792,7 @@ block; declaring is necessary but not sufficient — the policy must also grant 
    result validation → trace span → budget debit → observation fed back. Tool failures
    are `Result`, never silent; the model loop observes and adapts.
 
-### 25..5 MCP & external tool servers
+### 25.5 MCP & external tool servers
 
 Declaring an MCP server in `axon.toml` makes its tools first-class and fully typed
 (schemas imported and checked at build):
@@ -1806,7 +1806,7 @@ allow = ["search_issues", "create_issue"]   # explicit allowlist
 Axon can also *expose* its own tools as an MCP server: `axon serve --protocol mcp`
 ([§35](#35-interop--ffi)).
 
-### 25..6 Human-in-the-loop tools
+### 25.6 Human-in-the-loop tools
 
 ```axon
 tool wire_transfer(to: Iban, amount: Money) -> Receipt
@@ -1835,7 +1835,7 @@ let p: Person = generate<Person>(brain, prompt"""
 // p is statically Person AND validated. No JSON. No try/except.
 ```
 
-### 26..1 How the guarantee is enforced (defense in depth)
+### 26.1 How the guarantee is enforced (defense in depth)
 
 1. **Constrained decoding.** If the driver supports JSON-mode / grammar / tool-schema
    constraints, `generate` compiles `S` to that constraint so the model can only emit a
@@ -1852,7 +1852,7 @@ let r: Result<Person, ValidationError> =
     try_generate<Person>(brain, prompt, repairs = 3, on_repair = log_attempt) await
 ```
 
-### 26..2 Collections, unions, nested, streaming
+### 26.2 Collections, unions, nested, streaming
 
 ```axon
 let people: [Person] = generate<[Person]>(brain, "List the cast of …") await
@@ -1863,7 +1863,7 @@ for await person in generate_stream<[Person]>(brain, prompt) {     // partial-JS
 enum Decision = Approve(reason: String) | Reject(reason: String) | NeedInfo(q: String)
 ```
 
-### 26..3 The trichotomy
+### 26.3 The trichotomy
 
 | Construct | Turns | Tools | Output | Use for |
 |---|---|---|---|---|
@@ -1880,7 +1880,7 @@ enum Decision = Approve(reason: String) | Reject(reason: String) | NeedInfo(q: S
 Agents need memory that outlives a turn or process. Axon makes memory a typed, pluggable
 construct with three tiers behind the `Memory` trait and the `Memory` effect.
 
-### 27..1 The three tiers
+### 27.1 The three tiers
 
 ```axon
 // 1. Working memory — in-actor, this turn / this run (just `state`)
@@ -1900,7 +1900,7 @@ memory kb = vector_store(
 Built-in stores: `in_memory`, `sqlite`, `redis`, `pgvector`, `qdrant`, `chroma`, `s3`
 (cold), plus the `Store` trait for custom backends.
 
-### 27..2 The `Memory` API
+### 27.2 The `Memory` API
 
 ```axon
 kb.remember(key = topic, value = text, meta = { source: url, ts: now() }) await
@@ -1915,7 +1915,7 @@ let snap = kb.snapshot() await                         // point-in-time (replay/
 auto-fenced when injected into prompts ([§24.2](#242-prompt-safety),
 [§42](#42-security--sandboxing-model)).
 
-### 27..3 Memory in the prompt
+### 27.3 Memory in the prompt
 
 Memory plugs directly into the structured prompt; the runtime handles role-tagging,
 ordering, and **token-budget-aware truncation/summarization** automatically:
@@ -1941,7 +1941,7 @@ agent A {
 }
 ```
 
-### 27..4 Durable & transactional state
+### 27.4 Durable & transactional state
 
 `@durable state` is write-through to a store and crash-consistent — a restarted agent
 resumes with state intact (works with supervision §29.7 and replay §32):
@@ -1953,7 +1953,7 @@ agent Cart {
 }
 ```
 
-### 27..5 Consolidation & memory policy
+### 27.5 Consolidation & memory policy
 
 A scheduled handler can distil old episodes into durable semantic knowledge; a
 `mempolicy` declares retention/preservation/compression rules the runtime enforces,
@@ -1975,7 +1975,7 @@ mempolicy ResearchMemory {
 Streaming is the **default shape** of model and tool output (**P6**). `Stream<T>` is a
 first-class, backpressured async sequence.
 
-### 28..1 Consuming
+### 28.1 Consuming
 
 ```axon
 let tokens: Stream<Token> = ask brain { user: "Write a haiku about latency." }
@@ -1990,7 +1990,7 @@ let words = tokens
 let full: String = tokens.collect() await       // opt-in materialization
 ```
 
-### 28..2 Producing
+### 28.2 Producing
 
 ```axon
 fn ticker(every: Duration) -> Stream<Int> uses { Clock } {
@@ -1998,7 +1998,7 @@ fn ticker(every: Duration) -> Stream<Int> uses { Clock } {
 }
 ```
 
-### 28..3 Through agents & tools
+### 28.3 Through agents & tools
 
 An agent handler may return `Stream<T>`; callers `for await` over it. `plan` can stream
 intermediate reasoning/tool-trace as a `Stream<Step>` while still returning the final
@@ -2019,7 +2019,7 @@ on Chat(q: Tainted<String>) -> Stream<Token> uses { LLM } {
 Single agents compose into systems. All constructs below are typed, supervised, traced,
 and budgeted as one logical unit (**P9**).
 
-### 29..1 Pipelines
+### 29.1 Pipelines
 
 ```axon
 fn handle(t: Ticket) -> Resolution {
@@ -2027,7 +2027,7 @@ fn handle(t: Ticket) -> Resolution {
 }
 ```
 
-### 29..2 Agent networks & topology
+### 29.2 Agent networks & topology
 
 A `network` declares agents and the legal communication edges; the compiler uses the
 topology for cycle/deadlock/starvation analysis and rejects messages that violate it.
@@ -2051,7 +2051,7 @@ network ResearchTeam {
 }
 ```
 
-### 29..3 Typed message passing
+### 29.3 Typed message passing
 
 ```axon
 type AgentMsg =
@@ -2061,7 +2061,7 @@ type AgentMsg =
     | Ack(message_id: MessageId)
 ```
 
-### 29..4 The `orchestrate` block
+### 29.4 The `orchestrate` block
 
 ```axon
 orchestrate SupportFlow(ticket: Ticket) -> Outcome uses { LLM, Spawn } {
@@ -2084,7 +2084,7 @@ One shared budget/deadline, one root trace span with the whole graph as children
 automatic cancellation of the entire graph on budget/deadline breach, structured error
 propagation.
 
-### 29..5 Consensus & voting
+### 29.5 Consensus & voting
 
 ```axon
 orchestrate Panel(p: Proposal) -> Decision uses { LLM, Spawn } {
@@ -2100,7 +2100,7 @@ orchestrate Panel(p: Proposal) -> Decision uses { LLM, Spawn } {
 }
 ```
 
-### 29..6 `graph` workflows (explicit, inspectable DAGs)
+### 29.6 `graph` workflows (explicit, inspectable DAGs)
 
 For deterministic pipelines, declare a typed DAG/state-machine of steps. The graph is
 data: visualizable (`axon trace --graph`), testable, and replayable.
@@ -2125,7 +2125,7 @@ graph TriageFlow(input: Ticket) -> Resolution {
 Nodes run as concurrently as the edges allow; the engine handles scheduling, per-node
 retry/timeout, partial-failure policy, and emits a span per node.
 
-### 29..7 Supervisors
+### 29.7 Supervisors
 
 ```axon
 supervisor SupportSystem {
@@ -2148,7 +2148,7 @@ Restart semantics: `Permanent` (always), `Transient` (only on abnormal exit),
 `Temporary` (never). Durable state & memory survive restarts; in-flight `@idempotent`
 messages are retried.
 
-### 29..8 `flow` combinators
+### 29.8 `flow` combinators
 
 For procedural orchestration, `std.flow` offers typed, traced combinators:
 `sequence`, `parallel`, `race`, `retry`, `fallback`, `circuit_breaker`, `map_reduce`,
@@ -2164,7 +2164,7 @@ let answer = flow.reflect(
 ) await
 ```
 
-### 29..9 The `human` agent
+### 29.9 The `human` agent
 
 `human` is a built-in pseudo-agent: messaging it suspends the orchestration, emits an
 approval request to a configured channel (Slack/email/web/CLI), durably checkpoints
@@ -2218,7 +2218,7 @@ policy support {
 agent Resolver(model: Model, mem: Memory, tools: {…}) { policy: support /* … */ }
 ```
 
-### 30..1 How enforcement works
+### 30.1 How enforcement works
 
 The runtime wraps every `LLM`/`Tool`/`Net`/`Fs`/`Memory` effect of a policy-bound agent:
 **capability check** (grant + `when` clause; deny → typed `PolicyDenied`, audited) →
@@ -2228,7 +2228,7 @@ effect executes → **output guards** (rewrite/replace via `on_block`). Because 
 in the runtime, an author cannot forget a guardrail and a prompt-injected model output
 cannot talk the program into skipping one.
 
-### 30..2 `std.guard` (imperative use)
+### 30.2 `std.guard` (imperative use)
 
 The same checks are callable directly for fine-grained control:
 
@@ -2243,7 +2243,7 @@ let clean  = guard.redact_pii(text, kinds = [email, card])
 configurable injection heuristics, usable as `assert_*` checks or automatic post-filters
 on `plan`.
 
-### 30..3 Custom guards & policy testing
+### 30.3 Custom guards & policy testing
 
 ```axon
 guard fn no_competitor_mentions(text: String) -> GuardResult {
@@ -2266,7 +2266,7 @@ test "refund over limit is denied" {
 **P7: you cannot write an un-traced agent by accident.** The runtime emits structured
 telemetry for every effectful operation with zero instrumentation in user code.
 
-### 31..1 Automatically emitted
+### 31.1 Automatically emitted
 
 * A **span** per agent message, `ask`/`generate`/`plan`, tool call, and graph node — with
   parent/child links forming a full trace.
@@ -2291,7 +2291,7 @@ SupportFlow  60s budget · $1.00                              1.92s  $0.014
 └─ agent.QA.review                              sonnet-4     0.21s  $0.001  in 240/out 15
 ```
 
-### 31..2 Viewing & custom spans
+### 31.2 Viewing & custom spans
 
 ```sh
 axon trace last                       # open the most recent run
@@ -2310,7 +2310,7 @@ fn enrich(id: String) -> Profile uses { Net, Trace } {
 }
 ```
 
-### 31..3 Evaluations
+### 31.3 Evaluations
 
 Agents need behavioural tests. An eval suite scores behaviour over a dataset with
 graders, and **fails CI on regression** beyond tolerance vs. a baseline:
@@ -2337,7 +2337,7 @@ Agents are non-deterministic (models, tools, time, randomness). Axon makes any r
 **recordable and bit-exactly replayable** (**P8**) — what makes agents debuggable and
 testable like ordinary programs.
 
-### 32..1 Recording
+### 32.1 Recording
 
 Every effectful interaction (`LLM`, `Net`, `Tool`, `Clock`, `Rand`, `Memory` reads) is
 captured into a **session journal** (`.axj`) with content hashes, latency, tokens, cost.
@@ -2350,7 +2350,7 @@ axon run agent.ax --record runs/triage-2026-01-10.axj
 with recording("runs/session.axj") { let r = orchestrator.Solve(task) await }
 ```
 
-### 32..2 Replaying & `--patch`
+### 32.2 Replaying & `--patch`
 
 ```sh
 axon replay runs/triage-2026-01-10.axj             # exact re-execution, no model calls
@@ -2364,7 +2364,7 @@ and confirm the fix against the exact production scenario without spending a tok
 code paths that diverge from the recording raise a `ReplayDivergence` pinpointing where
 behaviour changed.
 
-### 32..3 Matchers & redaction
+### 32.3 Matchers & redaction
 
 ```toml
 [replay]
@@ -2378,7 +2378,7 @@ edits don't invalidate journals; a meaningful change misses and you re-record
 intentionally (and review the diff). `Secret<T>` values are recorded as
 `‹redacted:sha8›` and never written.
 
-### 32..4 Time-travel debugging
+### 32.4 Time-travel debugging
 
 ```sh
 axon trace runs/session.axj          # interactive timeline
@@ -2397,7 +2397,7 @@ virtualized and frozen under replay so logic branching on them is reproducible.
 `std` is batteries-included and **effect-annotated throughout**. Browse the full API with
 `axon doc std`.
 
-### 33..1 Core & data
+### 33.1 Core & data
 
 | Module | Contents |
 |---|---|
@@ -2410,7 +2410,7 @@ virtualized and frozen under replay so logic branching on them is reproducible.
 | `std.json`/`toml`/`yaml`/`csv` | parse/emit; integrate with `schema` validation |
 | `std.encoding` | base64, hex, url, msgpack, protobuf, gzip/zstd |
 
-### 33..2 IO & systems (all effect-typed)
+### 33.2 IO & systems (all effect-typed)
 
 | Module | Effect | Contents |
 |---|---|---|
@@ -2422,7 +2422,7 @@ virtualized and frozen under replay so logic branching on them is reproducible.
 | `std.env` | `Env` | environment, typed redaction-aware secrets |
 | `std.crypto` | — | sha256/512/blake3, hmac, AES-GCM, Ed25519, secure random |
 
-### 33..3 Agent-domain stdlib (the differentiators)
+### 33.3 Agent-domain stdlib (the differentiators)
 
 | Module | Contents |
 |---|---|
@@ -2439,7 +2439,7 @@ virtualized and frozen under replay so logic branching on them is reproducible.
 | `std.schema` | runtime reflection, JSON-Schema/OpenAPI emission, migration runner |
 | `std.server` | expose agents as REST/gRPC/MCP/OpenAI-compatible endpoints |
 
-### 33..4 A production-shaped support agent (end to end)
+### 33.4 A production-shaped support agent (end to end)
 
 ```axon
 use std.{ io, http, agent, memory, model, tool, flow, guard }
@@ -2496,7 +2496,7 @@ fn main() uses { Spawn, Net, Console } {
 
 ## 34. Modules, packages & visibility
 
-### 34..1 Modules & visibility
+### 34.1 Modules & visibility
 
 A file is a module; a directory with `mod.ax` is a module with submodules. Items are
 **private to their package by default**; `pub` exports; `pub(pkg)` is package-scoped.
@@ -2512,7 +2512,7 @@ fn internal_helper() { }                       // not exported
 pub use billing.writer.Writer                  // re-export
 ```
 
-### 34..2 Packages, manifest & lockfile
+### 34.2 Packages, manifest & lockfile
 
 `axon.toml` (authored) + `axon.lock` (generated, committed) → reproducible builds.
 Resolution is a SAT solver over semver ranges; the lockfile pins exact versions and
@@ -2524,7 +2524,7 @@ git/path/oci deps supported). Workspaces:
 members = ["agents/*", "libs/*", "tools/eval"]
 ```
 
-### 34..3 Capability-aware dependencies
+### 34.3 Capability-aware dependencies
 
 Unique to Axon: a package's **effects are published metadata**. `axon pkg audit` fails
 the build when a transitive dependency requests effects beyond your manifest policy:
@@ -2559,7 +2559,7 @@ and signature-verified; `axon pkg vendor` enables hermetic offline builds.
 
 Axon must coexist with the existing ecosystem (**P10**).
 
-### 35..1 Calling C / native libraries
+### 35.1 Calling C / native libraries
 
 ```axon
 extern "C" {
@@ -2576,7 +2576,7 @@ fn dot(a: [Float], b: [Float]) -> Float uses { Unsafe } {
 
 FFI requires the `Unsafe` effect, keeping the unsafe surface greppable and effect-tracked.
 
-### 35..2 Embedding Python / Node / WASM tools
+### 35.2 Embedding Python / Node / WASM tools
 
 ```axon
 tool sentiment(text: String) -> Float
@@ -2589,7 +2589,7 @@ and the Axon side gets a validated `Float` (or a typed error). Bridges exist for
 `python`, `node`, `wasm`, and `grpc`, and run out-of-process under the same capability
 sandbox as any tool.
 
-### 35..3 Exposing Axon to other languages
+### 35.3 Exposing Axon to other languages
 
 ```sh
 axon build --target wasm --export-abi      # use Axon agents from JS/Python/Go hosts
@@ -2604,7 +2604,7 @@ mcp` turns a package's tools/agents into a Model Context Protocol server — so 
 are consumable by existing ecosystems without rewrites. The embedded AxVM (tracing,
 policy, replay) travels with every binding, so guardrails hold no matter who calls in.
 
-### 35..4 Embedding the AxVM
+### 35.4 Embedding the AxVM
 
 ```c
 #include <axvm.h>
@@ -2681,7 +2681,7 @@ GLOBAL FLAGS
   -v, --verbose      increase log verbosity
 ```
 
-### 36..1 The REPL
+### 36.1 The REPL
 
 ```text
 $ axon repl
@@ -2703,7 +2703,7 @@ axon› :record demo.axj   # record subsequent calls
 Axon compiles to **AxVM bytecode** (`.axb`) running on a tiered runtime, or to a native
 binary / WASM / OCI image via AOT.
 
-### 37..1 Compilation pipeline
+### 37.1 Compilation pipeline
 
 ```
 .ax source
@@ -2721,7 +2721,7 @@ The type/effect inference pass produces, per function, a
 `(signature, effect_row, budget_class)` triple consumed downstream by the sandbox,
 scheduler, tracer, and replay engine.
 
-### 37..2 The runtime
+### 37.2 The runtime
 
 * **Scheduler.** M:N work-stealing async; agents/actors are lightweight green tasks
   (a few KB each); millions per process. Model/tool calls are non-blocking; blocking FFI
@@ -2740,7 +2740,7 @@ scheduler, tracer, and replay engine.
 * **JIT/AOT.** Hot bytecode is JIT-compiled (baseline → optimizing); AOT skips the VM for
   cold-start-sensitive serverless.
 
-### 37..3 Execution targets
+### 37.3 Execution targets
 
 | Target | Command | Use case |
 |---|---|---|
@@ -2749,14 +2749,14 @@ scheduler, tracer, and replay engine.
 | WASM/WASI | `axon build --target wasm` | edge, browsers, sandboxed plugins |
 | OCI image | `axon build --target oci` | minimal distroless image (effect policy embedded) |
 
-### 37..4 Hot reload & graceful shutdown
+### 37.4 Hot reload & graceful shutdown
 
 `axon run --watch` hot-swaps changed handlers/prompts without dropping agent state or
 in-flight requests. On `SIGTERM` the VM stops accepting work, drains in-flight handlers
 within a grace period, runs every agent's `on stop`, flushes durable state and traces,
 then exits — making rolling deploys safe.
 
-### 37..5 Performance characteristics (design targets)
+### 37.5 Performance characteristics (design targets)
 
 > **Honesty note.** Axon is a language *specification* with a reference design. These are
 > **design targets** the reference implementation is engineered against and benchmarked
@@ -2772,7 +2772,7 @@ then exits — making rolling deploys safe.
 * GC pause target: < 1 ms p99 on a 4 GB actor heap.
 * Native cold start: < 20 ms.
 
-### 37..6 Scaling & clustering
+### 37.6 Scaling & clustering
 
 * **Vertical:** one process hosts millions of lightweight agents; the scheduler saturates
   all cores.
@@ -2787,7 +2787,7 @@ then exits — making rolling deploys safe.
 
 ## 38. Compiler internals, bootstrapping & conformance
 
-### 38..1 Repository layout
+### 38.1 Repository layout
 
 ```
 axon/
@@ -2803,20 +2803,20 @@ axon/
 └── bootstrap/    # stage0 (Rust) bootstrap compiler
 ```
 
-### 38..2 Bootstrapping
+### 38.2 Bootstrapping
 
 Stage0 (a Rust implementation) compiles Stage1 (the Axon compiler); Stage1 compiles
 Stage2 (the self-hosted compiler); Stage2 must reproduce itself bit-for-bit
 (`./bootstrap.sh --verify`). The standard library is written in Axon.
 
-### 38..3 Conformance
+### 38.3 Conformance
 
 `spec/conformance/` is an executable suite (thousands of `.ax` programs + expected
 output, type errors, and effect errors). Any implementation claiming "Axon 1.0" must pass
 it: `axon test --conformance`. The grammar, type rules, and effect rules are specified
 formally in `spec/`; changes require updating the spec in the same PR.
 
-### 38..4 Contributing
+### 38.4 Contributing
 
 * RFC process for language changes (`rfcs/` + design review; ≥2-week discussion;
   core-team accept/reject; accepted RFCs land with conformance tests).
@@ -2833,7 +2833,7 @@ Agents need two kinds of testing: ordinary deterministic tests, and **evals** (q
 over non-deterministic model behaviour). Both are first-class via `axon test`, which runs
 in **replay mode by default** (deterministic, fast, free in CI).
 
-### 39..1 Unit, property & snapshot
+### 39.1 Unit, property & snapshot
 
 ```axon
 test "area of a square" { assert area(Rect(2.0, 2.0)) == 4.0 }
@@ -2847,7 +2847,7 @@ test "report shape is stable" snapshot {
 }
 ```
 
-### 39..2 Testing agents with effect handlers (deterministic)
+### 39.2 Testing agents with effect handlers (deterministic)
 
 Because effects are explicit, **mocking is just installing a handler** — no DI framework,
 no monkey-patching. `model_mock`, `tool_stub`, `clock_freeze`, `rand_seed`, `mem_inmemory`
@@ -2865,7 +2865,7 @@ test "support agent escalates when unsure" {
 }
 ```
 
-### 39..3 Replay-based regression tests
+### 39.3 Replay-based regression tests
 
 Recorded production sessions become regression fixtures (§32):
 
@@ -2876,7 +2876,7 @@ test "regression: 2026-01-10 triage" replay("fixtures/triage-2026-01-10.axj") {
 }
 ```
 
-### 39..4 Evals (quality gates)
+### 39.4 Evals (quality gates)
 
 `axon test --eval` runs eval suites (§31.3) over a dataset, reports mean/percentile
 scores, **fails CI if a metric regresses** beyond tolerance vs. baseline, and writes a
@@ -2887,7 +2887,7 @@ quality gates, not vibes. Conformance (`axon test --conformance`) gates language
 
 ## 40. Configuration & secrets
 
-### 40..1 Typed, layered configuration
+### 40.1 Typed, layered configuration
 
 Config is layered: `axon.toml` < env (`AXON_*`) < `--flags` < runtime config service.
 Missing/invalid config fails at startup with a clear error — never at the first request.
@@ -2904,7 +2904,7 @@ fn main() -> Result<Unit, ConfigError> uses { Env } {
 }
 ```
 
-### 40..2 Secrets are a redaction-aware type
+### 40.2 Secrets are a redaction-aware type
 
 ```axon
 let key: Secret<String> = env.secret("OPENAI_API_KEY")
@@ -2917,7 +2917,7 @@ let raw = key.expose()                          // ⚠️ explicit; emits an aud
 `‹redacted:sha8›`). Provider keys live behind the logical-model abstraction and never
 reach agent code as plain strings.
 
-### 40..3 Runtime configuration (`axon.service.toml`)
+### 40.3 Runtime configuration (`axon.service.toml`)
 
 ```toml
 [runtime]   max_agents = 50000   scheduler_threads = 0   io_threads = 4
@@ -2945,7 +2945,7 @@ reach agent code as plain strings.
 
 Axon is designed to be operated, not just demoed.
 
-### 41..1 Build artifacts
+### 41.1 Build artifacts
 
 ```sh
 axon build --release                         # optimized .axb
@@ -2957,7 +2957,7 @@ A native build is a single self-contained executable (the VM is statically linke
 OCI target embeds the manifest's effect policy so the container's allowed egress and
 filesystem are derived from `axon.toml`.
 
-### 41..2 Running as a service
+### 41.2 Running as a service
 
 ```sh
 axon serve src/main.ax \
@@ -2969,7 +2969,7 @@ axon serve src/main.ax \
 `/healthz`, `/metrics`), OTLP export, per-agent supervision (§29.7), durable-state
 recovery on restart (§27.4), and replay journaling toggled by env.
 
-### 41..3 Docker (distroless)
+### 41.3 Docker (distroless)
 
 ```dockerfile
 FROM ghcr.io/axon-lang/axon:1.0 AS build
@@ -2986,7 +2986,7 @@ EXPOSE 8080
 ENTRYPOINT ["/app"]
 ```
 
-### 41..4 Kubernetes
+### 41.4 Kubernetes
 
 ```yaml
 apiVersion: apps/v1
@@ -3023,7 +3023,7 @@ spec:
     resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
 ```
 
-### 41..5 Serverless & edge
+### 41.5 Serverless & edge
 
 ```axon
 #[lambda]      async fn h(e: LambdaEvent) -> LambdaResponse { … }   // AWS Lambda
@@ -3037,7 +3037,7 @@ wrangler deploy agent.wasm        # Cloudflare
 fastly compute deploy --wasm agent.wasm
 ```
 
-### 41..6 Operability checklist (free from the runtime)
+### 41.6 Operability checklist (free from the runtime)
 
 | Concern | Mechanism |
 |---|---|
@@ -3050,7 +3050,7 @@ fastly compute deploy --wasm agent.wasm
 | Least privilege | manifest effect policy + capability attenuation (§42) |
 | Rollback | versioned prompts & schemas with migrations (§17.1, §24.3) |
 
-### 41..7 Rollout strategies (canary, shadow & A/B)
+### 41.7 Rollout strategies (canary, shadow & A/B)
 
 Agents, prompts, and models change behaviour without changing types, so they need
 behavioural rollout controls. These are declared, runtime-mediated, and tied to the eval
@@ -3081,7 +3081,7 @@ guaranteeing nothing else moved.
 Agents execute model-chosen actions; security is not optional. Axon's model is
 **capability-based, deny-by-default, defense-in-depth**, mostly compile-time enforced.
 
-### 42..1 Layers
+### 42.1 Layers
 
 1. **No ambient authority (compile time).** Zero access to network/disk/process/clock/
    randomness unless the effect is in the row *and* a capability/handler was supplied. An
@@ -3102,7 +3102,7 @@ Agents execute model-chosen actions; security is not optional. Axon's model is
 7. **Human-in-the-loop (run time).** `@approval` tools require an out-of-band decision
    with the continuation persisted across restarts (§25.6).
 
-### 42..2 Worked example — security as a type property
+### 42.2 Worked example — security as a type property
 
 ```axon
 // Structurally incapable of exfiltration:
@@ -3305,7 +3305,7 @@ You do not have to rewrite everything. Axon interops both ways
 ([§35](#35-interop--ffi)); migrate the part that hurts first — usually flaky tests,
 scattered guardrails, or cost blindness.
 
-### 45..1 From Python (LangChain / LlamaIndex / AutoGen)
+### 45.1 From Python (LangChain / LlamaIndex / AutoGen)
 
 | Python concept | Axon equivalent |
 |---|---|
@@ -3324,13 +3324,13 @@ Incremental path: keep Python orchestration and expose the risky agent from Axon
 Python tools from Axon via `extern python` ([§35.2](#352-embedding-python--node--wasm-tools))
 while the agent logic, guardrails, and tests move into Axon.
 
-### 45..2 From TypeScript / Node
+### 45.2 From TypeScript / Node
 
 Run Axon as a sidecar, compile to WASM and import it, or call the OpenAI-compatible
 endpoint (`axon serve --protocol openai`). Replace bespoke zod-validate-and-retry loops
 with `generate<S>`. Express handlers call the agent over the generated REST/MCP surface.
 
-### 45..3 From Go / Java
+### 45.3 From Go / Java
 
 Use the C ABI (`axon build --target cdylib`) to embed the AxVM, or run `axon serve
 --protocol grpc` and call it as a typed gRPC service. Supervisor trees map directly onto
@@ -3471,7 +3471,7 @@ default think→act→observe loop. Real agents need more: explicit reasoning bu
 *selectable* planning strategies, self-correction, replanning on failure, and the ability
 to get better over time. These are language/stdlib constructs, not patterns.
 
-### 49..1 Reasoning budgets & extended thinking
+### 49.1 Reasoning budgets & extended thinking
 
 Modern models expose a separate "thinking" channel whose tokens are billed and latency-
 bearing but not part of the answer. Axon makes that a first-class, *budgeted* resource
@@ -3498,7 +3498,7 @@ The trace and cost ledger report `tokens.thinking` separately from
 [§10.6](#106-taintedt--untrusted-data-as-a-type)) for UIs that show "thinking…", without
 it being usable as program logic.
 
-### 49..2 Selectable planning strategies
+### 49.2 Selectable planning strategies
 
 `plan` accepts a `strategy:` — the loop shape is a value, swappable without rewriting the
 agent. Built-in strategies in `std.flow`:
@@ -3526,7 +3526,7 @@ let answer = plan with brain {
 Each strategy still runs inside the same runtime: capability checks, budgets, tracing,
 and replay apply identically regardless of strategy.
 
-### 49..3 Reflection & self-correction
+### 49.3 Reflection & self-correction
 
 `std.flow.reflect`/`critique` wrap any generation in a bounded improve loop with a typed
 acceptance predicate:
@@ -3542,7 +3542,7 @@ let final = flow.reflect(
 ) await
 ```
 
-### 49..4 Replanning & failure recovery
+### 49.4 Replanning & failure recovery
 
 When a step fails (tool error, validation failure, budget pressure), a `plan` can replan
 rather than abort. `on_step_error` receives the typed error and returns a directive:
@@ -3562,7 +3562,7 @@ plan with brain {
 } await
 ```
 
-### 49..5 Feedback capture & learned few-shot
+### 49.5 Feedback capture & learned few-shot
 
 Production agents improve from outcomes. `std.eval.feedback` records typed signals
 (thumbs, corrections, downstream success) keyed to the trace; episodic memory can then
@@ -3579,7 +3579,7 @@ ask brain {
 }
 ```
 
-### 49..6 Eval-driven prompt & strategy optimization
+### 49.6 Eval-driven prompt & strategy optimization
 
 `axon optimize` searches over prompt variants and strategy parameters against an eval
 suite ([§31.3](#313-evaluations), [§39.4](#394-evals-quality-gates)) and proposes a
@@ -3601,7 +3601,7 @@ needs more: ingestion, chunking, hybrid retrieval, reranking, and **grounded, ci
 answers whose claims are checkable. Axon provides a typed `retriever` construct so the
 whole pipeline is one declarative, traced, testable unit.
 
-### 50..1 Ingestion pipeline
+### 50.1 Ingestion pipeline
 
 ```axon
 use std.rag
@@ -3622,7 +3622,7 @@ rag.ingest(index, sources = [
 Ingestion is incremental and content-hashed: unchanged chunks are skipped, deletions
 tombstoned, so reindex on redeploy is cheap and an index never silently goes stale.
 
-### 50..2 Hybrid retrieval & reranking
+### 50.2 Hybrid retrieval & reranking
 
 ```axon
 let retriever = rag.Retriever(index) {
@@ -3634,7 +3634,7 @@ let retriever = rag.Retriever(index) {
 let hits: [Passage] = retriever.retrieve(query, k = 6) await
 ```
 
-### 50..3 Grounded, cited generation
+### 50.3 Grounded, cited generation
 
 ```axon
 schema Grounded { answer: String, citations: [Citation] @min_len(1) }
@@ -3657,7 +3657,7 @@ anti-hallucination control the runtime applies, not a prompt the model may ignor
 RAG retrievals are `Tainted<Passage>` and auto-fenced in prompts
 ([§24.2](#242-prompt-safety)).
 
-### 50..4 Evaluating retrieval
+### 50.4 Evaluating retrieval
 
 `std.eval` includes retrieval metrics — recall@k, MRR, nDCG, context precision, and
 answer-faithfulness/groundedness — wired into the same eval gates
@@ -3672,7 +3672,7 @@ Agents increasingly perceive and produce more than text. Axon treats media as ty
 first-class values that flow through prompts, tools, memory, and schemas with the same
 guarantees as text (validation, taint-tracking, tracing, replay).
 
-### 51..1 Media types
+### 51.1 Media types
 
 ```axon
 Image      // decoded raster + metadata (dims, mime, exif-stripped by default)
@@ -3691,7 +3691,7 @@ Media in transit from outside is `Tainted<Image>` etc.; size/decoder limits and 
 sniffing are enforced by the runtime (a malformed image cannot become a decoder exploit
 within the sandbox, [§42](#42-security--sandboxing-model)).
 
-### 51..2 Multimodal prompts & generation
+### 51.2 Multimodal prompts & generation
 
 ```axon
 let finding: Finding = generate<Finding>(brain, {
@@ -3708,7 +3708,7 @@ The compiler checks the bound model's `capabilities()`
 ([§23.1](#231-declaring-models)) — using `Image` input on a text-only model is a compile
 error, not a runtime surprise.
 
-### 51..3 Multimodal tools & memory
+### 51.3 Multimodal tools & memory
 
 Built-in tools (`std.tool`): `image.analyze`, `image.generate`, `image.edit`,
 `audio.transcribe`, `audio.synthesize`, `doc.parse`, `doc.ocr`, `video.keyframes`. They
@@ -3729,7 +3729,7 @@ Many production agents are not request/response — they wake on a schedule or a
 run for hours or days, and must survive restarts mid-task. Axon makes triggers and
 durable time first-class so a multi-day agent is ordinary, checkpointed code.
 
-### 52..1 Triggers
+### 52.1 Triggers
 
 ```axon
 agent Digest(model: Model, mem: Memory) {
@@ -3744,7 +3744,7 @@ agent Digest(model: Model, mem: Memory) {
 webhook router (signature-verified), and consumers for Kafka/NATS/SQS/PubSub via the
 `std.bus` interface. Each trigger invocation is a root trace span and replayable.
 
-### 52..2 Durable timers & sleep-across-restarts
+### 52.2 Durable timers & sleep-across-restarts
 
 ```axon
 agent Onboarding {
@@ -3767,7 +3767,7 @@ suspended, its durable state persisted, and it is resurrected on the right node 
 timer fires — even after a deploy. This makes long-running "workflow" agents reliable
 without an external orchestrator.
 
-### 52..3 Sagas & compensation
+### 52.3 Sagas & compensation
 
 Long multi-step side-effecting tasks declare compensations so partial failure unwinds
 cleanly:
@@ -3837,7 +3837,7 @@ reproducible and supply-chain-auditable.
 also need agents to find and call agents across processes, teams, or organizations,
 **acting on behalf of a specific user with scoped authority**.
 
-### 54..1 Agent cards & discovery
+### 54.1 Agent cards & discovery
 
 Every served agent publishes a typed **agent card** (capabilities, message protocol,
 auth, cost hints) derived from its declaration — no separate IDL:
@@ -3858,7 +3858,7 @@ Remote calls are ordinary typed `await`s; the runtime negotiates the protocol ag
 card at connect time and **rejects a mismatch at the boundary** rather than failing
 mid-conversation. Cross-org responses arrive as `Tainted<T>`.
 
-### 54..2 Delegated identity & scoped credentials
+### 54.2 Delegated identity & scoped credentials
 
 An agent often must act *as a user* with *only* that user's authority. Axon models this
 as a first-class, attenuable principal — not an ambient API key.
@@ -3887,7 +3887,7 @@ not tell you whether an agent *behaved well*: did it pick the right tools, avoid
 needless steps, recover from errors, and stay safe under attack? Axon evaluates the
 **trajectory**, not just the output.
 
-### 55..1 Trajectory metrics
+### 55.1 Trajectory metrics
 
 Because every run is a typed, recorded trace ([§32](#32-determinism-record--replay)),
 eval suites can assert over the steps:
@@ -3906,7 +3906,7 @@ eval "research agent behaves well" {
 }
 ```
 
-### 55..2 Red-teaming & adversarial suites
+### 55.2 Red-teaming & adversarial suites
 
 `std.eval.redteam` ships curated and generated adversarial datasets — prompt injection,
 jailbreaks, tool-abuse coaxing, data-exfiltration attempts, PII traps — run as gated
@@ -3923,7 +3923,7 @@ eval "injection resistance" redteam("std:injection@v3") {
 }
 ```
 
-### 55..3 Environment simulation
+### 55.3 Environment simulation
 
 Test multi-step and multi-agent behaviour deterministically against a mock world: a
 simulated clock, stubbed tools with scripted/dynamic responses, and synthetic user
@@ -3954,7 +3954,7 @@ section is the toolbox for *reducing* them. All of it composes with logical mode
 combinators ([§23](#23-models--llms-as-language-constructs)) and is visible in the cost
 ledger ([§31](#31-observability-tracing-cost--evals)).
 
-### 56..1 Prompt-prefix (provider) caching
+### 56.1 Prompt-prefix (provider) caching
 
 Mark stable prompt regions so the provider caches the prefix; cache hits are billed and
 traced at the reduced rate automatically.
@@ -3967,14 +3967,14 @@ ask brain {
 }
 ```
 
-### 56..2 Semantic & response caching
+### 56.2 Semantic & response caching
 
 ```axon
 model cached = brain.cached(ttl = 1h, key = semantic(threshold = 0.97))
 @memoize(ttl = 10m) tool lookup(k: Text) -> Record uses { Net } { … }
 ```
 
-### 56..3 Batching & speculative execution
+### 56.3 Batching & speculative execution
 
 ```axon
 let answers = llm.batch([q1, q2, q3]) await        // one batched request, not three
@@ -3985,7 +3985,7 @@ let fast_then_verify = race([                       // speculative: cheap draft 
 let r = parallel { a(); b(); c() }                  // overlap independent model/tool calls
 ```
 
-### 56..4 Difficulty-routed model selection
+### 56.4 Difficulty-routed model selection
 
 ```axon
 model router = route(|req|
@@ -3996,7 +3996,7 @@ model router = route(|req|
     })
 ```
 
-### 56..5 Context compression
+### 56.5 Context compression
 
 When context exceeds budget, the context policy
 ([§27.3](#273-memory-in-the-prompt)) can summarize or distil older material with a cheap
@@ -4019,7 +4019,7 @@ span, optional secondary spans, an explanation of *why*, a suggested fix, and wh
 possible an **auto-applicable rewrite** (`axon fix`). The criterion is simple: a
 first-time user reading the error alone should know what to do next.
 
-### 57..1 The shape of an Axon diagnostic
+### 57.1 The shape of an Axon diagnostic
 
 ```text
 error[E0712]: tool `payments.charge` is not granted by policy `support`
@@ -4044,7 +4044,7 @@ what *is* permitted; the **help** proposes the most likely fix; the **learn** li
 to a page with the rule, a small motivating example, and a recipe; the **fix** line is
 present iff the rewrite is mechanically safe.
 
-### 57..2 Error indexing & search
+### 57.2 Error indexing & search
 
 * Every diagnostic has a code; codes are stable across compiler versions; deleted codes
   are tombstoned, never reused. `axon explain E0712` opens the offline explanation page.
@@ -4053,7 +4053,7 @@ present iff the rewrite is mechanically safe.
 * `axon fix [--apply] [--only E0712,E0241]` applies suggested rewrites; the default is a
   dry-run with a unified diff so you see the change before committing.
 
-### 57..3 "Did you mean…" everywhere
+### 57.3 "Did you mean…" everywhere
 
 Unknown identifiers, fields, modules, capability names, prompt slot names, model logical
 names, tool names, and CLI subcommands all run a Damerau-Levenshtein lookup against the
@@ -4064,7 +4064,7 @@ error[E0421]: unknown capability `Filesystem` in `uses { ... }`
    = help: did you mean `Fs`?   (also in scope: Net, LLM, Memory, Console)
 ```
 
-### 57..4 Catalogued diagnostic families
+### 57.4 Catalogued diagnostic families
 
 To make errors learnable rather than memorisable, codes are grouped:
 
@@ -4084,7 +4084,7 @@ To make errors learnable rather than memorisable, codes are grouped:
 Lints have the same UX as errors; `#[allow(W1203)]` / `#[deny(W1203)]` work at the item
 and module level.
 
-### 57..5 Pretty panics & runtime traces
+### 57.5 Pretty panics & runtime traces
 
 When something does escape to a runtime panic, the trace is structured: it shows the
 agent id, the current handler, the active span chain (with cost and budget remaining),
@@ -4096,7 +4096,7 @@ runs/<id>.axj --from <step>` — that drops you straight into the time-travel de
 
 ## 58. Onboarding, scaffolding & learn-by-doing
 
-### 58..1 The five-minute path
+### 58.1 The five-minute path
 
 The promise is concrete: from `curl | sh` to a working agent that answers a question and
 appears in a trace, in under five minutes, with one command:
@@ -4123,7 +4123,7 @@ loop on day one.
 | `lambda`       | Serverless-shaped agent with `axon deploy --target lambda` |
 | `skill`        | A packageable, capability-audited skill (§53) |
 
-### 58..2 `axon tour` — an in-terminal interactive tutorial
+### 58.2 `axon tour` — an in-terminal interactive tutorial
 
 ```sh
 axon tour                # 30 lessons, 5 minutes each, runs locally
@@ -4134,14 +4134,14 @@ Lessons cover: bindings → types → effects → tools → agents → memory �
 testing → replay → orchestration → deployment. No video, no slides, no signup; works
 offline; the grader is just `axon test`.
 
-### 58..3 Worked-example library
+### 58.3 Worked-example library
 
 `axon doc --examples` opens a searchable catalogue of ~40 worked examples (under
 `examples/` in the repo) keyed by the spec section they illustrate. Every example is
 **runnable, type-checked in CI, and shipped with a `.axj` journal** so it replays
 deterministically with no API keys.
 
-### 58..4 Beginner mode (`--explain-errors`)
+### 58.4 Beginner mode (`--explain-errors`)
 
 ```sh
 axon run --explain-errors src/main.ax
@@ -4151,7 +4151,7 @@ For each error, the compiler appends a short, plain-English paragraph plus a "co
 cause" hint — the same content as the offline error pages, inlined. Off by default for
 seasoned users; great for the first day.
 
-### 58..5 Migration assistant from existing code
+### 58.5 Migration assistant from existing code
 
 `axon import` ingests a Python/TypeScript agent project and produces an Axon scaffold
 that compiles and runs the easy parts (tool schemas, model bindings, memory wiring) and
@@ -4166,7 +4166,7 @@ detail in [§45](#45-migration-guides). The point is that *getting started* does
 What a programmer feels minute-to-minute is the editor. Axon ships the editor
 experience as a first-party, supported product — not "an LSP exists, good luck."
 
-### 59..1 Beyond completion: agent-shaped editor affordances
+### 59.1 Beyond completion: agent-shaped editor affordances
 
 `axon-lsp` provides every ordinary feature (completion, hover, go-to, rename,
 diagnostics, code actions) plus a set of affordances that exist because of what Axon is:
@@ -4191,7 +4191,7 @@ diagnostics, code actions) plus a set of affordances that exist because of what 
   requirements, install with one click. The capability audit ([§34.3](#343-capability-aware-dependencies))
   shows in the diff *before* you accept.
 
-### 59..2 Fast feedback
+### 59.2 Fast feedback
 
 * **Incremental compilation cache** persists across invocations; a one-character edit
   in a 500k-line workspace re-typechecks only the dirty module.
@@ -4200,7 +4200,7 @@ diagnostics, code actions) plus a set of affordances that exist because of what 
 * **`axon repl`** ([§36.1](#361-the-repl)) keeps an interpreter session live; bindings
   survive across prompts; effects are enabled with sensible defaults.
 
-### 59..3 Notebook & playground
+### 59.3 Notebook & playground
 
 * `axon-notebook` is a Jupyter kernel: cells are `.ax` snippets, the kernel is the same
   AxVM (so traces, costs, capabilities work identically). Ideal for exploration,
@@ -4209,7 +4209,7 @@ diagnostics, code actions) plus a set of affordances that exist because of what 
   keys needed), shareable URLs, and one-click "send to GitHub issue" for bug reports
   with the cassette embedded.
 
-### 59..4 Debugger
+### 59.4 Debugger
 
 The time-travel debugger ([§32.4](#324-time-travel-debugging)) speaks the **Debug
 Adapter Protocol**, so VS Code, JetBrains, `nvim-dap`, Emacs `dap-mode`, and Helix all
@@ -4223,7 +4223,7 @@ backwards, branch a counterfactual.
 Spec coverage alone doesn't teach a language. Axon's documentation is structured around
 **what someone is trying to do**, not around the compiler's module layout.
 
-### 60..1 Four-layer documentation
+### 60.1 Four-layer documentation
 
 Following the [Diátaxis](https://diataxis.fr) framework:
 
@@ -4240,7 +4240,7 @@ Following the [Diátaxis](https://diataxis.fr) framework:
    bearer tokens?", "Why is `Tainted<T>` a type and not a flag?". The questions
    experienced engineers ask before they adopt.
 
-### 60..2 Doc-tests
+### 60.2 Doc-tests
 
 Examples in `///` comments are extracted and **executed** by `axon test --doc`. A
 broken example fails the build; you cannot ship stale docs. Same model as Rust's
@@ -4257,7 +4257,7 @@ amortised because the example is also the test.
 fn bm25_score(query: String, passage: String) -> Float { … }
 ```
 
-### 60..3 The recipe book
+### 60.3 The recipe book
 
 `hub.axon-lang.org/recipes` is a curated, community-extended catalogue of small,
 production-shaped patterns (handling rate-limit errors, batching tool calls, structured
@@ -4265,14 +4265,14 @@ output with optional fields, choosing a chunker, writing a custom guard). Every 
 is a runnable Axon project; every recipe is **versioned** alongside the language so
 "the 1.0 way to do X" is a stable URL.
 
-### 60..4 Searchable, AI-assisted docs
+### 60.4 Searchable, AI-assisted docs
 
 `docs.axon-lang.org` is searchable by keyword *and* by **intent** (a retrieval index
 over the four-layer corpus). The site itself ships a small embedded Axon agent that
 will answer questions grounded *only* in the docs ([§50.3](#503-grounded-cited-generation))
 with citations — practising what the language preaches. No hallucinated APIs.
 
-### 60..5 Changelog & migration notes
+### 60.5 Changelog & migration notes
 
 Every release ships:
 
@@ -4288,7 +4288,7 @@ Every release ships:
 A language with great features and no libraries is a hobby. The Axon ecosystem is
 designed for *trust* and *discovery* — not raw count of packages.
 
-### 61..1 The registry: `hub.axon-lang.org`
+### 61.1 The registry: `hub.axon-lang.org`
 
 * Content-addressed, signature-verified packages ([§34.2](#342-packages-manifest--lockfile)).
 * Required metadata per package: declared effects, license, repository, minimum Axon
@@ -4300,7 +4300,7 @@ designed for *trust* and *discovery* — not raw count of packages.
 * Private registries are first-class (`registry = "https://hub.acme.com"` in
   `axon.toml`); air-gapped builds via `axon pkg vendor` are supported and tested in CI.
 
-### 61..2 Quality signals on every package page
+### 61.2 Quality signals on every package page
 
 * **Capability audit** — exactly which effects this package requests; surfaced before
   you `axon pkg add`.
@@ -4311,7 +4311,7 @@ designed for *trust* and *discovery* — not raw count of packages.
 * **Provenance** — built from which commit, by which runner, signed by whom (SLSA-style
   attestations).
 
-### 61..3 A curated first-party set
+### 61.3 A curated first-party set
 
 Two tiers, both Apache-2.0:
 
@@ -4322,7 +4322,7 @@ Two tiers, both Apache-2.0:
   `axon-temporal` (workflow handoff). Predictable APIs, predictable lifecycle,
   predictable support.
 
-### 61..4 Community packages
+### 61.4 Community packages
 
 * `community.*` namespace, governed by a published quality bar and a CoC.
 * Promotion path: a community package with sustained usage, two maintainers, evals, and
@@ -4330,7 +4330,7 @@ Two tiers, both Apache-2.0:
 * `axon pkg outdated`, `axon pkg deprecated`, `axon pkg unused` keep dependency hygiene
   cheap.
 
-### 61..5 The skill marketplace
+### 61.5 The skill marketplace
 
 A specialised view of the registry for **skills** ([§53](#53-agent-skills--capability-packaging)):
 ready-to-install agent capabilities (web research, document Q&A, scheduling, deep code
@@ -4345,7 +4345,7 @@ so you know what you're getting before you grant it any capability.
 A production language must promise that *yesterday's code still works tomorrow*. Axon
 adopts the **edition** model and a written stability policy.
 
-### 62..1 Editions
+### 62.1 Editions
 
 ```toml
 [package]
@@ -4364,7 +4364,7 @@ Editions are how Axon can evolve syntax (e.g. adding a keyword) without breaking
 millions of lines already written. Inspired by Rust editions; aligned with the same
 guarantee.
 
-### 62..2 Semantic versioning, in detail
+### 62.2 Semantic versioning, in detail
 
 | Change | Bump |
 |---|---|
@@ -4375,7 +4375,7 @@ guarantee.
 | Capability-requirement widening on a tool | major |
 | Performance regression > 5% vs target | release-blocking, never a silent bump |
 
-### 62..3 Deprecation lifecycle
+### 62.3 Deprecation lifecycle
 
 * `#[deprecated(since = "1.3", note = "use foo_v2", suggest = "foo_v2")]`
 * Deprecated items emit `W2xxx` lints (off by default for one minor, on by default for
@@ -4383,14 +4383,14 @@ guarantee.
 * `axon fix --only W2031` mechanically rewrites call sites where safe.
 * Two-minor-version window minimum before removal.
 
-### 62..4 Long-term support
+### 62.4 Long-term support
 
 * One LTS line at any time, maintained for **24 months** after release.
 * Security fixes backported within 7 days of disclosure; CVEs published with full
   reproducers; affected packages auto-flagged in the registry.
 * `axup install lts` always resolves to the current LTS.
 
-### 62..5 Reproducible builds
+### 62.5 Reproducible builds
 
 * Pinned by `axon.lock` (content hashes, not version ranges).
 * Hermetic builds with `axon pkg vendor`.
@@ -4399,7 +4399,7 @@ guarantee.
 * `axon build --verify-reproducible` rebuilds the artifact in a clean sandbox and
   asserts byte-equality.
 
-### 62..6 Governance
+### 62.6 Governance
 
 * RFC process for language and stdlib changes (`rfcs/`); minimum two-week public
   discussion; recorded core-team decision.
@@ -4415,7 +4415,7 @@ Production agents are operated, not just deployed. Axon ships a built-in operato
 console — like `top` for a Unix system or `kubectl` for Kubernetes — that works against
 any running `axon serve` instance or cluster ([§37.6](#376-scaling--clustering)).
 
-### 63..1 The live view
+### 63.1 The live view
 
 ```sh
 axon top --target prod
@@ -4436,7 +4436,7 @@ Trace bus: 8.4k spans/s   p99 ledger lag 120 ms   journal:  enabled
 [t]op  [d]rain agt_77b3  [p]ause Billing  [r]estart agt_77b3  [q]uit
 ```
 
-### 63..2 What you can do without leaving the terminal
+### 63.2 What you can do without leaving the terminal
 
 * **Drain** an agent — stop accepting new messages, finish in-flight, run `on stop`,
   exit cleanly (works through supervisors, [§29.7](#297-supervisors)).
@@ -4449,7 +4449,7 @@ Trace bus: 8.4k spans/s   p99 ledger lag 120 ms   journal:  enabled
 * **Sample a journal** from a live agent for one minute and download as `.axj` — turn
   any "customer just hit X" into a deterministic replay locally.
 
-### 63..3 Behavioural alerts
+### 63.3 Behavioural alerts
 
 Alerts are declared next to the agent, evaluated by the runtime, fired through any
 `axon-ecosystem.*` notifier:
@@ -4463,7 +4463,7 @@ alerts on Resolver {
 }
 ```
 
-### 63..4 Multi-tenant view
+### 63.4 Multi-tenant view
 
 For platforms running agents on behalf of many customers, `axon top --by tenant` slices
 by `namespace` — the isolation primitive enforced by the runtime
@@ -4477,7 +4477,7 @@ customer without bolt-on tooling.
 A real language is a thousand small kindnesses. Each item below is a 1-day feature on
 its own; together they make Axon feel cared-for.
 
-### 64..1 In the language
+### 64.1 In the language
 
 * **Trailing-comma everywhere** — argument lists, fields, patterns, enum variants. No
   diff churn when you add a line.
@@ -4495,7 +4495,7 @@ its own; together they make Axon feel cared-for.
 * **Named arguments at the call site** are *always* legal — the call is
   self-documenting without a comment.
 
-### 64..2 In the toolchain
+### 64.2 In the toolchain
 
 * **`axon` with no arguments** prints the most likely next command based on the project
   state ("you have uncommitted changes — try `axon test`; no journals yet — try `axon
@@ -4515,7 +4515,7 @@ its own; together they make Axon feel cared-for.
 * **`axon doctor` heals what it can** — offers `--fix` for stale toolchains, missing
   drivers, broken symlinks, permission issues on the vault.
 
-### 64..3 In the runtime
+### 64.3 In the runtime
 
 * **Crash dumps** include the agent id, the active span chain, the cost so far, the
   last three effects, and a one-line "run this to reproduce" command.
@@ -4527,7 +4527,7 @@ its own; together they make Axon feel cared-for.
   tool calls if statically resolvable, expected cost) without spending money. Great for
   PR review of changes that affect cost.
 
-### 64..4 For agentic projects specifically
+### 64.4 For agentic projects specifically
 
 * **`axon eval --since main`** — runs only the evals whose code path changed vs the
   base branch.
@@ -4547,7 +4547,7 @@ None of these are flashy. Together they are the difference between a language yo
 
 The final feature of any successful language is its community.
 
-### 65..1 Where to get help
+### 65.1 Where to get help
 
 | Channel | Purpose |
 |---|---|
@@ -4559,7 +4559,7 @@ The final feature of any successful language is its community.
 | `bsky.app/profile/axon-lang.org` / Mastodon | Announcements |
 | `security@axon-lang.org` | Coordinated disclosure (GPG key in `SECURITY.md`) |
 
-### 65..2 Governance
+### 65.2 Governance
 
 * A small **core team** with public meeting notes and decisions.
 * A **steering council** with representation from the largest open-source users.
@@ -4568,7 +4568,7 @@ The final feature of any successful language is its community.
 * A **vendor-neutrality** principle: no model provider, no cloud, no framework is
   baked into the language or the registry.
 
-### 65..3 Inclusivity
+### 65.3 Inclusivity
 
 * **Code of Conduct** based on the Contributor Covenant; enforced.
 * **Mentorship program** matches first-time contributors with maintainers for the first
@@ -4578,7 +4578,7 @@ The final feature of any successful language is its community.
 * **Documentation translation** is a first-class workstream; the four-layer corpus
   (§60.1) is structured so non-English communities can contribute and stay current.
 
-### 65..4 Commercial support
+### 65.4 Commercial support
 
 * A directory of independent consultancies trained on Axon.
 * Anthropic offers nothing privileged on the registry; any provider's drivers are
@@ -4586,7 +4586,7 @@ The final feature of any successful language is its community.
 * For organisations needing SLAs, the LTS line ([§62.4](#624-long-term-support)) is the
   contract: predictable lifecycle, security backports, reproducible builds.
 
-### 65..5 Where to start
+### 65.5 Where to start
 
 ```sh
 axon new my-first-bot --template agent

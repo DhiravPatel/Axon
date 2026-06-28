@@ -52,7 +52,11 @@ export async function loadChapter(
   const chapters = await loadChapters(file);
   const meta = chapters.find((c) => c.slug === slug);
   if (!meta) return null;
-  const html = await renderMarkdown(meta.body);
+  // The page header already renders the chapter title as the <h1>, so drop
+  // the leading `## Title` from the body — otherwise it shows up a second
+  // time as an <h2> directly under the title.
+  const body = meta.body.replace(/^##\s+.*\r?\n+/, "");
+  const html = await renderMarkdown(body);
   const toc = extractToc(html);
   return { ...meta, html, toc };
 }
