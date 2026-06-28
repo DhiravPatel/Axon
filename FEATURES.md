@@ -1,6 +1,38 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1141 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1145 tests passing** across 30+ crates).
+
+---
+
+## Stage 41 — Safety & Ergonomics: Overflow-Safe Arithmetic, `require`, and `todo`/`unimplemented`
+
+A security + user-friendliness pass.
+
+### §41.1 — Overflow-safe integer arithmetic (security)
+
+Axon's `+ - *` wrap silently on overflow (fast, matches the hardware) — fine for most code, but a footgun for size/length math on untrusted (LLM/tool/user) input, the classic integer-overflow vulnerability. Stage 41 adds an explicit safe path as `Int` methods ([eval.rs](crates/axon-runtime/src/eval.rs) + [infer.rs](crates/axon-tyck/src/infer.rs)):
+
+- `checked_add` / `checked_sub` / `checked_mul` → return `Int?` (`nil` on overflow), so the caller must handle it: `let n = a.checked_mul(b) ?? fail()`
+- `saturating_add` / `saturating_sub` / `saturating_mul` → clamp to the `Int` range instead of wrapping
+
+```axon
+let total = count.checked_mul(size) ?? panic("size overflow")   // safe
+let capped = balance.saturating_add(deposit)                    // never wraps
+```
+
+### §41.2 — `require` input validation + `todo`/`unimplemented` (ergonomics)
+
+- `require(cond, msg)` — validate a precondition / untrusted input; fails with `requirement failed: <msg>`. Same shape as `assert`, but the wording frames input validation rather than an internal-invariant bug.
+- `todo(msg?)` / `unimplemented(msg?)` — sketch a program incrementally; reaching one is a clean runtime error (`not yet implemented (todo): …`), never a silent wrong answer.
+
+All four are registered as pure built-ins ([builtin.rs](crates/axon-runtime/src/builtin.rs), [register.rs](crates/axon-tyck/src/register.rs)).
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage41_safety` | 4 | `require` pass/fail, `checked_*` nil-on-overflow, `saturating_*` clamps to the Int range, `todo`/`unimplemented` error message |
+| **Workspace total** | **1145 passing**, up from 1141 | +4 |
 
 ---
 

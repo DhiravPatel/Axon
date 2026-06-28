@@ -355,7 +355,11 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
             "replace", "repeat",
         ],
         Duration => &["as_ns", "as_micros", "as_ms", "as_secs", "as_secs_f64"],
-        Int => &["abs", "to_string", "to_float", "min", "max", "pow"],
+        Int => &[
+            "abs", "to_string", "to_float", "min", "max", "pow",
+            "checked_add", "checked_sub", "checked_mul",
+            "saturating_add", "saturating_sub", "saturating_mul",
+        ],
         Float => &["abs", "round", "floor", "ceil", "sqrt", "to_int", "to_string"],
         List(_) => &[
             "len", "push", "pop", "first", "last", "reverse", "map", "filter",
@@ -1222,6 +1226,16 @@ impl<'a> Checker<'a> {
             (Ty::Int, "to_float") => (Ty::Float, EffectRow::pure(), vec![]),
             (Ty::Int, "min") | (Ty::Int, "max") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
             (Ty::Int, "pow") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
+            // Stage 41 — overflow-safe arithmetic. `checked_*` is nullable Int
+            // (`nil` on overflow); `saturating_*` always returns an Int.
+            (Ty::Int, "checked_add")
+            | (Ty::Int, "checked_sub")
+            | (Ty::Int, "checked_mul") => {
+                (Ty::Nullable(Box::new(Ty::Int)), EffectRow::pure(), vec![Ty::Int])
+            }
+            (Ty::Int, "saturating_add")
+            | (Ty::Int, "saturating_sub")
+            | (Ty::Int, "saturating_mul") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
             (Ty::Float, "abs")
             | (Ty::Float, "round")
             | (Ty::Float, "floor")

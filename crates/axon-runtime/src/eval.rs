@@ -1640,6 +1640,45 @@ impl Interpreter {
                     )),
                 }
             }
+            // Overflow-safe arithmetic — Axon's `+ - *` wrap silently (fast,
+            // matches the hardware), which is a footgun for size/length math on
+            // untrusted input. These give an explicit safe path: `checked_*`
+            // returns `nil` on overflow (handle it), `saturating_*` clamps to
+            // the Int range. Stage 41 (security).
+            (Value::Int(n), "checked_add")
+            | (Value::Int(n), "checked_sub")
+            | (Value::Int(n), "checked_mul") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::Int(m) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        format!("`Int.{method}` expects an Int argument"),
+                        span,
+                    ));
+                };
+                let r = match method {
+                    "checked_add" => n.checked_add(*m),
+                    "checked_sub" => n.checked_sub(*m),
+                    _ => n.checked_mul(*m),
+                };
+                Ok(r.map(Value::Int).unwrap_or(Value::Nil))
+            }
+            (Value::Int(n), "saturating_add")
+            | (Value::Int(n), "saturating_sub")
+            | (Value::Int(n), "saturating_mul") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::Int(m) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        format!("`Int.{method}` expects an Int argument"),
+                        span,
+                    ));
+                };
+                let r = match method {
+                    "saturating_add" => n.saturating_add(*m),
+                    "saturating_sub" => n.saturating_sub(*m),
+                    _ => n.saturating_mul(*m),
+                };
+                Ok(Value::Int(r))
+            }
             (Value::Float(x), "abs") => {
                 ensure_arity(method, 0, args.len(), span)?;
                 Ok(Value::Float(x.abs()))

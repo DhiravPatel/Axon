@@ -23,7 +23,8 @@ impl<'a> Checker<'a> {
         // is the whole point of effect rows.
         const PURE: &[&str] = &[
             "len", "str", "int", "float", "bool", "abs", "min", "max", "chan", "assert",
-            "assert_eq", "panic", "anthropic", "mock_model", "default_model", "local_memory",
+            "assert_eq", "panic", "require", "todo", "unimplemented",
+            "anthropic", "mock_model", "default_model", "local_memory",
             // ---- Stage 11 stdlib: std.string ----
             "str_upper", "str_lower", "str_trim", "str_trim_start", "str_trim_end",
             "str_split", "str_split_lines", "str_split_once",

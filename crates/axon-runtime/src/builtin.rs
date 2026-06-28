@@ -317,6 +317,42 @@ pub fn register_builtins(register: &mut dyn FnMut(&'static str, NativeFn)) {
             call: builtin_panic,
         },
     );
+    // `require(cond, msg?)` — validate an assumption about (often untrusted)
+    // input. Same shape as `assert`, but the wording frames a *precondition*
+    // / input-validation failure rather than an internal-invariant bug, so
+    // agent code reads clearly when guarding tool output or user text.
+    register(
+        "require",
+        NativeFn {
+            name: "require",
+            min_arity: 1,
+            max_arity: Some(2),
+            required_caps: &[],
+            call: builtin_require,
+        },
+    );
+    // `todo(msg?)` / `unimplemented(msg?)` — sketch a program incrementally;
+    // reaching one is a clean runtime error, not a silent wrong answer.
+    register(
+        "todo",
+        NativeFn {
+            name: "todo",
+            min_arity: 0,
+            max_arity: Some(1),
+            required_caps: &[],
+            call: builtin_todo,
+        },
+    );
+    register(
+        "unimplemented",
+        NativeFn {
+            name: "unimplemented",
+            min_arity: 0,
+            max_arity: Some(1),
+            required_caps: &[],
+            call: builtin_unimplemented,
+        },
+    );
 
     // ---- Net (stub) -----------------------------------------------------
     //
@@ -841,6 +877,36 @@ fn builtin_panic(args: &[Value]) -> Result<Value, String> {
         None => "explicit panic".to_string(),
     };
     Err(format!("panic: {msg}"))
+}
+
+fn builtin_require(args: &[Value]) -> Result<Value, String> {
+    if args[0].is_truthy() {
+        return Ok(Value::Unit);
+    }
+    let msg = match args.get(1) {
+        Some(Value::String(s)) => s.as_str().to_owned(),
+        Some(other) => other.to_string(),
+        None => "unmet precondition".to_string(),
+    };
+    Err(format!("requirement failed: {msg}"))
+}
+
+fn builtin_todo(args: &[Value]) -> Result<Value, String> {
+    let msg = match args.first() {
+        Some(Value::String(s)) => format!(": {}", s.as_str()),
+        Some(other) => format!(": {other}"),
+        None => String::new(),
+    };
+    Err(format!("not yet implemented (todo){msg}"))
+}
+
+fn builtin_unimplemented(args: &[Value]) -> Result<Value, String> {
+    let msg = match args.first() {
+        Some(Value::String(s)) => format!(": {}", s.as_str()),
+        Some(other) => format!(": {other}"),
+        None => String::new(),
+    };
+    Err(format!("not implemented{msg}"))
 }
 
 fn builtin_http_fetch_stub(_args: &[Value]) -> Result<Value, String> {
