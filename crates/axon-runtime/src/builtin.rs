@@ -354,6 +354,62 @@ pub fn register_builtins(register: &mut dyn FnMut(&'static str, NativeFn)) {
         },
     );
 
+    // ---- AI utilities (pure, deterministic) -----------------------------
+    //
+    // Bread-and-butter helpers for agent code that don't need a model call:
+    // budgeting context windows, chunking documents for RAG, parsing model
+    // output, and comparing embedding vectors.
+    register(
+        "estimate_tokens",
+        NativeFn {
+            name: "estimate_tokens",
+            min_arity: 1,
+            max_arity: Some(1),
+            required_caps: &[],
+            call: builtin_estimate_tokens,
+        },
+    );
+    register(
+        "chunk_text",
+        NativeFn {
+            name: "chunk_text",
+            min_arity: 2,
+            max_arity: Some(3),
+            required_caps: &[],
+            call: builtin_chunk_text,
+        },
+    );
+    register(
+        "extract_json",
+        NativeFn {
+            name: "extract_json",
+            min_arity: 1,
+            max_arity: Some(1),
+            required_caps: &[],
+            call: builtin_extract_json,
+        },
+    );
+    register(
+        "extract_code",
+        NativeFn {
+            name: "extract_code",
+            min_arity: 1,
+            max_arity: Some(1),
+            required_caps: &[],
+            call: builtin_extract_code,
+        },
+    );
+    register(
+        "cosine_similarity",
+        NativeFn {
+            name: "cosine_similarity",
+            min_arity: 2,
+            max_arity: Some(2),
+            required_caps: &[],
+            call: builtin_cosine_similarity,
+        },
+    );
+
     // ---- Net (stub) -----------------------------------------------------
     //
     // A real HTTP client lands when we ship the std network library; the
@@ -907,6 +963,189 @@ fn builtin_unimplemented(args: &[Value]) -> Result<Value, String> {
         None => String::new(),
     };
     Err(format!("not implemented{msg}"))
+}
+
+// ---- AI utilities ------------------------------------------------------
+
+fn ai_str_arg<'a>(v: &'a Value, fname: &str) -> Result<&'a str, String> {
+    match v {
+        Value::String(s) => Ok(s.as_str()),
+        other => Err(format!(
+            "`{fname}` expects a String, got `{}`",
+            other.type_name()
+        )),
+    }
+}
+
+/// `estimate_tokens(text)` — a rough token count for budgeting context
+/// windows. Uses the widely-cited ~4-characters-per-token heuristic; it is an
+/// *estimate*, not a real tokenizer.
+fn builtin_estimate_tokens(args: &[Value]) -> Result<Value, String> {
+    let s = ai_str_arg(&args[0], "estimate_tokens")?;
+    let chars = s.chars().count();
+    Ok(Value::Int(((chars + 3) / 4) as i64))
+}
+
+/// `chunk_text(text, max_chars, overlap = 0)` — split text into character
+/// windows of at most `max_chars`, each overlapping the previous by `overlap`
+/// characters. The canonical RAG / long-context pre-processing step.
+fn builtin_chunk_text(args: &[Value]) -> Result<Value, String> {
+    let s = ai_str_arg(&args[0], "chunk_text")?;
+    let max = match &args[1] {
+        Value::Int(n) if *n > 0 => *n as usize,
+        Value::Int(_) => return Err("`chunk_text` max_chars must be positive".into()),
+        other => {
+            return Err(format!(
+                "`chunk_text` max_chars must be an Int, got `{}`",
+                other.type_name()
+            ))
+        }
+    };
+    let overlap = match args.get(2) {
+        Some(Value::Int(n)) if *n >= 0 => *n as usize,
+        Some(Value::Int(_)) => return Err("`chunk_text` overlap must be non-negative".into()),
+        Some(other) => {
+            return Err(format!(
+                "`chunk_text` overlap must be an Int, got `{}`",
+                other.type_name()
+            ))
+        }
+        None => 0,
+    };
+    if overlap >= max {
+        return Err("`chunk_text` overlap must be less than max_chars".into());
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let step = max - overlap;
+    let mut out: Vec<Value> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + max).min(chars.len());
+        out.push(Value::String(Rc::new(chars[i..end].iter().collect())));
+        if end == chars.len() {
+            break;
+        }
+        i += step;
+    }
+    Ok(Value::List(Rc::new(RefCell::new(out))))
+}
+
+/// `extract_json(text)` — pull the first balanced JSON object or array out of
+/// a model's reply (which often wraps it in prose or a ```json fence). Returns
+/// `nil` when none is found. Brace matching is string-aware.
+fn builtin_extract_json(args: &[Value]) -> Result<Value, String> {
+    let s = ai_str_arg(&args[0], "extract_json")?;
+    Ok(extract_balanced_json(s)
+        .map(|j| Value::String(Rc::new(j)))
+        .unwrap_or(Value::Nil))
+}
+
+fn extract_balanced_json(s: &str) -> Option<String> {
+    let bytes: Vec<char> = s.chars().collect();
+    let start = bytes.iter().position(|&c| c == '{' || c == '[')?;
+    let open = bytes[start];
+    let close = if open == '{' { '}' } else { ']' };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &c) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(bytes[start..=i].iter().collect());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `extract_code(text)` — return the contents of the first fenced code block
+/// (```` ```lang ... ``` ````), dropping the fence and any language tag.
+/// Returns `nil` when there is no fenced block.
+fn builtin_extract_code(args: &[Value]) -> Result<Value, String> {
+    let s = ai_str_arg(&args[0], "extract_code")?;
+    Ok(extract_first_fence(s)
+        .map(|c| Value::String(Rc::new(c)))
+        .unwrap_or(Value::Nil))
+}
+
+fn extract_first_fence(s: &str) -> Option<String> {
+    let open = s.find("```")?;
+    let after_open = &s[open + 3..];
+    // Skip the optional language tag up to the first newline.
+    let body_start = after_open.find('\n').map(|n| n + 1).unwrap_or(0);
+    let body = &after_open[body_start..];
+    let close = body.find("```")?;
+    Some(body[..close].trim_end_matches('\n').to_string())
+}
+
+/// `cosine_similarity(a, b)` — cosine similarity of two equal-length numeric
+/// vectors (e.g. embeddings). Returns a Float in [-1, 1]; `0.0` if either
+/// vector is all zeros.
+fn builtin_cosine_similarity(args: &[Value]) -> Result<Value, String> {
+    let a = ai_float_vec(&args[0], "cosine_similarity")?;
+    let b = ai_float_vec(&args[1], "cosine_similarity")?;
+    if a.len() != b.len() {
+        return Err(format!(
+            "`cosine_similarity`: vectors differ in length ({} vs {})",
+            a.len(),
+            b.len()
+        ));
+    }
+    if a.is_empty() {
+        return Err("`cosine_similarity`: vectors must be non-empty".into());
+    }
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    Ok(Value::Float(if denom == 0.0 { 0.0 } else { dot / denom }))
+}
+
+fn ai_float_vec(v: &Value, fname: &str) -> Result<Vec<f64>, String> {
+    let list = match v {
+        Value::List(l) => l,
+        other => {
+            return Err(format!(
+                "`{fname}` expects a List of numbers, got `{}`",
+                other.type_name()
+            ))
+        }
+    };
+    let mut out = Vec::new();
+    for el in list.borrow().iter() {
+        match el {
+            Value::Float(f) => out.push(*f),
+            Value::Int(i) => out.push(*i as f64),
+            other => {
+                return Err(format!(
+                    "`{fname}` expects numbers, found `{}`",
+                    other.type_name()
+                ))
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn builtin_http_fetch_stub(_args: &[Value]) -> Result<Value, String> {

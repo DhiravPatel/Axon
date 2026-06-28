@@ -1,6 +1,33 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1154 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1158 tests passing** across 30+ crates).
+
+---
+
+## Stage 45 — AI Utilities: Token Budgeting, Chunking, Output Parsing, Embedding Similarity
+
+Pure, deterministic helpers for the everyday plumbing of agent code — no model call required, so they're fully testable. Registered as pure built-ins ([builtin.rs](crates/axon-runtime/src/builtin.rs), [register.rs](crates/axon-tyck/src/register.rs)):
+
+- **`estimate_tokens(text)` → `Int`** — rough token count (the ~4-chars/token rule) for budgeting a context window before you spend it.
+- **`chunk_text(text, max_chars, overlap = 0)` → `List<String>`** — split a document into overlapping character windows: the canonical RAG / long-context pre-processing step.
+- **`extract_json(text)` → `String?`** — pull the first balanced JSON object/array out of a model reply (which usually wraps it in prose or a ```` ```json ```` fence). String-aware brace matching; `nil` if none.
+- **`extract_code(text)` → `String?`** — return the contents of the first fenced code block, dropping the fence + language tag.
+- **`cosine_similarity(a, b)` → `Float`** — cosine similarity of two equal-length numeric vectors (embeddings); `0.0` for a zero vector.
+
+```axon
+if estimate_tokens(doc) > budget {
+    for piece in chunk_text(doc, 2000, 200) { index.add(piece) }
+}
+let data = extract_json(model_reply).expect("model returned no JSON")
+let score = cosine_similarity(embed(query), embed(candidate))
+```
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage45_ai_utils` | 4 | `estimate_tokens` + `chunk_text` overlap windows, `extract_json` from a fenced reply, `extract_code`, `cosine_similarity` (identical → 1, orthogonal → 0) |
+| **Workspace total** | **1158 passing**, up from 1154 | +4 |
 
 ---
 

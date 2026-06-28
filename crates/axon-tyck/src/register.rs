@@ -24,6 +24,9 @@ impl<'a> Checker<'a> {
         const PURE: &[&str] = &[
             "len", "str", "int", "float", "bool", "abs", "min", "max", "chan", "assert",
             "assert_eq", "panic", "require", "todo", "unimplemented",
+            // ---- Stage 45 AI utilities (pure) ----
+            "estimate_tokens", "chunk_text", "extract_json", "extract_code",
+            "cosine_similarity",
             "anthropic", "mock_model", "default_model", "local_memory",
             // ---- Stage 11 stdlib: std.string ----
             "str_upper", "str_lower", "str_trim", "str_trim_start", "str_trim_end",
