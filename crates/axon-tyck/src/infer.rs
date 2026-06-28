@@ -364,6 +364,7 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
         List(_) => &[
             "len", "push", "pop", "first", "last", "reverse", "map", "filter",
             "is_empty", "contains", "index_of", "sum", "join", "sort", "fold",
+            "any", "all", "find", "count", "take", "drop", "min", "max", "enumerate",
         ],
         Map(_, _) => &["set", "get", "contains"],
         Set(_) => &["add", "contains"],
@@ -1285,6 +1286,23 @@ impl<'a> Checker<'a> {
             (Ty::List(_), "join") => (Ty::String, EffectRow::pure(), vec![Ty::String]),
             (Ty::List(t), "sort") => (Ty::List(t.clone()), EffectRow::pure(), vec![]),
             (Ty::List(_), "fold") => (Ty::Dyn, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
+            // Stage 43 — functional collection methods.
+            (Ty::List(_), "any") | (Ty::List(_), "all") => {
+                (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn])
+            }
+            (Ty::List(t), "find") => (Ty::Nullable(t.clone()), EffectRow::pure(), vec![Ty::Dyn]),
+            (Ty::List(_), "count") => (Ty::Int, EffectRow::pure(), vec![Ty::Dyn]),
+            (Ty::List(t), "take") | (Ty::List(t), "drop") => {
+                (Ty::List(t.clone()), EffectRow::pure(), vec![Ty::Int])
+            }
+            (Ty::List(t), "min") | (Ty::List(t), "max") => {
+                (Ty::Nullable(t.clone()), EffectRow::pure(), vec![])
+            }
+            (Ty::List(t), "enumerate") => (
+                Ty::List(Box::new(Ty::Tuple(vec![Ty::Int, (**t).clone()]))),
+                EffectRow::pure(),
+                vec![],
+            ),
             (Ty::Map(_, _), "set") => (Ty::Unit, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
             (Ty::Map(_, _), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),

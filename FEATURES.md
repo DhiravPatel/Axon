@@ -1,6 +1,30 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1148 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1151 tests passing** across 30+ crates).
+
+---
+
+## Stage 43 — Functional Collection Methods
+
+`List<T>` already had `map`/`filter`/`fold`; Stage 43 rounds out the surface every developer reaches for, dispatched in [eval.rs](crates/axon-runtime/src/eval.rs) and typed in [infer.rs](crates/axon-tyck/src/infer.rs). They compose with the Stage 42 optional methods (`xs.find(p).unwrap_or(d)`):
+
+- **Predicate**: `any(f)` / `all(f)` → `Bool`, `find(f)` → `T?` (first match), `count(f)` → `Int`
+- **Slicing**: `take(n)` / `drop(n)` → `List<T>`
+- **Reducing**: `min()` / `max()` → `T?` (nil on empty)
+- **Indexing**: `enumerate()` → `List<(Int, T)>`, enabling the idiomatic indexed loop:
+
+```axon
+for (i, item) in items.enumerate() { … }
+let first_big = nums.find(|n| n > threshold).unwrap_or(0)
+if rows.all(|r| r.is_valid()) { commit() }
+```
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage43_collections` | 3 | `any`/`all`/`count`/`find`, `take`/`drop`/`min`/`max` (+ nil on empty), `enumerate` with `for (i, v)` tuple destructuring |
+| **Workspace total** | **1151 passing**, up from 1148 | +3 |
 
 ---
 

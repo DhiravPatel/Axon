@@ -1853,6 +1853,103 @@ impl Interpreter {
                 }
                 Ok(acc)
             }
+            // Stage 43 — functional collection surface. `any`/`all`/`find`/
+            // `count` take a predicate; `take`/`drop`/`min`/`max`/`enumerate`
+            // are the standard slicing/reducing helpers.
+            (Value::List(xs), "any") | (Value::List(xs), "all") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let f = &args[0];
+                let want_all = method == "all";
+                let items = xs.borrow().clone();
+                for v in items {
+                    let keep = self.call_value(f, &[v], span)?.is_truthy();
+                    if want_all && !keep {
+                        return Ok(Value::Bool(false));
+                    }
+                    if !want_all && keep {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(want_all))
+            }
+            (Value::List(xs), "find") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let f = &args[0];
+                let items = xs.borrow().clone();
+                for v in items {
+                    if self.call_value(f, &[v.clone()], span)?.is_truthy() {
+                        return Ok(v);
+                    }
+                }
+                Ok(Value::Nil)
+            }
+            (Value::List(xs), "count") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let f = &args[0];
+                let items = xs.borrow().clone();
+                let mut n: i64 = 0;
+                for v in items {
+                    if self.call_value(f, &[v], span)?.is_truthy() {
+                        n += 1;
+                    }
+                }
+                Ok(Value::Int(n))
+            }
+            (Value::List(xs), "take") | (Value::List(xs), "drop") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::Int(n) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        format!("`List.{method}` expects an Int count"),
+                        span,
+                    ));
+                };
+                let n = (*n).max(0) as usize;
+                let items = xs.borrow();
+                let out: Vec<Value> = if method == "take" {
+                    items.iter().take(n).cloned().collect()
+                } else {
+                    items.iter().skip(n).cloned().collect()
+                };
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
+            }
+            (Value::List(xs), "min") | (Value::List(xs), "max") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let items = xs.borrow();
+                let want_max = method == "max";
+                let mut best: Option<Value> = None;
+                for v in items.iter() {
+                    match &best {
+                        None => best = Some(v.clone()),
+                        Some(cur) => {
+                            let ord = v.cmp(cur).ok_or_else(|| {
+                                EvalSignal::error(
+                                    format!("`List.{method}`: values are not comparable"),
+                                    span,
+                                )
+                            })?;
+                            let replace = if want_max {
+                                ord == std::cmp::Ordering::Greater
+                            } else {
+                                ord == std::cmp::Ordering::Less
+                            };
+                            if replace {
+                                best = Some(v.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(best.unwrap_or(Value::Nil))
+            }
+            (Value::List(xs), "enumerate") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let out: Vec<Value> = xs
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| Value::Tuple(Rc::new(vec![Value::Int(i as i64), v.clone()])))
+                    .collect();
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
+            }
             (Value::Map(entries), "get") => {
                 ensure_arity(method, 1, args.len(), span)?;
                 for (k, v) in entries.borrow().iter() {
