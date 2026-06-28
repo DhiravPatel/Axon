@@ -1975,6 +1975,30 @@ impl Interpreter {
                     entries.borrow().iter().any(|(k, _)| k == &args[0]),
                 ))
             }
+            // Stage 44 — round out the Map method surface.
+            (Value::Map(entries), "len") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(entries.borrow().len() as i64))
+            }
+            (Value::Map(entries), "is_empty") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(entries.borrow().is_empty()))
+            }
+            (Value::Map(entries), "keys") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let out: Vec<Value> = entries.borrow().iter().map(|(k, _)| k.clone()).collect();
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
+            }
+            (Value::Map(entries), "values") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                let out: Vec<Value> = entries.borrow().iter().map(|(_, v)| v.clone()).collect();
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(out))))
+            }
+            (Value::Map(entries), "remove") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                entries.borrow_mut().retain(|(k, _)| k != &args[0]);
+                Ok(Value::Unit)
+            }
             (Value::Set(xs), "contains") => {
                 ensure_arity(method, 1, args.len(), span)?;
                 Ok(Value::Bool(xs.borrow().iter().any(|v| v == &args[0])))
@@ -1986,6 +2010,104 @@ impl Interpreter {
                     xs.push(args[0].clone());
                 }
                 Ok(Value::Unit)
+            }
+            // Stage 44 — round out the Set method surface.
+            (Value::Set(xs), "len") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Int(xs.borrow().len() as i64))
+            }
+            (Value::Set(xs), "is_empty") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(xs.borrow().is_empty()))
+            }
+            (Value::Set(xs), "remove") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                xs.borrow_mut().retain(|v| v != &args[0]);
+                Ok(Value::Unit)
+            }
+            (Value::Set(xs), "to_list") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::List(Rc::new(std::cell::RefCell::new(xs.borrow().clone()))))
+            }
+            (Value::Set(xs), "union")
+            | (Value::Set(xs), "intersection")
+            | (Value::Set(xs), "difference") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                let Value::Set(other) = &args[0] else {
+                    return Err(EvalSignal::error(
+                        format!("`Set.{method}` expects another Set"),
+                        span,
+                    ));
+                };
+                let a = xs.borrow();
+                let b = other.borrow();
+                let mut out: Vec<Value> = Vec::new();
+                match method {
+                    "union" => {
+                        out.extend(a.iter().cloned());
+                        for v in b.iter() {
+                            if !out.iter().any(|x| x == v) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                    "intersection" => {
+                        for v in a.iter() {
+                            if b.iter().any(|x| x == v) && !out.iter().any(|x| x == v) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                    _ => {
+                        for v in a.iter() {
+                            if !b.iter().any(|x| x == v) && !out.iter().any(|x| x == v) {
+                                out.push(v.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Set(Rc::new(std::cell::RefCell::new(out))))
+            }
+            // Stage 44 — Char text-processing methods.
+            (Value::Char(c), "is_digit") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.is_ascii_digit()))
+            }
+            (Value::Char(c), "is_alpha") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.is_alphabetic()))
+            }
+            (Value::Char(c), "is_alnum") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.is_alphanumeric()))
+            }
+            (Value::Char(c), "is_whitespace") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.is_whitespace()))
+            }
+            (Value::Char(c), "is_upper") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.is_uppercase()))
+            }
+            (Value::Char(c), "is_lower") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(c.is_lowercase()))
+            }
+            (Value::Char(c), "to_upper") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Char(c.to_uppercase().next().unwrap_or(*c)))
+            }
+            (Value::Char(c), "to_lower") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Char(c.to_lowercase().next().unwrap_or(*c)))
+            }
+            (Value::Char(c), "to_string") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::String(Rc::new(c.to_string())))
+            }
+            (Value::Char(c), "to_digit") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(c.to_digit(10).map(|d| Value::Int(d as i64)).unwrap_or(Value::Nil))
             }
             // Memory.
             (Value::Memory(log), "store") => {

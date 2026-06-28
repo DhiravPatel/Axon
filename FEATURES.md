@@ -1,6 +1,33 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1151 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1154 tests passing** across 30+ crates).
+
+---
+
+## Stage 44 — Map/Set Method Completeness + Char Text Processing
+
+Stage 43 rounded out `List`; Stage 44 brings `Map`, `Set`, and `Char` up to the same method-first ergonomics (dispatched in [eval.rs](crates/axon-runtime/src/eval.rs), typed in [infer.rs](crates/axon-tyck/src/infer.rs)):
+
+- **Map** (had `get`/`set`/`contains`): `.len()`, `.is_empty()`, `.keys()` → `List<K>`, `.values()` → `List<V>`, `.remove(k)`
+- **Set** (had `add`/`contains`): `.len()`, `.is_empty()`, `.remove(v)`, `.to_list()`, `.union(s)`, `.intersection(s)`, `.difference(s)`
+- **Char** (had *none*): `.is_digit()`, `.is_alpha()`, `.is_alnum()`, `.is_whitespace()`, `.is_upper()`, `.is_lower()`, `.to_upper()`, `.to_lower()`, `.to_string()`, `.to_digit()` → `Int?`
+
+This makes text processing natural — iterate a string by `Char` (Stage 39 P4) and classify inline:
+
+```axon
+for ch in line {
+    if ch.is_digit() { total = total + ch.to_digit().unwrap() }
+}
+let common = users.intersection(admins)
+for name in scores.keys() { … }
+```
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage44_map_set_char` | 3 | Map `len`/`keys`/`values`/`remove`, Set `union`/`intersection`/`difference`/`to_list`, Char `is_digit`/`is_alpha`/`to_digit`/`to_upper` |
+| **Workspace total** | **1154 passing**, up from 1151 | +3 |
 
 ---
 

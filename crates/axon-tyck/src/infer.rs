@@ -366,8 +366,17 @@ fn builtin_methods_for(recv_ty: &Ty) -> Vec<String> {
             "is_empty", "contains", "index_of", "sum", "join", "sort", "fold",
             "any", "all", "find", "count", "take", "drop", "min", "max", "enumerate",
         ],
-        Map(_, _) => &["set", "get", "contains"],
-        Set(_) => &["add", "contains"],
+        Map(_, _) => &[
+            "set", "get", "contains", "len", "is_empty", "keys", "values", "remove",
+        ],
+        Set(_) => &[
+            "add", "contains", "len", "is_empty", "remove", "to_list", "union",
+            "intersection", "difference",
+        ],
+        Char => &[
+            "is_digit", "is_alpha", "is_alnum", "is_whitespace", "is_upper",
+            "is_lower", "to_upper", "to_lower", "to_string", "to_digit",
+        ],
         Chan(_) => &[
             "send", "recv", "len", "is_empty",
             "close", "is_closed", "capacity", "dropped",
@@ -1305,8 +1314,38 @@ impl<'a> Checker<'a> {
             ),
             (Ty::Map(_, _), "set") => (Ty::Unit, EffectRow::pure(), vec![Ty::Dyn, Ty::Dyn]),
             (Ty::Map(_, _), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
+            // Stage 44 — round out the Map method surface.
+            (Ty::Map(_, _), "len") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Map(_, _), "is_empty") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::Map(k, _), "keys") => (Ty::List(k.clone()), EffectRow::pure(), vec![]),
+            (Ty::Map(_, v), "values") => (Ty::List(v.clone()), EffectRow::pure(), vec![]),
+            (Ty::Map(_, _), "remove") => (Ty::Unit, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(_), "contains") => (Ty::Bool, EffectRow::pure(), vec![Ty::Dyn]),
             (Ty::Set(t), "add") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
+            // Stage 44 — round out the Set method surface.
+            (Ty::Set(_), "len") => (Ty::Int, EffectRow::pure(), vec![]),
+            (Ty::Set(_), "is_empty") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::Set(t), "remove") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
+            (Ty::Set(t), "to_list") => (Ty::List(t.clone()), EffectRow::pure(), vec![]),
+            (Ty::Set(t), "union")
+            | (Ty::Set(t), "intersection")
+            | (Ty::Set(t), "difference") => {
+                (Ty::Set(t.clone()), EffectRow::pure(), vec![Ty::Set(t.clone())])
+            }
+            // Stage 44 — Char text-processing methods.
+            (Ty::Char, "is_digit")
+            | (Ty::Char, "is_alpha")
+            | (Ty::Char, "is_alnum")
+            | (Ty::Char, "is_whitespace")
+            | (Ty::Char, "is_upper")
+            | (Ty::Char, "is_lower") => (Ty::Bool, EffectRow::pure(), vec![]),
+            (Ty::Char, "to_upper") | (Ty::Char, "to_lower") => {
+                (Ty::Char, EffectRow::pure(), vec![])
+            }
+            (Ty::Char, "to_string") => (Ty::String, EffectRow::pure(), vec![]),
+            (Ty::Char, "to_digit") => {
+                (Ty::Nullable(Box::new(Ty::Int)), EffectRow::pure(), vec![])
+            }
             // Channels. Stage 38 adds close/is_closed/capacity/dropped.
             (Ty::Chan(t), "send") => (Ty::Unit, EffectRow::pure(), vec![*t.clone()]),
             (Ty::Chan(t), "recv") => (Ty::Nullable(t.clone()), EffectRow::pure(), vec![]),
