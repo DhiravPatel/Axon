@@ -1,6 +1,32 @@
 # Axon — Implemented Features
 
-A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1145 tests passing** across 30+ crates).
+A snapshot of everything Axon ships today, grouped by the stages that introduced each capability. All features below are covered by the workspace test suite (**1148 tests passing** across 30+ crates).
+
+---
+
+## Stage 42 — Optional/Nullable Ergonomics
+
+Many built-ins return `T?` (a value or `nil`): `list.pop()`, `.first()`, `.last()`, `chan.recv()`, and Stage 41's `Int.checked_*`. Stage 42 gives those a natural method surface instead of forcing an `== nil` comparison or a bare `??`. Universal methods that work on any value (`nil` is just a value), dispatched in [eval.rs](crates/axon-runtime/src/eval.rs) and typed for `T?` receivers in [infer.rs](crates/axon-tyck/src/infer.rs):
+
+- `.unwrap()` → the value, or a runtime error (`unwrap: value was nil`)
+- `.expect(msg)` → the value, or a runtime error carrying `msg`
+- `.unwrap_or(default)` → the value, or `default` (method form of `??`)
+- `.is_nil()` / `.is_some()` → `Bool`
+
+This composes with the Stage 41 safe-arithmetic story for a one-liner that is both safe and readable:
+
+```axon
+let total = count.checked_mul(size).expect("size overflow")   // never wraps, never silently nil
+let head  = queue.first().unwrap_or(default_task())
+if result.is_some() { … }
+```
+
+### Test coverage
+
+| Suite | Tests | Pins |
+| --- | --- | --- |
+| `axon-cli::stage42_optionals` | 3 | `unwrap`/`is_some`/`is_nil`/`unwrap_or` on `T?`, `expect` error message on `nil`, composition with `checked_mul` |
+| **Workspace total** | **1148 passing**, up from 1145 | +3 |
 
 ---
 

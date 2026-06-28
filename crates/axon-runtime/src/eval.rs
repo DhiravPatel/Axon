@@ -2053,6 +2053,46 @@ impl Interpreter {
             }
             // Agents / actors: dispatch the named message handler.
             (Value::Spawned(actor), name) => self.dispatch_handler(actor.clone(), name, args, span),
+            // Universal optional/nullable ergonomics — work on any value
+            // (`nil` is just a value), so a `T?` from `pop()`, `first()`,
+            // `checked_mul()`, etc. reads naturally. Stage 42.
+            (_, "is_nil") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(matches!(recv, Value::Nil)))
+            }
+            (_, "is_some") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                Ok(Value::Bool(!matches!(recv, Value::Nil)))
+            }
+            (_, "unwrap") => {
+                ensure_arity(method, 0, args.len(), span)?;
+                if matches!(recv, Value::Nil) {
+                    return Err(EvalSignal::error(
+                        "unwrap: value was nil".to_string(),
+                        span,
+                    ));
+                }
+                Ok(recv.clone())
+            }
+            (_, "expect") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                if matches!(recv, Value::Nil) {
+                    let msg = match &args[0] {
+                        Value::String(s) => s.as_str().to_owned(),
+                        other => other.to_string(),
+                    };
+                    return Err(EvalSignal::error(format!("expect: {msg}"), span));
+                }
+                Ok(recv.clone())
+            }
+            (_, "unwrap_or") => {
+                ensure_arity(method, 1, args.len(), span)?;
+                if matches!(recv, Value::Nil) {
+                    Ok(args[0].clone())
+                } else {
+                    Ok(recv.clone())
+                }
+            }
             // Fallback: treat `obj.method(...)` as `(obj.method)(...)` when
             // the receiver actually has a callable field by that name. This
             // gives records-of-functions the obvious dispatch behavior.

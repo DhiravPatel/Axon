@@ -1236,6 +1236,18 @@ impl<'a> Checker<'a> {
             (Ty::Int, "saturating_add")
             | (Ty::Int, "saturating_sub")
             | (Ty::Int, "saturating_mul") => (Ty::Int, EffectRow::pure(), vec![Ty::Int]),
+            // Stage 42 — optional/nullable ergonomics. Pairs with `checked_*`,
+            // `pop`, `first`, `recv`, etc., which all return `T?`.
+            (Ty::Nullable(t), "unwrap") => ((**t).clone(), EffectRow::pure(), vec![]),
+            (Ty::Nullable(t), "expect") => {
+                ((**t).clone(), EffectRow::pure(), vec![Ty::String])
+            }
+            (Ty::Nullable(t), "unwrap_or") => {
+                ((**t).clone(), EffectRow::pure(), vec![(**t).clone()])
+            }
+            (Ty::Nullable(_), "is_nil") | (Ty::Nullable(_), "is_some") => {
+                (Ty::Bool, EffectRow::pure(), vec![])
+            }
             (Ty::Float, "abs")
             | (Ty::Float, "round")
             | (Ty::Float, "floor")
