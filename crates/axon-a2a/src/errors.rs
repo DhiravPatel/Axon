@@ -9,6 +9,7 @@ pub enum A2aError {
     UnsupportedVersion { found: u32, expected: u32 },
 }
 
+
 impl fmt::Display for A2aError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
